@@ -1,0 +1,30 @@
+Frontend:
+  impl: LoadStoreTrace
+  clock_ratio: 4
+  path: ./ramulator_trace.txt
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: DDR4
+    org:
+      preset: DDR4_8Gb_x8
+      channel: 1
+      rank: 2
+    timing:
+      preset: DDR4_2400R
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: ClosedRowPolicy
+      cap: 4
+
+  AddrMapper:
+    impl: RoBaRaCoCh
