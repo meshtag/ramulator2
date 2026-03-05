@@ -72,8 +72,9 @@ $OPT --load-pass-plugin="$PASS_LIB" --passes="mem-trace" \
 # ── Step 3: Execute and produce trace ────────────────────────────────
 echo "[4/5] Executing instrumented IR (trace → $TRACE_OUTPUT)"
 export RAMULATOR_TRACE_OUT="$TRACE_OUTPUT"
-$CLANG -O0 "$INSTRUMENTED" "$RUNTIME_LIB" -o "${INSTRUMENTED%.ll}.exe"
-"./${INSTRUMENTED%.ll}.exe"
+EXE="${INSTRUMENTED%.ll}.exe"
+$CLANG -O0 "$INSTRUMENTED" "$RUNTIME_LIB" -o "$EXE"
+"$EXE"
 
 TRACE_LINES=$(wc -l < "$TRACE_OUTPUT" | tr -d ' ')
 echo "     Trace generated: $TRACE_LINES DRAM requests"
