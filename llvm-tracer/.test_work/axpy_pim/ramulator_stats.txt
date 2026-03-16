@@ -1,0 +1,25 @@
+[Ramulator::PimTrace] [info] Loading PIM trace file /Users/meshtag/LLVMRamulator/ramulator2/llvm-tracer/.test_work/axpy_pim/pim_trace.txt ...
+[Ramulator::PimTrace] [info] Loaded 768 trace lines.
+Frontend:
+  impl: PimTrace
+
+MemorySystem:
+  impl: PimDRAM
+  total_num_bkread_requests: 256
+  total_num_other_requests: 512
+  total_num_write_requests: 0
+  total_num_bkwrite_requests: 256
+  total_num_read_requests: 256
+  memory_system_cycles: 3952
+  DRAM:
+    impl: HBM3_PIM
+  Controller:
+    impl: PIM
+    id: Channel 0
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+
+
+

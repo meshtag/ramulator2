@@ -6,6 +6,9 @@ Request::Request(Addr_t addr, int type): addr(addr), type_id(type) {};
 
 Request::Request(AddrVec_t addr_vec, int type): addr_vec(addr_vec), type_id(type) {};
 
+Request::Request(AddrVec_t addr_vec, std::string opstr)
+    : addr_vec(addr_vec), op(std::move(opstr)) {};
+
 Request::Request(Addr_t addr, int type, int source_id, std::function<void(Request&)> callback):
 addr(addr), type_id(type), source_id(source_id), callback(callback) {};
 

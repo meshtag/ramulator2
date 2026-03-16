@@ -25,6 +25,12 @@ struct Organization {
   int dq = -1;
   /// The size of different levels in the hierarchy.
   std::vector<int> count;
+  /// PIM-specific: number of PEs per bank group
+  int m_pe_per_bankgroup = 0;
+  /// PIM-specific: number of registers per PE
+  int m_reg_per_pe = 0;
+  /// PIM-specific: PE operand bit width
+  int m_pe_bits = 0;
 }; 
 
 // Meta information about a command

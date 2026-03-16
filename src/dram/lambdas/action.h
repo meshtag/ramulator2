@@ -35,6 +35,14 @@ namespace Bank {
     node->m_state = T::m_states["Closed"];
   };
 
+  template <class T>
+  void PREASA(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+    for (auto child : node->m_child_nodes) {
+      child->m_state = T::m_states["Closed"];
+      child->m_row_state.clear();
+    }
+  };
+
 }       // namespace Bank
 
 namespace BankGroup {
@@ -140,6 +148,32 @@ namespace Channel {
     }
   };
 }      // namespace Channel
+
+namespace Subarray {
+template <class T>
+void ACT(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+  node->m_state = T::m_states["Opened"];
+  node->m_row_state[target_id] = T::m_states["Opened"];
+};
+
+template <class T>
+void PRE(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+  node->m_state = T::m_states["Closed"];
+  node->m_row_state.clear();
+};
+
+template <class T>
+void SASEL(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+  typename T::Node *bank = node->m_parent_node;
+  for (auto subarray : bank->m_child_nodes) {
+    if (subarray->m_state == T::m_states["Selected"]) {
+      subarray->m_state = T::m_states["Opened"];
+    }
+  }
+  node->m_state = T::m_states["Selected"];
+  node->m_row_state[target_id] = T::m_states["Selected"];
+};
+} // namespace Subarray
 }       // namespace Action
 }       // namespace Lambdas
 };      // namespace Ramulator

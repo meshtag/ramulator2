@@ -1,0 +1,27 @@
+Frontend:
+  impl: PimTrace
+  clock_ratio: 1
+  path: pim_trace.txt
+
+MemorySystem:
+  impl: PimDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: HBM3_PIM
+    org:
+      preset: HBM3_8Gb
+      channel: 1
+      pe_per_bankgroup: 2
+      reg_per_pe: 1
+      pe_bits: 16
+    timing:
+      preset: HBM3_2Gbps
+
+  Controller:
+    impl: PIM
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    plugins:

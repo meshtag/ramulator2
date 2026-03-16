@@ -115,6 +115,55 @@ namespace Channel {
     return cmd;
   };
 }       // namespace Channel
+
+namespace Subarray {
+template <class T>
+int RequireRowOpen(typename T::Node *node, int cmd, const AddrVec_t &addr_vec,
+                   Clk_t clk) {
+  switch (node->m_state) {
+  case T::m_states["Closed"]:
+    return T::m_commands["ACT"];
+  case T::m_states["Opened"]:
+  case T::m_states["Selected"]: {
+    if (node->m_row_state.find(addr_vec[T::m_levels["row"]]) !=
+        node->m_row_state.end()) {
+      return cmd;
+    } else {
+      return T::m_commands["PRE"];
+    }
+  }
+  default:
+    return T::m_commands["ACT"];
+  }
+};
+
+template <class T>
+int RequireRowSelected(typename T::Node *node, int cmd,
+                       const AddrVec_t &addr_vec, Clk_t clk) {
+  switch (node->m_state) {
+  case T::m_states["Closed"]:
+    return T::m_commands["ACT"];
+  case T::m_states["Opened"]: {
+    if (node->m_row_state.find(addr_vec[T::m_levels["row"]]) !=
+        node->m_row_state.end()) {
+      return T::m_commands["SASEL"];
+    } else {
+      return T::m_commands["PRE"];
+    }
+  }
+  case T::m_states["Selected"]: {
+    if (node->m_row_state.find(addr_vec[T::m_levels["row"]]) !=
+        node->m_row_state.end()) {
+      return cmd;
+    } else {
+      return T::m_commands["PRE"];
+    }
+  }
+  default:
+    return T::m_commands["ACT"];
+  }
+};
+} // namespace Subarray
 }       // namespace Preq
 }       // namespace Lambdas
 };      // namespace Ramulator

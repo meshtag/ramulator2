@@ -1,0 +1,19 @@
+[pim-runtime] Initialized. Trace: pim_trace.txt
+[pim-runtime] HBM config: 1 ch, 2 pch, 4 bg, 4 banks/bg, 16 sa, 512 rows, 64 cols, 128-bit DQ
+[pim-runtime] Tensor 0: INPUT, 4096 elems (16384 bytes), ch=0 pch=0 bg=0 bank=0 sa=[0..0] rows=[0..15]
+[pim-runtime] Tensor 1: WEIGHT, 4096 elems (16384 bytes), ch=0 pch=0 bg=0 bank=1 sa=[0..0] rows=[0..15]
+[pim-runtime] Tensor 2: WEIGHT, 4096 elems (16384 bytes), ch=0 pch=0 bg=0 bank=2 sa=[0..0] rows=[0..15]
+[pim-runtime] Tensor 3: OUTPUT, 4096 elems (16384 bytes), ch=0 pch=0 bg=0 bank=3 sa=[0..0] rows=[0..15]
+[pim-runtime] Tensor 4: OUTPUT, 4096 elems (16384 bytes), ch=0 pch=0 bg=1 bank=0 sa=[0..0] rows=[0..15]
+[pim-runtime] Phase -> COMPUTE
+[pim-runtime] Phase -> HOST
+[pim-runtime] Phase -> COMPUTE
+[pim-runtime] Phase -> IDLE
+
+[pim-runtime] === PIM Trace Statistics ===
+[pim-runtime]   Bank-reads  (BR): 327680
+[pim-runtime]   Bank-writes (BW): 20480
+[pim-runtime]   Reads       (R) : 44032
+[pim-runtime]   Writes      (W) : 19456
+[pim-runtime]   Ignored        : 3074
+[pim-runtime]   Total PIM ops  : 411648

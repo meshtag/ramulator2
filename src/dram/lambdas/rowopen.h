@@ -20,6 +20,34 @@ namespace Bank {
     }
   }
 }       // namespace Bank
+
+namespace Subarray {
+template <class T>
+bool RDWR(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+  switch (node->m_state) {
+  case T::m_states["Closed"]:
+    return false;
+  case T::m_states["Opened"]:
+  case T::m_states["Selected"]:
+    return true;
+  default:
+    return false;
+  }
+}
+
+template <class T>
+bool PIM(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
+  switch (node->m_state) {
+  case T::m_states["Closed"]:
+    return false;
+  case T::m_states["Opened"]:
+  case T::m_states["Selected"]:
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace Subarray
 }       // namespace RowHit
 }       // namespace Lambdas
 };      // namespace Ramulator
