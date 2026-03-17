@@ -237,9 +237,9 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   int first_sa = t->base_row / cfg_num_rows;
   int last_sa = (t->base_row + rows_needed - 1) / cfg_num_rows;
 
-  const char *role_str = (role == PIM_ROLE_WEIGHT)  ? "WEIGHT"
-                         : (role == PIM_ROLE_INPUT) ? "INPUT"
-                                                    : "OUTPUT";
+  const char *role_str = (role == PIM_ROLE_STREAMED)  ? "STREAMED"
+                         : (role == PIM_ROLE_OPERAND) ? "OPERAND"
+                                                      : "ACCUMULATOR";
   fprintf(stderr,
           "[pim-runtime] Tensor %d: %s, %d elems (%zu bytes), "
           "ch=%d pch=%d bg=%d bank=%d sa=[%d..%d] rows=[%d..%d]\n",
@@ -301,16 +301,13 @@ void __mem_trace_fini(void) { pim_finalize(); }
 /*
  * Translate a single memory access into PIM trace operations.
  *
- * COMPUTE phase mapping (PIM PE active):
- *   WEIGHT load  -> BR (bank-read:  weight streams through PE, triggers MAC)
- *   INPUT  load  -> W  (write:      input broadcast to PE register via bus)
- *   OUTPUT load  -> R  (read:       read partial sum from PE)
- *   OUTPUT store -> BW (bank-write: write accumulated result to bank)
+ * COMPUTE phase (PIM PE active):
+ *   STREAMED load   -> BR (bank-read: data streams through PE)
+ *   OPERAND load    -> W  (write: data to PE register via bus)
+ *   ACCUMULATOR load  -> R  (read: partial sum from PE)
+ *   ACCUMULATOR store -> BW (bank-write: result to bank)
  *
- * HOST phase mapping (softmax, etc.):
- *   any load     -> R  (read data from bank to host)
- *   any store    -> W  (write data from host to bank)
- *
+ * HOST phase: any load -> R, any store -> W (via bus)
  * IDLE phase: no trace emission.
  */
 static void pim_trace_access(uint64_t addr, int is_write) {
@@ -339,26 +336,26 @@ static void pim_trace_access(uint64_t addr, int is_write) {
     if (!is_write) {
       /* Load */
       switch (t->role) {
-      case PIM_ROLE_WEIGHT:
+      case PIM_ROLE_STREAMED:
         emit_trace("BR", ch, pch, bg, bank, sa, row, col);
         stat_bank_reads++;
         break;
-      case PIM_ROLE_INPUT:
+      case PIM_ROLE_OPERAND:
         emit_trace("W", ch, pch, bg, bank, sa, row, col);
         stat_writes++;
         break;
-      case PIM_ROLE_OUTPUT:
+      case PIM_ROLE_ACCUMULATOR:
         emit_trace("R", ch, pch, bg, bank, sa, row, col);
         stat_reads++;
         break;
       }
     } else {
       /* Store */
-      if (t->role == PIM_ROLE_OUTPUT) {
+      if (t->role == PIM_ROLE_ACCUMULATOR) {
         emit_trace("BW", ch, pch, bg, bank, sa, row, col);
         stat_bank_writes++;
       }
-      /* Stores to WEIGHT/INPUT in GEMM phase are ignored (read-only) */
+      /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
   } else if (cur_phase == PIM_PHASE_HOST) {
     if (!is_write) {

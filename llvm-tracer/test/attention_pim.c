@@ -31,11 +31,11 @@ int main(void) {
   int dims_qkv[2] = {SEQ_LEN, D_HEAD};
   int dims_s[2] = {SEQ_LEN, SEQ_LEN};
 
-  pim_register_tensor(Q, dims_qkv, 2, sizeof(float), PIM_ROLE_INPUT);
-  pim_register_tensor(K, dims_qkv, 2, sizeof(float), PIM_ROLE_WEIGHT);
-  pim_register_tensor(V, dims_qkv, 2, sizeof(float), PIM_ROLE_WEIGHT);
-  pim_register_tensor(S, dims_s, 2, sizeof(float), PIM_ROLE_OUTPUT);
-  pim_register_tensor(O, dims_qkv, 2, sizeof(float), PIM_ROLE_OUTPUT);
+  pim_register_tensor(Q, dims_qkv, 2, sizeof(float), PIM_ROLE_OPERAND);
+  pim_register_tensor(K, dims_qkv, 2, sizeof(float), PIM_ROLE_STREAMED);
+  pim_register_tensor(V, dims_qkv, 2, sizeof(float), PIM_ROLE_STREAMED);
+  pim_register_tensor(S, dims_s, 2, sizeof(float), PIM_ROLE_ACCUMULATOR);
+  pim_register_tensor(O, dims_qkv, 2, sizeof(float), PIM_ROLE_ACCUMULATOR);
 
   /* Initialize tensors with deterministic data */
   for (int i = 0; i < SEQ_LEN; i++) {

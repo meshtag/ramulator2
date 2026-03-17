@@ -8,11 +8,12 @@
 extern "C" {
 #endif
 
-/* Tensor roles determine how loads/stores are translated to PIM ops */
+/* Tensor roles: data-flow semantics for PIM operations */
 typedef enum {
-  PIM_ROLE_WEIGHT, /* Stays in bank rows; load triggers bank-read (MAC) */
-  PIM_ROLE_INPUT,  /* Broadcast via bus; load triggers write (to PE reg) */
-  PIM_ROLE_OUTPUT, /* Accumulated in PE; store triggers bank-write */
+  PIM_ROLE_STREAMED,   /* Bank-resident; load streams through PE (BR) */
+  PIM_ROLE_OPERAND,    /* Written to PE register via bus (W) */
+  PIM_ROLE_ACCUMULATOR /* Accumulated in PE; load reads (R), store writes (BW)
+                        */
 } pim_role_t;
 
 /* Computation phases */
@@ -40,7 +41,7 @@ void pim_init(const char *trace_file);
  *   dims      - array of dimension sizes (e.g., {64, 64})
  *   ndims     - number of dimensions
  *   elem_size - size of each element in bytes (e.g., sizeof(float))
- *   role      - PIM_ROLE_WEIGHT, PIM_ROLE_INPUT, or PIM_ROLE_OUTPUT
+ *   role      - PIM_ROLE_STREAMED, PIM_ROLE_OPERAND, or PIM_ROLE_ACCUMULATOR
  *
  * Returns a tensor id (>= 0) on success, -1 on failure.
  */

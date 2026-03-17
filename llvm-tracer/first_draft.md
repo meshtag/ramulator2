@@ -1,31 +1,32 @@
-# HBM PIM Attention: First Draft
+# HBM PIM: First Draft
 
 ## Goal
 
-Map a single-head scaled dot-product attention kernel onto an HBM Processing-in-Memory
-(PIM) architecture, generate cycle-accurate PIM traces via LLVM instrumentation, and
-simulate them in Ramulator2 with a custom HBM3_PIM DRAM model. This is a stepping stone
-toward Triton-level PIM integration.
+Map PIM-compatible kernels onto an HBM Processing-in-Memory (PIM) architecture,
+generate cycle-accurate PIM traces via LLVM instrumentation, and simulate them
+in Ramulator2 with a custom HBM3_PIM DRAM model. Included examples: attention
+(single-head scaled dot-product) and AXPY. A stepping stone toward Triton-level
+PIM integration.
 
 ---
 
 ## Architecture Overview
 
 ```
-  attention_pim.c          pim_runtime.c           Ramulator2
-  ┌──────────────┐    ┌────────────────────┐    ┌─────────────────┐
-  │ Tiled GEMM   │    │ Tensor registry    │    │ PimTrace        │
-  │ + Softmax    │───>│ Phase-aware trace  │───>│ PimDRAMSystem   │
-  │ (C source)   │    │ translation        │    │ HBM3_PIM DRAM   │
-  └──────┬───────┘    └────────┬───────────┘    │ PIM Controller  │
-         │                     │                └────────┬────────┘
-    clang + opt           pim_trace.txt              cycle count
-    + MemTracePass        (BR/BW/R/W ops)            + stats
+  attention_pim.c /        pim_runtime.c           Ramulator2
+  axpy_pim.c               ┌────────────────────┐    ┌─────────────────┐
+  ┌──────────────┐    ┌──>│ Tensor registry    │───>│ PimTrace        │
+  │ PIM-annotated│    │   │ Phase-aware trace  │    │ PimDRAMSystem   │
+  │ C source     │────┘   │ translation        │    │ HBM3_PIM DRAM   │
+  └──────────────┘        └────────┬───────────┘    │ PIM Controller  │
+         │                         │                └────────┬────────┘
+    clang + opt              pim_trace.txt              cycle count
+    + MemTracePass           (BR/BW/R/W ops)             + stats
 ```
 
 Three components connected by a file-based interface:
 
-1. **Kernel** (`attention_pim.c`) -- C code with explicit PIM annotations
+1. **Kernel** (`attention_pim.c`, `axpy_pim.c`, etc.) -- C code with explicit PIM annotations
 2. **PIM Runtime** (`pim_runtime.c`) -- intercepts LLVM-instrumented loads/stores,
    translates them to PIM operations
 3. **Ramulator2 PIM** -- simulates the PIM trace on a cycle-accurate HBM3 model
@@ -40,16 +41,17 @@ input.c ─→ LLVM IR ─→ optimized IR ─→ instrumented IR ─→ execute
          -emit-llvm                                      (pim_trace)
 ```
 
-Run with: `./run_pim_trace.sh test/attention_pim.c`
+Run with: `./test_all_pim.sh` (builds MemTracePass + Ramulator2, runs all tests)
+or `./run_pim_trace.sh test/attention_pim.c` (single file, no build step).
 
 | Step | Tool | Output |
 |------|------|--------|
 | 1 | `clang -S -emit-llvm` | `.ll` (unoptimized IR) |
 | 2 | `opt -O2` | `.opt.ll` (optimized IR, stack spills eliminated) |
-| 3 | `opt --passes=mem-trace` | `.instrumented.ll` (loads/stores hooked) |
+| 3 | `opt --load-pass-plugin=MemTracePass.dylib --passes=mem-trace` | `.instrumented.ll` (loads/stores hooked) |
 | 4 | `clang` + link `pim_runtime.c` | executable |
 | 5 | Execute | `pim_trace.txt` (PIM operations) |
-| 6 | `ramulator2 -f config.yaml` | cycle count, request statistics |
+| 6 | `ramulator2 --config_file config.yaml` | cycle count, request statistics |
 
 ---
 
@@ -188,43 +190,47 @@ void pim_finalize(void);
 
 | Role | Meaning |
 |------|---------|
-| `PIM_ROLE_WEIGHT` | Resides in bank rows; load triggers bank-read (MAC in PE) |
-| `PIM_ROLE_INPUT` | Broadcast via data bus; load triggers write to PE register |
-| `PIM_ROLE_OUTPUT` | Accumulated by PE; load reads partial sum, store writes back |
+| `PIM_ROLE_STREAMED` | Bank-resident; load streams through PE (BR) |
+| `PIM_ROLE_OPERAND` | Written to PE register via bus (W) |
+| `PIM_ROLE_ACCUMULATOR` | Accumulated in PE; load reads (R), store writes (BW) |
 
 **Phases** change the interpretation mode:
 
 | Phase | Load from tensor | Store to tensor |
 |-------|-----------------|-----------------|
-| `PIM_PHASE_GEMM` + WEIGHT | BR (bank-read: MAC) | ignored |
-| `PIM_PHASE_GEMM` + INPUT | W (write to PE) | ignored |
-| `PIM_PHASE_GEMM` + OUTPUT | R (read partial sum) | BW (bank-write) |
+| `PIM_PHASE_COMPUTE` + STREAMED | BR (bank-read: MAC) | ignored |
+| `PIM_PHASE_COMPUTE` + OPERAND | W (write to PE) | ignored |
+| `PIM_PHASE_COMPUTE` + ACCUMULATOR | R (read partial sum) | BW (bank-write) |
 | `PIM_PHASE_HOST` + any | R (read to host) | W (write from host) |
 | `PIM_PHASE_IDLE` | ignored | ignored |
 
 ### Bank Mapping
 
-Each registered tensor is assigned to a bank (round-robin across bank groups):
+Each registered tensor is assigned to a flat bank (round-robin across channel,
+pseudochannel, bank group, and bank):
 
 ```
-Tensor 0 → bg=0, bank=0
-Tensor 1 → bg=0, bank=1
-Tensor 2 → bg=0, bank=2
+Tensor 0 → ch=0 pch=0 bg=0 bank=0
+Tensor 1 → ch=0 pch=0 bg=0 bank=1
 ...
+Tensor 16 → ch=0 pch=1 bg=0 bank=0   (wraps to next pseudochannel)
 ```
 
-Within a bank, elements are laid out linearly in rows:
+Within a bank, elements are laid out linearly in rows spanning subarrays:
 
 ```
 values_per_column = DQ_bits / (elem_size * 8)    -- e.g., 128/32 = 4 floats
 values_per_row    = num_columns * values_per_column  -- e.g., 64 * 4 = 256
 
-element[i]  →  row = base_row + i / values_per_row
-               col = (i % values_per_row) / values_per_column
+linear_row = base_row + i / values_per_row
+subarray   = linear_row / rows_per_subarray
+row        = linear_row % rows_per_subarray
+col        = (i % values_per_row) / values_per_column
 ```
 
-Row allocation is **per-bank**: each bank maintains its own row counter so
-tensors in different banks independently start at row 0.
+Row allocation is **per-bank**: each bank maintains its own row counter. If a
+tensor exceeds a bank's capacity (`subarrays × rows_per_subarray`), registration
+fails with an error (no silent row wrap).
 
 ### Extensibility
 
@@ -261,11 +267,11 @@ Phase 3 (GEMM):  O = P * V            [64x64] = [64x64] × [64x64]
 
 **Phase 1 -- Q * K^T:**
 
-Q is registered as INPUT. K is registered as WEIGHT. S is OUTPUT.
+Q is registered as OPERAND. K is registered as STREAMED. S is ACCUMULATOR.
 
 In the inner loop `acc += Q[i][k] * K[j][k]`:
-- Load Q → W (broadcast input to PE register)
-- Load K → BR (weight streams through PE, triggers MAC)
+- Load Q → W (write operand to PE register)
+- Load K → BR (data streams through PE, triggers MAC)
 - After tile: load S → R, store S → BW (read/write accumulated partial sum)
 
 The local accumulator variable `acc` is in a CPU register, not in any
@@ -285,23 +291,36 @@ between PIM banks and the host for non-MAC operations.
 
 **Phase 3 -- P * V:**
 
-S (now containing softmax output) is still registered as OUTPUT.
-V is registered as WEIGHT.
+S (now containing softmax output) is still registered as ACCUMULATOR.
+V is registered as STREAMED.
 
-- Load S → R (read softmax result; "OUTPUT load" in GEMM = read from bank)
-- Load V → BR (weight MAC)
+- Load S → R (read softmax result; ACCUMULATOR load in COMPUTE = read from bank)
+- Load V → BR (STREAMED data through PE, triggers MAC)
 - Store O → BW (write final output)
 
 ### Trace Statistics (64x64 attention)
 
 | Operation | Count | Source |
 |-----------|-------|--------|
-| BR (bank-read/MAC) | 327,680 | Weight loads in both GEMMs |
-| BW (bank-write) | 20,480 | Output stores in both GEMMs |
-| R (read) | 44,032 | Output reads + softmax reads |
-| W (write/input) | 19,456 | Input broadcasts + softmax writes |
+| BR (bank-read/MAC) | 327,680 | STREAMED loads in both GEMMs |
+| BW (bank-write) | 20,480 | ACCUMULATOR stores in both GEMMs |
+| R (read) | 44,032 | ACCUMULATOR reads + softmax reads |
+| W (write) | 19,456 | OPERAND loads + softmax writes |
 | **Total PIM ops** | **411,648** | |
 | **HBM3_PIM cycles** | **~981K** | Simulated by Ramulator2 |
+
+---
+
+## AXPY Kernel
+
+AXPY: `y[i] = a * x[i] + y[i]`. Simple vector operation demonstrating the same
+role mapping:
+
+- `x[]` → STREAMED (data streams through PE on load, BR)
+- `y[]` → ACCUMULATOR (load R, store BW)
+- Scalar `a` → in PE register (not traced; assumed pre-loaded)
+
+Run with `./test_all_pim.sh axpy_pim`. Trace: ~768 ops, ~4K cycles.
 
 ---
 
@@ -336,8 +355,10 @@ V is registered as WEIGHT.
 | `runtime/pim_runtime.h` | PIM API (init, register, phase, finalize) |
 | `runtime/pim_runtime.c` | Tensor registry, bank mapping, phase-aware translation |
 | `test/attention_pim.c` | Tiled single-head attention kernel |
+| `test/axpy_pim.c` | AXPY kernel (y = a*x + y) |
 | `config/hbmpim_config.yaml` | HBM3_PIM simulation configuration |
-| `run_pim_trace.sh` | End-to-end pipeline script |
+| `test_all_pim.sh` | Build MemTracePass + Ramulator2, run all tests |
+| `run_pim_trace.sh` | Single-file pipeline (no build step) |
 
 ---
 
@@ -346,8 +367,8 @@ V is registered as WEIGHT.
 Each line: `<OP> <ch>,<pch>,<bg>,<bank>,<sa>,<row>,<col>`
 
 ```
-W  0,0,0,0,0,0,0       # Write input value to PE register
-BR 0,0,0,1,0,0,0       # Bank-read: weight through PE, triggers MAC
+W  0,0,0,0,0,0,0       # Write operand to PE register
+BR 0,0,0,1,0,0,0       # Bank-read: data through PE, triggers MAC
 R  0,0,0,3,0,0,0       # Read accumulated result from bank
 BW 0,0,0,3,0,0,15      # Bank-write: store result to bank row
 ```
@@ -363,10 +384,15 @@ translation is needed at the simulator side.
 # From the llvm-tracer directory:
 cd ramulator2/llvm-tracer
 
-# Run the full pipeline
-./run_pim_trace.sh test/attention_pim.c
+# Build everything and run all tests (recommended)
+./test_all_pim.sh
 
-# Or with custom config
+# Run a single test
+./test_all_pim.sh axpy_pim
+./test_all_pim.sh attention_pim
+
+# Single-file pipeline (assumes MemTracePass and Ramulator2 are already built)
+./run_pim_trace.sh test/attention_pim.c
 ./run_pim_trace.sh test/attention_pim.c config/hbmpim_config.yaml
 
 # Environment overrides
@@ -389,11 +415,11 @@ int main(void) {
     float A[N][K], B[K][M], C[N][M];
     int da[2] = {N, K}, db[2] = {K, M}, dc[2] = {N, M};
 
-    pim_register_tensor(A, da, 2, sizeof(float), PIM_ROLE_INPUT);
-    pim_register_tensor(B, db, 2, sizeof(float), PIM_ROLE_WEIGHT);
-    pim_register_tensor(C, dc, 2, sizeof(float), PIM_ROLE_OUTPUT);
+    pim_register_tensor(A, da, 2, sizeof(float), PIM_ROLE_OPERAND);
+    pim_register_tensor(B, db, 2, sizeof(float), PIM_ROLE_STREAMED);
+    pim_register_tensor(C, dc, 2, sizeof(float), PIM_ROLE_ACCUMULATOR);
 
-    pim_set_phase(PIM_PHASE_GEMM);
+    pim_set_phase(PIM_PHASE_COMPUTE);
     // ... tiled GEMM with local accumulator ...
     pim_set_phase(PIM_PHASE_IDLE);
 
@@ -406,18 +432,19 @@ int main(void) {
 
 ## Known Limitations
 
-1. **Single channel**: All tensors map to channel 0, pseudo-channel 0.
-   Multi-channel parallelism is not yet exploited.
+1. **Channel distribution**: Tensors distribute across ch/pch/bg/bank via
+   round-robin. With the default config (1 channel), all stay in channel 0.
+   Set `PIM_NUM_CHANNELS` and `PIM_NUM_PCH` to exploit multi-channel.
 
 2. **No drain cycle**: The simulator stops when the last trace is accepted by
    the memory controller. A few final cycles of pending requests are not
    counted in the cycle total. The error is bounded by the controller queue
    depth (~32 requests * ~20 cycles = ~640 cycles out of ~981K).
 
-3. **Input write addressing**: In GEMM phase, INPUT loads emit `W` operations
-   addressed to the INPUT tensor's bank, but the real HBM-PIM broadcasts
-   inputs via the bus to the PE in the WEIGHT bank. Ramulator2 models this
-   correctly as bus occupancy regardless of target bank.
+3. **Operand addressing**: In COMPUTE phase, OPERAND loads emit `W` ops
+   addressed to the OPERAND tensor's bank. The real HBM-PIM transfers data
+   via the bus to the PE in the STREAMED bank. Ramulator2 models bus
+   occupancy regardless of target bank.
 
 4. **Fixed element size**: The prototype uses `float` (4 bytes). Real HBM-PIM
    PEs operate on FP16 (2 bytes). The operation counts and access patterns
