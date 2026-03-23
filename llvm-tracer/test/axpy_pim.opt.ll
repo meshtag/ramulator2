@@ -1,5 +1,5 @@
-; ModuleID = 'test/axpy_pim.ll'
-source_filename = "test/axpy_pim.c"
+; ModuleID = '/Users/meshtag/TritonPIM/third_party/ramulator2/llvm-tracer/test/axpy_pim.ll'
+source_filename = "/Users/meshtag/TritonPIM/third_party/ramulator2/llvm-tracer/test/axpy_pim.c"
 target datalayout = "e-m:o-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "arm64-apple-macosx15.0.0"
 

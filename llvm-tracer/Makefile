@@ -11,7 +11,7 @@ BUILD_DIR := build
 
 .PHONY: all clean
 
-all: $(BUILD_DIR)/MemTracePass.dylib $(BUILD_DIR)/libtrace_runtime.dylib
+all: $(BUILD_DIR)/MemTracePass.dylib $(BUILD_DIR)/libtrace_runtime.dylib $(BUILD_DIR)/libim_runtime.dylib
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -22,6 +22,10 @@ $(BUILD_DIR)/MemTracePass.dylib: src/MemTracePass.cpp | $(BUILD_DIR)
 
 # Runtime library (linked into instrumented program)
 $(BUILD_DIR)/libtrace_runtime.dylib: runtime/trace_runtime.c | $(BUILD_DIR)
+	$(CC) -O2 -fPIC -shared -o $@ $<
+
+# IM execution-model runtime (bank-ID / program-ID primitives)
+$(BUILD_DIR)/libim_runtime.dylib: runtime/im_runtime.c | $(BUILD_DIR)
 	$(CC) -O2 -fPIC -shared -o $@ $<
 
 clean:
