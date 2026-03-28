@@ -28,9 +28,16 @@ int32_t __pim_get_bank_id(void);
 void __pim_set_bank_id(int32_t id);
 
 /* --- Program ID (which tile / block of the input this invocation covers) ---
+ * Axis 0 (X) is the primary dimension; Y and Z are optional for 2D/3D grids.
  */
 int32_t __pim_get_program_id(void);
 void __pim_set_program_id(int32_t id);
+
+int32_t __pim_get_program_id_y(void);
+void __pim_set_program_id_y(int32_t id);
+
+int32_t __pim_get_program_id_z(void);
+void __pim_set_program_id_z(int32_t id);
 
 #ifdef __cplusplus
 }
