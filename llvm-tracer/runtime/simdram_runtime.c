@@ -33,10 +33,41 @@ static int cfg_num_pch = 2; /* rank: 2 */
 static int cfg_num_bg = 4;
 static int cfg_num_banks = 4; /* per bank group */
 static int cfg_num_sa = 16;
-static int cfg_num_rows = 512;
+static int cfg_num_rows = 512; /* total physical rows per subarray  */
 static int cfg_num_cols = 64;
 static int cfg_dq_bits = 128;
 static int cfg_pe_bits = 16;
+
+/*
+ * SIMDRAM subarray row groups (paper §3.1, Fig. 2).
+ *
+ * Each subarray is partitioned into three groups:
+ *
+ *   D-group  — regular data rows (program/system data).
+ *   C-group  — 2 constant rows: C0 (all-0) and C1 (all-1).
+ *              Used as initial inputs (e.g., carry-in for addition)
+ *              and for AND/OR reductions.
+ *   B-group  — 16 compute rows: T0–T3 (4 regular rows),
+ *              DCC0/DCC1 (2 dual-contact-cell rows with separate
+ *              d-wordlines and n-wordlines), plus 10 additional
+ *              bitwise scratch rows.  Connected to a special row
+ *              decoder that can activate three rows simultaneously
+ *              (TRA — triple-row activation) for MAJ-3 computation.
+ *
+ * With 1024 rows/SA (paper): 1006 D + 2 C + 16 B = 1024.
+ * With  512 rows/SA (HBM3) :  494 D + 2 C + 16 B = 512.
+ *
+ * The D-group rows are the only rows available for tensor data.
+ * C-group and B-group rows are reserved for SIMDRAM control and
+ * computation; they are never allocated for user data.
+ */
+#define SIMDRAM_C_GROUP_ROWS 2  /* C0 (all-0) + C1 (all-1) */
+#define SIMDRAM_B_GROUP_ROWS 16 /* T0–T3 + DCC0/DCC1 + scratch rows */
+#define SIMDRAM_RESERVED_ROWS (SIMDRAM_C_GROUP_ROWS + SIMDRAM_B_GROUP_ROWS)
+
+/* Usable data rows per subarray = total rows − reserved rows.
+ * Recomputed in simdram_init() if cfg_num_rows is overridden. */
+static int cfg_data_rows_per_sa = 512 - SIMDRAM_RESERVED_ROWS; /* 494 */
 
 /* ================================================================
  *  Tensor registry
@@ -146,8 +177,8 @@ static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
   *col = (elem_idx % t->elems_per_row_group) / t->elems_per_col_slot;
 
   int linear_base = t->base_row + row_group_idx * cfg_pe_bits;
-  *sa = linear_base / cfg_num_rows;
-  *base_row = linear_base % cfg_num_rows;
+  *sa = linear_base / cfg_data_rows_per_sa;
+  *base_row = linear_base % cfg_data_rows_per_sa;
 }
 
 /*
@@ -236,6 +267,17 @@ void simdram_init(const char *trace_file) {
   if ((v = getenv("SIMDRAM_PE_BITS")))
     cfg_pe_bits = atoi(v);
 
+  /* Recompute usable data rows after any cfg_num_rows override */
+  cfg_data_rows_per_sa = cfg_num_rows - SIMDRAM_RESERVED_ROWS;
+  if (cfg_data_rows_per_sa <= 0) {
+    fprintf(stderr,
+            "[simdram] ERROR: cfg_num_rows=%d too small for "
+            "reserved rows (%d C-group + %d B-group = %d)\n",
+            cfg_num_rows, SIMDRAM_C_GROUP_ROWS, SIMDRAM_B_GROUP_ROWS,
+            SIMDRAM_RESERVED_ROWS);
+    exit(1);
+  }
+
   num_tensors = 0;
   cur_phase = SIMDRAM_PHASE_IDLE;
   memset(next_free_row, 0, sizeof(next_free_row));
@@ -249,9 +291,11 @@ void simdram_init(const char *trace_file) {
   fprintf(stderr, "[simdram] Initialized. Trace: %s\n", trace_file);
   fprintf(stderr,
           "[simdram] HBM config: %d ch, %d pch, %d bg, %d banks/bg, "
-          "%d sa, %d rows, %d cols, %d-bit DQ, pe_bits=%d\n",
+          "%d sa, %d rows/sa (%d data + %d reserved), %d cols, "
+          "%d-bit DQ, pe_bits=%d\n",
           cfg_num_channels, cfg_num_pch, cfg_num_bg, cfg_num_banks, cfg_num_sa,
-          cfg_num_rows, cfg_num_cols, cfg_dq_bits, cfg_pe_bits);
+          cfg_num_rows, cfg_data_rows_per_sa, SIMDRAM_RESERVED_ROWS,
+          cfg_num_cols, cfg_dq_bits, cfg_pe_bits);
 }
 
 int simdram_register_tensor(void *ptr, const int *dims, int ndims,
@@ -304,11 +348,12 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->assigned_bg = (global_bank / cfg_num_banks) % cfg_num_bg;
   t->assigned_bank = global_bank % cfg_num_banks;
 
-  /* Linear rows needed: ceil(total / elems_per_row_group) × pe_bits */
+  /* Linear rows needed: ceil(total / elems_per_row_group) × pe_bits.
+   * Only D-group rows are usable for data (cfg_data_rows_per_sa per SA). */
   int row_groups =
       (total + t->elems_per_row_group - 1) / t->elems_per_row_group;
   int rows_needed = row_groups * cfg_pe_bits;
-  int rows_capacity = cfg_num_sa * cfg_num_rows;
+  int rows_capacity = cfg_num_sa * cfg_data_rows_per_sa;
 
   if (next_free_row[global_bank] + rows_needed > rows_capacity) {
     fprintf(stderr,
@@ -333,14 +378,14 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
     acc_trackers[idx].pch = t->assigned_pch;
     acc_trackers[idx].bg = t->assigned_bg;
     acc_trackers[idx].bank = t->assigned_bank;
-    acc_trackers[idx].sa = t->base_row / cfg_num_rows;
-    acc_trackers[idx].row = t->base_row % cfg_num_rows;
+    acc_trackers[idx].sa = t->base_row / cfg_data_rows_per_sa;
+    acc_trackers[idx].row = t->base_row % cfg_data_rows_per_sa;
     if (current_acc < 0)
       current_acc = idx; /* default to first registered accumulator */
   }
 
-  int first_sa = t->base_row / cfg_num_rows;
-  int last_sa = (t->base_row + rows_needed - 1) / cfg_num_rows;
+  int first_sa = t->base_row / cfg_data_rows_per_sa;
+  int last_sa = (t->base_row + rows_needed - 1) / cfg_data_rows_per_sa;
 
   const char *role_str = (role == SIMDRAM_ROLE_STREAMED)  ? "STREAMED"
                          : (role == SIMDRAM_ROLE_OPERAND) ? "OPERAND"
@@ -570,10 +615,18 @@ void __compute_trace(int32_t opcode, int32_t bit_width) {
   int cost = maj_cost(opcode);
   int cur_row_offset = 0;
 
+  /*
+   * B-group rows start after D-group + C-group in each subarray.
+   * TRA (triple-row activation) physically operates on B-group rows
+   * (T0–T3, DCC0/DCC1), not on data rows.  We emit BR ops at the
+   * B-group base row within the same subarray as the accumulator.
+   */
+  int b_group_base = cfg_data_rows_per_sa + SIMDRAM_C_GROUP_ROWS;
+
   for (int i = 0; i < cost; i++) {
     emit_trace("BR", at->ch, at->pch, at->bg, at->bank, at->sa,
-               at->row + cur_row_offset, 0);
-    cur_row_offset = (cur_row_offset + 1) % cfg_pe_bits;
+               b_group_base + cur_row_offset, 0);
+    cur_row_offset = (cur_row_offset + 1) % SIMDRAM_B_GROUP_ROWS;
     stat_bank_reads++;
   }
 
