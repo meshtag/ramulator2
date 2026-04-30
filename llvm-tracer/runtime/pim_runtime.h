@@ -60,6 +60,32 @@ void __mem_trace_fini(void);
 void __mem_trace_load(void *addr, uint64_t size);
 void __mem_trace_store(void *addr, uint64_t size);
 
+/* Axis-wise persistent-scope load entry points emitted by MemTracePass. The
+ * suffix names the axes the load is INVARIANT in (i.e. axes whose change does
+ * NOT reset the dedup state). All four share the trace-emission shape of
+ * __mem_trace_load; only the underlying dedup scope differs:
+ *
+ *   __pim_load_persistent     — invariant in {x,y,z}: reset only on phase
+ *                               change. Pointer doesn't depend on any pid.
+ *   __pim_load_persistent_yz  — invariant in {y,z}: reset on pid_x change.
+ *                               Pointer depends on pid_x only.
+ *   __pim_load_persistent_xz  — invariant in {x,z}: reset on pid_y change.
+ *                               Pointer depends on pid_y only.
+ *   __pim_load_persistent_xy  — invariant in {x,y}: reset on pid_z change.
+ *                               Pointer depends on pid_z only.
+ *
+ * Loads whose pointer depends on multiple program-id axes are routed to
+ * __mem_trace_load (per-program-id reset) by the compiler-side classifier. */
+void __pim_load_persistent(void *addr, uint64_t size);
+void __pim_load_persistent_yz(void *addr, uint64_t size);
+void __pim_load_persistent_xz(void *addr, uint64_t size);
+void __pim_load_persistent_xy(void *addr, uint64_t size);
+
+/* Explicit reset of every persistent dedup state. Reserved for future MLIR-
+ * level tile-region scoping; phase changes already provide an implicit reset.
+ */
+void __pim_scope_release(int32_t scope_tag);
+
 #ifdef __cplusplus
 }
 #endif
