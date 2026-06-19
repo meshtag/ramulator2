@@ -81,10 +81,43 @@ void __pim_load_persistent_yz(void *addr, uint64_t size);
 void __pim_load_persistent_xz(void *addr, uint64_t size);
 void __pim_load_persistent_xy(void *addr, uint64_t size);
 
-/* Explicit reset of every persistent dedup state. Reserved for future MLIR-
- * level tile-region scoping; phase changes already provide an implicit reset.
- */
-void __pim_scope_release(int32_t scope_tag);
+/* ================================================================
+ *  Per-tensor broadcast-scalar hint
+ *
+ *  Tells the runtime that accesses to a registered tensor are
+ *  "broadcast scalar" reads — every bank reads the SAME physical
+ *  address per access, the value is broadcast on the bus once, and
+ *  subsequent re-reads of the same address (across program-id
+ *  boundaries, K-loop iterations, etc.) hit the PE's internal
+ *  register cache rather than re-broadcasting.
+ *
+ *  When set:
+ *    - Every access to the tensor routes through the xyz-invariant
+ *      persistent dedup state (g_dedup_persistent), regardless of
+ *      which entry point the LLVM classifier chose.
+ *    - Each unique physical (bank, row, col) tuple emits at most
+ *      ONCE for the entire COMPUTE phase. Repeated accesses to the
+ *      same tuple are suppressed (dedup hit).
+ *
+ *  Correctness invariant: this models a hardware PE-register cache
+ *  that retains broadcast operand values for the COMPUTE phase. It
+ *  does NOT collapse distinct physical tuples — different program-id
+ *  values that produce different addresses (e.g., conv2d weight
+ *  varying with pid_co) still emit each distinct tuple once. The flag
+ *  is safe to set on any tensor whose kernel-side access pattern is a
+ *  scalar broadcast (Triton scalar tl.load() with no per-bank
+ *  variation in the address).
+ *
+ *  Examples of correct use:
+ *    - matvec x:        scalar tl.load(x + k)
+ *    - matmul row-tiled A: scalar tl.load(A + pid_row*K + k)
+ *    - conv2d Weight:   scalar tl.load(w_ptr)
+ *
+ *  Examples where it would be UNSOUND (don't set):
+ *    - matmul B (vector tl.load — different banks read different cols)
+ *    - conv2d Input (vector tl.load with mask)
+ *    - any tensor where bank-id leaks into the address chain. */
+void pim_set_tensor_broadcast_scalar(int tensor_id, int on);
 
 #ifdef __cplusplus
 }

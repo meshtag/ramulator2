@@ -1,12 +1,14 @@
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -77,13 +79,119 @@ static int mapOpcode(unsigned LLVMOp) {
   }
 }
 
+/*
+ * Forward def-use walker to find the eventual StoreInst that a
+ * BinaryOperator's result flows into.
+ *
+ * Returns the StoreInst (DFS-first reached); the caller takes the
+ * store's pointer operand as the destination address. We return the
+ * Store rather than the address so the caller can insert the
+ * compute_trace call immediately before the Store — that guarantees
+ * the address (the Store's pointer operand) dominates the call site
+ * in SSA, avoiding "instruction does not dominate all uses" verifier
+ * failures that would result from instrumenting at the BO position
+ * where the destination address is computed later in program order.
+ *
+ * Walks transparently through value-propagating ops (BinaryOperator,
+ * PHINode, SelectInst, CastInst, vector shuffles, value-producing
+ * intrinsics like fmuladd/vector reductions). Stops at LoadInst,
+ * GEPs, int↔ptr conversions, and opaque calls — those don't propagate
+ * our value into a stored destination.
+ *
+ * Imprecision:
+ *   - Vector BO: all lanes resolve to the vector store's tile-base
+ *     pointer. For SIMDRAM's bit-serial layout where dq_bits values
+ *     share one col_slot, this resolves to the col_slot containing
+ *     the tile's first lane — acceptable granularity.
+ *   - DAG fan-out (BO feeds multiple stores): we return the first
+ *     store reached. Mild misattribution for fused-with-scratch
+ *     kernels.
+ *   - BO never stored: returns nullptr; caller falls back to
+ *     instrumenting at the BO position with a null dest_addr, which
+ *     the runtime resolves via current_acc.
+ */
+static StoreInst *findEventualStore(BinaryOperator *BO) {
+  SmallVector<Value *, 16> worklist;
+  SmallSet<Value *, 32> visited;
+  worklist.push_back(BO);
+
+  while (!worklist.empty()) {
+    Value *cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+
+    for (User *U : cur->users()) {
+      if (auto *Store = dyn_cast<StoreInst>(U)) {
+        if (Store->getValueOperand() == cur)
+          return Store;
+        continue;
+      }
+
+      if (isa<GetElementPtrInst>(U) || isa<LoadInst>(U) ||
+          isa<PtrToIntInst>(U) || isa<IntToPtrInst>(U))
+        continue;
+
+      if (auto *Call = dyn_cast<CallInst>(U)) {
+        if (auto *II = dyn_cast<IntrinsicInst>(Call)) {
+          switch (II->getIntrinsicID()) {
+          case Intrinsic::fmuladd:
+          case Intrinsic::fma:
+          case Intrinsic::minnum:
+          case Intrinsic::maxnum:
+          case Intrinsic::minimum:
+          case Intrinsic::maximum:
+          case Intrinsic::sqrt:
+          case Intrinsic::exp:
+          case Intrinsic::exp2:
+          case Intrinsic::log:
+          case Intrinsic::log2:
+          case Intrinsic::pow:
+          case Intrinsic::fabs:
+          case Intrinsic::vector_reduce_add:
+          case Intrinsic::vector_reduce_mul:
+          case Intrinsic::vector_reduce_fadd:
+          case Intrinsic::vector_reduce_fmul:
+          case Intrinsic::vector_reduce_fmax:
+          case Intrinsic::vector_reduce_fmin:
+            worklist.push_back(II);
+            break;
+          default:
+            break;
+          }
+        }
+        continue;
+      }
+
+      if (isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+          isa<SelectInst>(U) || isa<CastInst>(U) ||
+          isa<InsertElementInst>(U) || isa<ExtractElementInst>(U) ||
+          isa<InsertValueInst>(U) || isa<ExtractValueInst>(U) ||
+          isa<ShuffleVectorInst>(U) || isa<UnaryOperator>(U) ||
+          isa<CmpInst>(U) || isa<FreezeInst>(U)) {
+        worklist.push_back(U);
+        continue;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
 struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     LLVMContext &Ctx = M.getContext();
 
-    // void __compute_trace(int32_t opcode, int32_t bit_width)
+    // void __compute_trace(int32_t opcode, int32_t bit_width,
+    //                       void *dest_addr);
+    // dest_addr is the destination address that the BinaryOperator's
+    // result eventually flows into (via def-use chains). The runtime
+    // uses it to attribute compute to a specific output cell. A null
+    // dest_addr means "no destination determined" — the runtime falls
+    // back to current_acc-based addressing.
+    PointerType *PtrTy = PointerType::get(Ctx, /*AddressSpace=*/0);
     FunctionType *TraceFnTy = FunctionType::get(
-        Type::getVoidTy(Ctx), {Type::getInt32Ty(Ctx), Type::getInt32Ty(Ctx)},
+        Type::getVoidTy(Ctx),
+        {Type::getInt32Ty(Ctx), Type::getInt32Ty(Ctx), PtrTy},
         false);
 
     FunctionCallee ComputeFn =
@@ -109,13 +217,34 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
         }
       }
 
+      Value *NullPtr = ConstantPointerNull::get(PtrTy);
+
       for (auto *BO : BinOps) {
-        IRBuilder<> Builder(BO);
         int op = mapOpcode(BO->getOpcode());
         unsigned bits = BO->getType()->getScalarSizeInBits();
-        Builder.CreateCall(ComputeFn,
-                           {ConstantInt::get(Type::getInt32Ty(Ctx), op),
-                            ConstantInt::get(Type::getInt32Ty(Ctx), bits)});
+        Value *opArg = ConstantInt::get(Type::getInt32Ty(Ctx), op);
+        Value *bitsArg = ConstantInt::get(Type::getInt32Ty(Ctx), bits);
+
+        // Forward def-use to find the BinaryOp's eventual store.
+        // Insert __compute_trace at the STORE position (not the BO
+        // position) so the dest_addr (the store's pointer operand)
+        // dominates the call — instrumenting at the BO would reference
+        // a not-yet-defined SSA value and trip the LLVM verifier.
+        StoreInst *Store = findEventualStore(BO);
+
+        if (Store) {
+          IRBuilder<> Builder(Store);
+          Value *DestAddr = Store->getPointerOperand();
+          if (DestAddr->getType() != PtrTy)
+            DestAddr = Builder.CreateBitOrPointerCast(DestAddr, PtrTy);
+          Builder.CreateCall(ComputeFn, {opArg, bitsArg, DestAddr});
+        } else {
+          // No store found — instrument at the BO position with a
+          // null dest_addr; the runtime falls back to current_acc.
+          IRBuilder<> Builder(BO->getNextNode() ? BO->getNextNode()
+                                                : (Instruction *)BO);
+          Builder.CreateCall(ComputeFn, {opArg, bitsArg, NullPtr});
+        }
         Modified = true;
       }
     }

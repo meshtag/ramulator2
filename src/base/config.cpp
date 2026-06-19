@@ -100,7 +100,12 @@ void Config::Details::override_configs(YAML::Node config, const std::vector<std:
     for (const auto& token : tokens) {
       std::vector<uint> indices;
 
-      std::regex match_brackets("\\[(\\d+)]");
+      // POSIX-portable regex: macOS libc++ parser rejects both `\\d`
+      // (unsupported shorthand outside a character class) and the
+      // unescaped `]`, throwing "parser did not consume the entire
+      // regular expression" at construction. Use [0-9] and escape the
+      // closing bracket explicitly.
+      std::regex match_brackets("\\[([0-9]+)\\]");
       std::sregex_iterator it(token.begin(), token.end(), match_brackets);
       std::sregex_iterator end;
 
