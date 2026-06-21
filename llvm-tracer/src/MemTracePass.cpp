@@ -104,6 +104,21 @@ static unsigned programIdAxesMask(Value *V, SmallPtrSetImpl<Value *> &Visited,
   return 0;
 }
 
+// Scratchpad (on-chip PE register file / SRAM) address space. Memory ops in
+// this space are NOT DRAM: they model operand reuse the im-operand-residency-
+// layout lowering has staged into on-chip scratchpad (loaded once from global,
+// then reused). MemTracePass therefore emits NO DRAM trace event for them, so
+// the trace faithfully contains only real DRAM traffic — reuse realized in the
+// IR, not by a runtime dedup (Phase B). The IM lowering must place scratchpad
+// allocations and their loads/stores in this address space.
+static constexpr unsigned IM_SCRATCHPAD_ADDRSPACE = 7;
+
+static bool isScratchpadAccess(const Value *Ptr) {
+  Type *T = Ptr->getType();
+  return T->isPointerTy() &&
+         T->getPointerAddressSpace() == IM_SCRATCHPAD_ADDRSPACE;
+}
+
 struct MemTracePass : public PassInfoMixin<MemTracePass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     LLVMContext &Ctx = M.getContext();
@@ -169,10 +184,14 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
       SmallVector<StoreInst *, 64> Stores;
       for (auto &BB : F) {
         for (auto &I : BB) {
-          if (auto *LI = dyn_cast<LoadInst>(&I))
-            Loads.push_back(LI);
-          else if (auto *SI = dyn_cast<StoreInst>(&I))
-            Stores.push_back(SI);
+          // Scratchpad accesses are on-chip (reuse), not DRAM — do not trace.
+          if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (!isScratchpadAccess(LI->getPointerOperand()))
+              Loads.push_back(LI);
+          } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (!isScratchpadAccess(SI->getPointerOperand()))
+              Stores.push_back(SI);
+          }
         }
       }
 
