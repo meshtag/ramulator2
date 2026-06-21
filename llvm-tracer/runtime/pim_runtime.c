@@ -1030,21 +1030,31 @@ void pim_init(const char *trace_file) {
     if (perpid_cap < 16) perpid_cap = 16;
     if (persistent_cap < 16) persistent_cap = 16;
 
-    g_dedup               = addr_dedup_create(perpid_cap);
-    g_dedup_persistent    = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_yz  = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_xz  = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_xy  = addr_dedup_create(persistent_cap);
-    g_dedup_store_perpid  = addr_dedup_create(perpid_cap);
-    g_dedup_lockstep      = addr_dedup_create(perpid_cap);
-  } else {
-    g_dedup = NULL;
-    g_dedup_persistent = NULL;
-    g_dedup_invariant_yz = NULL;
-    g_dedup_invariant_xz = NULL;
-    g_dedup_invariant_xy = NULL;
-    g_dedup_store_perpid = NULL;
-    g_dedup_lockstep = NULL;
+    // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
+    // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
+    // per (pid,bank). It is allocated independently of g_dedup_enabled so the
+    // blank operand dedups (per-pid physical + persistent scope) can be
+    // disabled (IM_DEDUP=0) while lockstep stays on. (Previously g_dedup_lockstep
+    // lived inside the g_dedup_enabled block, so IM_DEDUP=0 silently killed
+    // lockstep too — conflating an artifact correction with the blank dedups.)
+    // See docs/ablation-levers-plan.md.
+    g_dedup_lockstep = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
+
+    if (g_dedup_enabled) {
+      g_dedup               = addr_dedup_create(perpid_cap);
+      g_dedup_persistent    = addr_dedup_create(persistent_cap);
+      g_dedup_invariant_yz  = addr_dedup_create(persistent_cap);
+      g_dedup_invariant_xz  = addr_dedup_create(persistent_cap);
+      g_dedup_invariant_xy  = addr_dedup_create(persistent_cap);
+      g_dedup_store_perpid  = addr_dedup_create(perpid_cap);
+    } else {
+      g_dedup = NULL;
+      g_dedup_persistent = NULL;
+      g_dedup_invariant_yz = NULL;
+      g_dedup_invariant_xz = NULL;
+      g_dedup_invariant_xy = NULL;
+      g_dedup_store_perpid = NULL;
+    }
   }
   stat_persistent_skips = 0;
   stat_invariant_yz_skips = 0;
