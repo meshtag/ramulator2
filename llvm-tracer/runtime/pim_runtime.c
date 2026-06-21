@@ -1022,13 +1022,43 @@ void pim_init(const char *trace_file) {
    * If a table fills, the dedup primitive falls back to "treat as new"
    * (over-emit, never under-emit), so undersizing degrades performance
    * gracefully without affecting correctness. */
-  if (g_dedup_enabled) {
-    int perpid_cap = 16384;
-    int persistent_cap = 262144;
+  {
+    /* Faithful per-bank residency capacity. Operand reuse is served from a
+     * PE-local resident buffer (~one row buffer per bank): a re-read of
+     * resident data hits the buffer (no DRAM event), a re-read beyond capacity
+     * re-fetches. The default capacity is therefore PHYSICAL — active_banks ×
+     * per-bank buffer (row-buffer ≈ num_cols values-of-columns) — rather than
+     * the old 256K "blank" cap that modeled an unphysical unbounded operand
+     * cache. The dedup table keys on global_bank, so an aggregate cap of
+     * active_banks × per_bank approximates per-bank residency for the regular
+     * (evenly bank-spread) GEMM/conv layouts. Override the per-bank buffer with
+     * IM_RESIDENT_PER_BANK, or set the aggregate directly with IM_DEDUP_CAP /
+     * IM_PERSISTENT_CAP. See docs/ablation-levers-plan.md. */
+    int active_banks =
+        cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    if (active_banks < 1) active_banks = 1;
+    /* Per-bank resident operand budget, in elements. A residency hit is served
+     * from the PE register file with no DRAM event, so the physical bound is
+     * the PE register capacity: HBM-PIM GRF 16x256b = 128 int32 + SRF 8x32b = 8,
+     * ~136 int32/bank. The measured per-bank reuse working sets (matvec 8,
+     * matmul 24, conv 136) all fit this — i.e. operand reuse here is
+     * register-resident, not an unphysical large cache. Override with
+     * IM_RESIDENT_PER_BANK. */
+    int resident_per_bank = 136; /* PE register file: GRF(128) + SRF(8) int32 */
+    if ((v = getenv("IM_RESIDENT_PER_BANK"))) resident_per_bank = atoi(v);
+    if (resident_per_bank < 1) resident_per_bank = 1;
+    int physical_cap = active_banks * resident_per_bank;
+
+    int perpid_cap = physical_cap;
+    int persistent_cap = physical_cap;
     if ((v = getenv("IM_DEDUP_CAP"))      ) perpid_cap = atoi(v);
     if ((v = getenv("IM_PERSISTENT_CAP")) ) persistent_cap = atoi(v);
     if (perpid_cap < 16) perpid_cap = 16;
     if (persistent_cap < 16) persistent_cap = 16;
+    fprintf(stderr,
+            "[pim-runtime] residency cap: %d/bank x %d banks = %d "
+            "(physical row-buffer model; was 256K blank)\n",
+            resident_per_bank, active_banks, physical_cap);
 
     // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
     // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
