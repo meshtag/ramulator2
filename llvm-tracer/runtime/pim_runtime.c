@@ -239,6 +239,33 @@ static uint64_t stat_store_coalesced = 0; /* per-call BWs collapsed when a
 static addr_dedup_state_t *g_dedup = NULL;
 static int g_dedup_enabled = 1;
 
+/* Matched-reuse fairness mode. Default = 0 (off). EXPERIMENTAL.
+ *
+ * Set IM_MATCHED_REUSE=1 to model operand/weight reuse the SAME way
+ * OptiPIM does: emit each operand/weight re-read and let the shared
+ * Ramulator row-buffer model charge it (cheap on a row-hit, full ACT on
+ * a miss) instead of zeroing it at trace level. This makes the
+ * per-operator comparison apples-to-apples on the reuse cost model
+ * (OptiPIM is already row-buffer-charged).
+ *
+ * When ON:
+ *   - the per-pid (g_dedup) and the four persistent axis-scope dedups are
+ *     DISABLED for STREAMED/OPERAND loads (temporal/cross-pid re-reads are
+ *     emitted, not collapsed), and the bcast_scalar->persistent unbounded
+ *     promotion is suppressed;
+ *   - lockstep bank-collapse stays as in default mode: it collapses STREAMED
+ *     bank-replicas (genuine broadcast: all banks read the same (sa,row,col)),
+ *     but OPERAND loads keep the lockstep BYPASS so per-bank operand work
+ *     stays SPREAD across the 32 banks — matching OptiPIM codegen_bank_new,
+ *     which fans each input write across all spatial banks (input
+ *     replication) rather than serializing on one bank. (An earlier version
+ *     collapsed operands onto bank 0, which serialized OptiPIM-parallel work
+ *     and inflated cycles — reverted.)
+ *   - ACCUMULATOR residency (psum in PE register; in-capacity, fair) and
+ *     per-BG broadcast fanout are PRESERVED.
+ * Default OFF so no other measurement regresses. */
+static int g_matched_mode = 0;
+
 /* bcast_scalar global enable flag. Default = 1 (on).
  *
  * Gates the per-tensor bcast_scalar bit set by
@@ -392,6 +419,78 @@ static uint64_t stat_invariant_xy_skips = 0;
 static addr_dedup_state_t *g_dedup_lockstep = NULL;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
+
+/* ============================================================
+ *  Per-bank LRU residency cache (faithful PE-register model)
+ *
+ *  Models each PE's register file as a fixed-capacity, fully-
+ *  associative LRU cache: an operand re-read that is still resident
+ *  is served from the register (NO DRAM event); a re-read of an
+ *  evicted operand re-fetches. This replaces the first-N addr_dedup
+ *  residency, which skipped the *first N tuples seen* rather than the
+ *  N *currently resident* — only an LRU faithfully models "still in a
+ *  register" (so a skip provably means register-resident). Fully
+ *  associative + LRU is the best-case capacity model: if reuse does
+ *  not fit this, it cannot fit a real (set-associative) GRF either.
+ *  Enable with IM_LRU_RESIDENCY=1; capacity = g_resident_per_bank.
+ * ============================================================ */
+#define LRU_EMPTY ((uint64_t)-1)
+typedef struct {
+  int cap;
+  uint64_t *keys;
+  uint64_t *ts;
+  uint64_t clock;
+} lru_cache_t;
+static lru_cache_t *g_lru_resident[MAX_BANKS];
+static int g_lru_residency = 0;
+static int g_resident_per_bank = 136;
+
+static lru_cache_t *lru_create(int cap) {
+  if (cap < 1) cap = 1;
+  lru_cache_t *c = (lru_cache_t *)calloc(1, sizeof(lru_cache_t));
+  c->cap = cap;
+  c->keys = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
+  c->ts = (uint64_t *)calloc((size_t)cap, sizeof(uint64_t));
+  for (int i = 0; i < cap; i++)
+    c->keys[i] = LRU_EMPTY;
+  c->clock = 0;
+  return c;
+}
+/* Returns 1 if `key` is resident (HIT, caller skips DRAM), 0 if not
+ * (MISS: inserted, LRU victim evicted if full; caller emits). */
+static int lru_touch(lru_cache_t *c, uint64_t key) {
+  c->clock++;
+  int empty = -1, victim = 0;
+  uint64_t victim_ts = UINT64_MAX;
+  for (int i = 0; i < c->cap; i++) {
+    if (c->keys[i] == key) {
+      c->ts[i] = c->clock;
+      return 1; /* HIT */
+    }
+    if (c->keys[i] == LRU_EMPTY) {
+      if (empty < 0)
+        empty = i;
+    } else if (c->ts[i] < victim_ts) {
+      victim_ts = c->ts[i];
+      victim = i;
+    }
+  }
+  int slot = (empty >= 0) ? empty : victim;
+  c->keys[slot] = key;
+  c->ts[slot] = c->clock;
+  return 0; /* MISS */
+}
+static void lru_reset(lru_cache_t *c) {
+  if (!c)
+    return;
+  for (int i = 0; i < c->cap; i++)
+    c->keys[i] = LRU_EMPTY;
+  c->clock = 0;
+}
+static inline uint64_t lru_key(int tensor_id, uint64_t linear_row, int col) {
+  return ((uint64_t)(tensor_id & 0x3F) << 58) |
+         ((linear_row & 0x3FFFFFFFFFFULL) << 16) | ((uint64_t)col & 0xFFFF);
+}
 
 /* Per-program-id store dedup for ACCUMULATOR tensors.
  *
@@ -1011,6 +1110,15 @@ void pim_init(const char *trace_file) {
           "[pim-runtime] lockstep_collapse=%d (set PIM_LOCKSTEP_COLLAPSE=0 to disable)\n",
           g_lockstep_enabled);
 
+  /* Matched-reuse fairness mode (default OFF). See g_matched_mode
+   * declaration. Set IM_MATCHED_REUSE=1 to charge operand/weight
+   * re-reads via the row-buffer model instead of zeroing them. */
+  const char *matched_env = getenv("IM_MATCHED_REUSE");
+  g_matched_mode = (matched_env && matched_env[0] == '1') ? 1 : 0;
+  fprintf(stderr,
+          "[pim-runtime] matched_reuse=%d (set IM_MATCHED_REUSE=1 to enable)\n",
+          g_matched_mode);
+
   /* Dedup-table capacities. Defaults are tuned for ~tens-of-thousands of
    * unique (bank,row,col) tuples per scope, which covers single-channel
    * HBM3-PIM problem sizes. Override via env vars when running larger
@@ -1059,6 +1167,23 @@ void pim_init(const char *trace_file) {
             "[pim-runtime] residency cap: %d/bank x %d banks = %d "
             "(physical row-buffer model; was 256K blank)\n",
             resident_per_bank, active_banks, physical_cap);
+
+    /* Faithful per-bank LRU residency (IM_LRU_RESIDENCY=1): model each PE's
+     * register file as a fully-associative LRU cache of g_resident_per_bank
+     * entries, instead of the first-N addr_dedup. Persists across program-ids
+     * within a COMPUTE phase (reset in pim_set_phase) — same scope as the
+     * persistent dedup, so this is an apples-to-apples LRU-vs-first-N swap. */
+    g_resident_per_bank = resident_per_bank;
+    const char *lru_env = getenv("IM_LRU_RESIDENCY");
+    g_lru_residency = (lru_env && lru_env[0] == '1') ? 1 : 0;
+    if (g_lru_residency) {
+      for (int b = 0; b < active_banks && b < MAX_BANKS; b++)
+        g_lru_resident[b] = lru_create(resident_per_bank);
+      fprintf(stderr,
+              "[pim-runtime] LRU residency ON: per-bank register cache, "
+              "%d entries/bank (faithful; replaces first-N dedup)\n",
+              resident_per_bank);
+    }
 
     // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
     // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
@@ -1436,6 +1561,13 @@ void pim_set_phase(pim_phase_t phase) {
       addr_dedup_reset(g_dedup_invariant_xy);
     if (g_dedup_store_perpid)
       addr_dedup_reset(g_dedup_store_perpid);
+    /* The per-bank register cache persists across program-ids but is cleared at
+     * a phase boundary (a distinct logical workload). */
+    if (g_lru_residency) {
+      int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+      for (int b = 0; b < n_banks && b < MAX_BANKS; b++)
+        lru_reset(g_lru_resident[b]);
+    }
   }
   cur_phase = phase;
 }
@@ -1567,9 +1699,30 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    *     with the existing per-pid store dedup to produce 1 R + 1 BW
    *     per accumulator tuple per pid (matching OptiPIM).
    *   - Stores are handled separately (per-program-id store dedup, below). */
-  if (g_dedup_enabled && g_dedup && cur_phase == PIM_PHASE_COMPUTE &&
-      !is_write &&
+  if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
       (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND ||
+       (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
+    /* Faithful PE-register residency: a hit is served from the register
+     * (no DRAM event); a miss re-fetches (LRU eviction at GRF capacity).
+     * Unifies the per-pid / persistent / bcast scopes into one physical
+     * per-bank register cache. */
+    int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
+    uint64_t linear_row =
+        (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+    lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
+                             ? g_lru_resident[global_bank]
+                             : NULL;
+    if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
+                                          (int)loc.col))) {
+      t->dedup_skips++;
+      if (t->role == PIM_ROLE_ACCUMULATOR)
+        stat_acc_resident_skips++;
+      return; /* resident in PE register cache; no DRAM event */
+    }
+  } else if (g_dedup_enabled && g_dedup && cur_phase == PIM_PHASE_COMPUTE &&
+      !is_write &&
+      ((!g_matched_mode &&
+        (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) ||
        (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
     /* For tensors flagged as broadcast-scalar (kernel reads them with
      * the same physical address from every bank), promote dedup to the
@@ -1692,7 +1845,8 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
     return;
   }
 
-  if (g_dedup_enabled && dedup_state && cur_phase == PIM_PHASE_COMPUTE &&
+  if (!g_matched_mode && g_dedup_enabled && dedup_state &&
+      cur_phase == PIM_PHASE_COMPUTE &&
       (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) {
     /* Broadcast-scalar promotion: when the tensor is flagged, override
      * whatever axis-scope persistent state the LLVM classifier picked
