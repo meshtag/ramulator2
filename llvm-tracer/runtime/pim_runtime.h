@@ -32,6 +32,21 @@ typedef enum {
   PIM_OP_COUNT
 } pim_op_t;
 
+/* Reuse-as-layout: the physical layout/residency class decided by the
+ * compiler's im-operand-residency-layout pass (the explicit, heuristic
+ * analog of OptiPIM's DataLayout MILP) and pushed in via
+ * pim_set_tensor_layout(). UNSET (=0) is the zero-initialized default for
+ * every registered tensor and means "no compiler layout decision" — the
+ * runtime maps elements and accounts for reuse exactly as before. The
+ * non-UNSET kinds mirror the pass's reuse_class values. */
+typedef enum {
+  PIM_LAYOUT_KIND_UNSET = 0,   /* default: legacy behavior, no change */
+  PIM_LAYOUT_KIND_RESIDENT,    /* stationary operand: read-once, bank-resident */
+  PIM_LAYOUT_KIND_BANK_SPREAD, /* parallel output dim spread across the banks */
+  PIM_LAYOUT_KIND_ROW_DUP,     /* broadcast operand replicated per bank-group */
+  PIM_LAYOUT_KIND_LEADER       /* represented on a single leader bank */
+} pim_layout_kind_t;
+
 /* Initialize the PIM runtime, open the trace file */
 void pim_init(const char *trace_file);
 
@@ -118,6 +133,34 @@ void __pim_load_persistent_xy(void *addr, uint64_t size);
  *    - conv2d Input (vector tl.load with mask)
  *    - any tensor where bank-id leaks into the address chain. */
 void pim_set_tensor_broadcast_scalar(int tensor_id, int on);
+
+/* ================================================================
+ *  Per-tensor reuse-as-layout descriptor (compiler-decided)
+ *
+ *  Pushed in by benchmarks/pass_ablation.py from the per-operand
+ *  decisions stamped by the im-operand-residency-layout MLIR pass
+ *  (carried in ccinfo.metadata, keyed by the kernel pointer-arg index,
+ *  which maps 1:1 to the registered tensor id since pointer args are
+ *  registered first and in order). This is the explicit, compiler-side
+ *  realization of operand reuse — the alternative to recovering it
+ *  post-hoc from trace dedup, and the basis for an apples-to-apples
+ *  layout comparison against OptiPIM.
+ *
+ *    layout_kind        - pim_layout_kind_t (UNSET => no change)
+ *    reduction_col_axis - tensor axis to place on the column-low bits
+ *                         (the contraction dim), or -1 if none
+ *    bank_spread_mask   - bitmask of tensor axes spread across the banks
+ *    resident_capacity  - resident working-set budget in tuples; 0 means
+ *                         unbounded (current behavior). A later increment
+ *                         charges reuse beyond this budget as a re-fetch.
+ *
+ *  ABI-only at this stage: recording these fields changes no emitted
+ *  trace until a later increment teaches map_element and the dedup
+ *  accounting to honor them. Absent this call (e.g. an older runtime
+ *  build) every tensor stays UNSET, so existing traces are unaffected. */
+void pim_set_tensor_layout(int tensor_id, int layout_kind,
+                           int reduction_col_axis, uint32_t bank_spread_mask,
+                           int resident_capacity);
 
 #ifdef __cplusplus
 }

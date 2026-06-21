@@ -165,6 +165,16 @@ typedef struct {
   int duplicated;
   int dup_row_base[MAX_BANKS];
 
+  /* Reuse-as-layout descriptor, set by pim_set_tensor_layout() from the
+   * compiler's im-operand-residency-layout decisions. layout_kind=UNSET
+   * (=0, the zero-initialized default for the static tensors[] array)
+   * preserves every existing mapping and accounting path unchanged. The
+   * other fields are recorded now and consumed by a later increment. */
+  int layout_kind;           /* pim_layout_kind_t */
+  int reduction_col_axis;    /* contraction axis -> column-low bits; -1 = none */
+  uint32_t bank_spread_mask; /* bitmask of tensor axes spread across banks */
+  int resident_capacity;     /* resident budget in tuples; 0 = unbounded */
+
   /* Per-tensor diagnostic counters (Stage 0). Emitted = trace lines actually
    * written; dedup_skips = times check_and_mark returned 0 for this tensor;
    * range_calls = number of __mem_trace_load/store invocations into this
@@ -249,6 +259,14 @@ static int g_dedup_enabled = 1;
  * cross-pid dedup. Useful for ablation against an OptiPIM PimCodeGen run
  * that does NOT use alloc_method=row_duplicate. */
 static int g_bcast_scalar_enabled = 1;
+/* Reuse-as-layout honoring (default OFF). When IM_HONOR_LAYOUT=1, the
+ * compiler-decided layout pushed in via pim_set_tensor_layout() drives
+ * physical placement (currently ROW_DUP -> per-BG resident replication, the
+ * same audited path as a manual broadcast_scalar, matching OptiPIM's
+ * alloc_method=row_duplicate). Default 0 keeps pim_set_tensor_layout()
+ * ABI-only (record + log, no behavior change) so existing traces are
+ * byte-identical and A/B comparison is a single env flag. */
+static int g_honor_layout = 0;
 
 /* Accumulator residency. Default = 1 (on).
  *
@@ -942,6 +960,16 @@ void pim_init(const char *trace_file) {
   fprintf(stderr, "[pim-runtime] bcast_scalar=%d (set PIM_BCAST_SCALAR=0 to disable)\n",
           g_bcast_scalar_enabled);
 
+  /* Reuse-as-layout honoring knob (default OFF). When set, the compiler's
+   * layout decisions (pim_set_tensor_layout) drive physical placement. See
+   * g_honor_layout. */
+  const char *honor_env = getenv("IM_HONOR_LAYOUT");
+  g_honor_layout = (honor_env && honor_env[0] == '1') ? 1 : 0;
+  fprintf(stderr,
+          "[pim-runtime] honor_layout=%d (set IM_HONOR_LAYOUT=1 to let the "
+          "compiler layout drive placement)\n",
+          g_honor_layout);
+
   /* Per-BG broadcast modeling knob (default ON). Emits
    * cfg_num_channels * cfg_num_pch * cfg_num_bg W events per unique
    * scalar broadcast (one per bank-group's I/O bus cycle). Set
@@ -1291,6 +1319,61 @@ void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
       g_per_bg_bcast_enabled && g_duplicate_bcast_enabled &&
       !tensors[tensor_id].duplicated) {
     duplicate_bcast_tensor_per_bg(&tensors[tensor_id]);
+  }
+}
+
+/* Record the compiler-decided reuse-as-layout descriptor for a tensor.
+ * Mirrors pim_set_tensor_broadcast_scalar: bounds-check, store the fields,
+ * log. ABI-only at this stage — the fields are recorded but not yet read by
+ * map_element or the dedup accounting, so calling this leaves every emitted
+ * trace byte-identical. A later increment teaches the mapping/accounting to
+ * honor layout_kind / reduction_col_axis / bank_spread_mask /
+ * resident_capacity. */
+void pim_set_tensor_layout(int tensor_id, int layout_kind,
+                           int reduction_col_axis, uint32_t bank_spread_mask,
+                           int resident_capacity) {
+  if (tensor_id < 0 || tensor_id >= num_tensors) {
+    fprintf(stderr,
+            "[pim-runtime] WARN: pim_set_tensor_layout tensor_id=%d "
+            "out of range [0,%d); ignored.\n",
+            tensor_id, num_tensors);
+    return;
+  }
+  tensor_info_t *t = &tensors[tensor_id];
+  t->layout_kind = layout_kind;
+  t->reduction_col_axis = reduction_col_axis;
+  t->bank_spread_mask = bank_spread_mask;
+  t->resident_capacity = resident_capacity;
+
+  static const char *kind_names[] = {"UNSET", "RESIDENT", "BANK_SPREAD",
+                                     "ROW_DUP", "LEADER"};
+  const char *kname =
+      (layout_kind >= 0 && layout_kind <= PIM_LAYOUT_KIND_LEADER)
+          ? kind_names[layout_kind]
+          : "?";
+  fprintf(stderr,
+          "[pim-runtime] tensor %d: layout_kind=%s reduction_col_axis=%d "
+          "bank_spread_mask=0x%x resident_capacity=%d (honor=%d)\n",
+          tensor_id, kname, reduction_col_axis, bank_spread_mask,
+          resident_capacity, g_honor_layout);
+
+  if (!g_honor_layout)
+    return; /* ABI-only: record the descriptor, change no emitted trace */
+
+  /* Honor the layout decision by driving the existing physical-placement
+   * machinery. ROW_DUP (the pass's BroadcastReplicate class) maps onto the
+   * per-BG resident replication map_element already implements, which matches
+   * OptiPIM's alloc_method=row_duplicate — the FAIR layout for a scalar-
+   * broadcast operand and the compiler-decided replacement for a manual
+   * broadcast_scalar annotation. BANK_SPREAD is the default placement (no
+   * change); RESIDENT/LEADER and reduction_col_axis/resident_capacity
+   * honoring land in a later increment. */
+  switch (layout_kind) {
+  case PIM_LAYOUT_KIND_ROW_DUP:
+    pim_set_tensor_broadcast_scalar(tensor_id, 1);
+    break;
+  default:
+    break;
   }
 }
 
