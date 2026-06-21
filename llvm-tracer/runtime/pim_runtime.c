@@ -1871,31 +1871,44 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
     return;
   }
 
-  if (!g_matched_mode && g_dedup_enabled && dedup_state &&
-      cur_phase == PIM_PHASE_COMPUTE &&
+  if (cur_phase == PIM_PHASE_COMPUTE &&
       (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) {
-    /* Broadcast-scalar promotion: when the tensor is flagged, override
-     * whatever axis-scope persistent state the LLVM classifier picked
-     * with the xyz-invariant g_dedup_persistent. This catches repeats
-     * across program-id boundaries that axis-scoped resets would
-     * otherwise miss. See pim_set_tensor_broadcast_scalar() in the
-     * header for the correctness invariant. */
-    addr_dedup_state_t *use_state = dedup_state;
-    uint64_t *use_skips = state_skips;
-    if (t->bcast_scalar && g_dedup_persistent) {
-      use_state = g_dedup_persistent;
-      use_skips = &stat_persistent_skips;
-    }
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (!addr_dedup_check_and_mark(use_state, (uint64_t)global_bank,
-                                   linear_row, (uint64_t)loc.col)) {
-      t->persistent_skips++;
-      if (use_skips)
-        (*use_skips)++;
-      return;
+    if (g_lru_residency) {
+      /* Faithful path: route pid-invariant operand reuse (e.g. matmul B
+       * reused across M-tiles) through the SAME per-bank register cache as
+       * the per-pid path — one physical PE register file. A skip provably
+       * means register-resident at GRF capacity, not a first-N artifact. */
+      lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
+                               ? g_lru_resident[global_bank]
+                               : NULL;
+      if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
+                                            (int)loc.col))) {
+        t->persistent_skips++;
+        stat_persistent_skips++;
+        return;
+      }
+    } else if (!g_matched_mode && g_dedup_enabled && dedup_state) {
+      /* Legacy first-N path. Broadcast-scalar promotion: when flagged,
+       * override the axis-scope persistent state the LLVM classifier picked
+       * with the xyz-invariant g_dedup_persistent (catches repeats across
+       * program-id boundaries that axis-scoped resets would miss). */
+      addr_dedup_state_t *use_state = dedup_state;
+      uint64_t *use_skips = state_skips;
+      if (t->bcast_scalar && g_dedup_persistent) {
+        use_state = g_dedup_persistent;
+        use_skips = &stat_persistent_skips;
+      }
+      if (!addr_dedup_check_and_mark(use_state, (uint64_t)global_bank,
+                                     linear_row, (uint64_t)loc.col)) {
+        t->persistent_skips++;
+        if (use_skips)
+          (*use_skips)++;
+        return;
+      }
     }
   }
 
