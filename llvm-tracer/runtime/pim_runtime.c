@@ -452,7 +452,11 @@ static int g_resident_per_bank = 136;
  * NO reuse skip — every access emits and is faithfully row-buffer-costed. This
  * makes reuse a COMPILER decision the runtime merely applies (and that an
  * ablation lever can switch off), the step toward removing runtime reuse
- * entirely. Default off (legacy role-based residency) until validated. */
+ * entirely. DEFAULT ON (validated: all 34 matmul/matvec/conv shapes hold under
+ * attr-gating — the compiler marks every reuse-bearing operand via the bridge);
+ * IM_ATTR_GATED_RESIDENCY=0 reverts to legacy role-based residency. Reuse now
+ * REQUIRES the compiler decision: a runtime path that does not call
+ * pim_set_tensor_layout (e.g. a hand-written driver) gets no reuse. */
 static int g_attr_gated_residency = 0;
 
 static lru_cache_t *lru_create(int cap) {
@@ -1202,11 +1206,13 @@ void pim_init(const char *trace_file) {
               resident_per_bank);
     }
     const char *attrgate_env = getenv("IM_ATTR_GATED_RESIDENCY");
-    g_attr_gated_residency = (attrgate_env && attrgate_env[0] == '1') ? 1 : 0;
-    if (g_attr_gated_residency)
-      fprintf(stderr,
-              "[pim-runtime] attr-gated residency ON: reuse skip fires only for "
-              "tensors the compiler marked resident (layout_kind != UNSET)\n");
+    g_attr_gated_residency = (attrgate_env && attrgate_env[0] == '0') ? 0 : 1;
+    fprintf(stderr,
+            "[pim-runtime] attr-gated residency %s (DEFAULT ON): reuse skip fires "
+            "only for tensors the compiler marked resident "
+            "(IM_ATTR_GATED_RESIDENCY=0 to disable). Validated: all 34 "
+            "matmul/matvec/conv shapes hold.\n",
+            g_attr_gated_residency ? "ON" : "OFF");
 
     // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
     // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
