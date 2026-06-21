@@ -1174,14 +1174,21 @@ void pim_init(const char *trace_file) {
      * within a COMPUTE phase (reset in pim_set_phase) — same scope as the
      * persistent dedup, so this is an apples-to-apples LRU-vs-first-N swap. */
     g_resident_per_bank = resident_per_bank;
+    /* DEFAULT ON: the faithful per-bank LRU register cache is the default
+     * residency model — a skip provably means register-resident. Set
+     * IM_LRU_RESIDENCY=0 to fall back to the (verified-equivalent, faster)
+     * legacy first-N dedup. This is an interim faithful model; the goal is for
+     * reuse to be decided by the compiler (im.residency attrs) and ultimately
+     * realized in codegen so the runtime needs no reuse skip at all. */
     const char *lru_env = getenv("IM_LRU_RESIDENCY");
-    g_lru_residency = (lru_env && lru_env[0] == '1') ? 1 : 0;
+    g_lru_residency = (lru_env && lru_env[0] == '0') ? 0 : 1;
     if (g_lru_residency) {
       for (int b = 0; b < active_banks && b < MAX_BANKS; b++)
         g_lru_resident[b] = lru_create(resident_per_bank);
       fprintf(stderr,
-              "[pim-runtime] LRU residency ON: per-bank register cache, "
-              "%d entries/bank (faithful; replaces first-N dedup)\n",
+              "[pim-runtime] LRU residency ON (default): per-bank register "
+              "cache, %d entries/bank (faithful; IM_LRU_RESIDENCY=0 for legacy "
+              "first-N)\n",
               resident_per_bank);
     }
 
