@@ -445,6 +445,16 @@ static lru_cache_t *g_lru_resident[MAX_BANKS];
 static int g_lru_residency = 0;
 static int g_resident_per_bank = 136;
 
+/* Phase A: attr-gated residency (IM_ATTR_GATED_RESIDENCY=1). When set, a tensor
+ * gets the register-residency reuse skip ONLY if the compiler marked it
+ * reuse-bearing (t->layout_kind != UNSET, set via pim_set_tensor_layout from the
+ * im.residency attrs). Absent a compiler decision (UNSET, e.g. no bridge call),
+ * NO reuse skip — every access emits and is faithfully row-buffer-costed. This
+ * makes reuse a COMPILER decision the runtime merely applies (and that an
+ * ablation lever can switch off), the step toward removing runtime reuse
+ * entirely. Default off (legacy role-based residency) until validated. */
+static int g_attr_gated_residency = 0;
+
 static lru_cache_t *lru_create(int cap) {
   if (cap < 1) cap = 1;
   lru_cache_t *c = (lru_cache_t *)calloc(1, sizeof(lru_cache_t));
@@ -1191,6 +1201,12 @@ void pim_init(const char *trace_file) {
               "first-N)\n",
               resident_per_bank);
     }
+    const char *attrgate_env = getenv("IM_ATTR_GATED_RESIDENCY");
+    g_attr_gated_residency = (attrgate_env && attrgate_env[0] == '1') ? 1 : 0;
+    if (g_attr_gated_residency)
+      fprintf(stderr,
+              "[pim-runtime] attr-gated residency ON: reuse skip fires only for "
+              "tensors the compiler marked resident (layout_kind != UNSET)\n");
 
     // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
     // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
@@ -1707,6 +1723,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    *     per accumulator tuple per pid (matching OptiPIM).
    *   - Stores are handled separately (per-program-id store dedup, below). */
   if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
+      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND ||
        (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
     /* Faithful PE-register residency: a hit is served from the register
@@ -1728,6 +1745,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     }
   } else if (g_dedup_enabled && g_dedup && cur_phase == PIM_PHASE_COMPUTE &&
       !is_write &&
+      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       ((!g_matched_mode &&
         (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) ||
        (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
@@ -1770,6 +1788,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    */
   if (g_dedup_enabled && g_dedup_store_perpid &&
       cur_phase == PIM_PHASE_COMPUTE && is_write &&
+      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       t->role == PIM_ROLE_ACCUMULATOR) {
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
@@ -1854,6 +1873,7 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
 
   if (!g_matched_mode && g_dedup_enabled && dedup_state &&
       cur_phase == PIM_PHASE_COMPUTE &&
+      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) {
     /* Broadcast-scalar promotion: when the tensor is flagged, override
      * whatever axis-scope persistent state the LLVM classifier picked
@@ -1998,7 +2018,8 @@ static void pim_trace_store_tile_coalesced(tensor_info_t *t, uint64_t base_addr,
     /* Otherwise the per-call buffer is full — fall through to layer 2. */
 
     /* Layer 2: cross-vector dedup within the current program-id. */
-    if (g_dedup_enabled && g_dedup_store_perpid) {
+    if (g_dedup_enabled && g_dedup_store_perpid &&
+        (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET)) {
       uint64_t linear_row =
           (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
       if (!addr_dedup_check_and_mark(g_dedup_store_perpid,
