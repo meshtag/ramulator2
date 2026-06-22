@@ -270,10 +270,9 @@ static uint64_t stat_ignored = 0;
  *   g_dedup_invariant_xy   — reset on pid_z change
  */
 static addr_dedup_state_t *g_dedup = NULL;
-static addr_dedup_state_t *g_dedup_persistent = NULL;
-static addr_dedup_state_t *g_dedup_invariant_yz = NULL;
-static addr_dedup_state_t *g_dedup_invariant_xz = NULL;
-static addr_dedup_state_t *g_dedup_invariant_xy = NULL;
+/* (blank cross-pid persistent/invariant reuse dedups removed 2026-06-22 —
+ * verified inert on SIMDRAM; all loads route to g_dedup, the faithful per-pid
+ * host-replay collapse. Mirrors the HBM pim_runtime.c cleanup.) */
 static int g_dedup_enabled = 1;
 
 /* Compute-row residency (corrected Lever 2).
@@ -328,10 +327,6 @@ static int g_k_amort_batch = 0;
 static uint64_t g_compute_trace_count = 0;
 static uint64_t stat_k_amort_emissions = 0;
 
-static uint64_t stat_persistent_skips = 0;
-static uint64_t stat_invariant_yz_skips = 0;
-static uint64_t stat_invariant_xz_skips = 0;
-static uint64_t stat_invariant_xy_skips = 0;
 
 /* SIMDRAM broadcast-write input distribution.
  *
@@ -481,10 +476,6 @@ static void emit_input_broadcast(tensor_info_t *t,
 
 static void destroy_dedup_state(void) {
   if (g_dedup)               { addr_dedup_destroy(g_dedup);              g_dedup = NULL; }
-  if (g_dedup_persistent)    { addr_dedup_destroy(g_dedup_persistent);   g_dedup_persistent = NULL; }
-  if (g_dedup_invariant_yz)  { addr_dedup_destroy(g_dedup_invariant_yz); g_dedup_invariant_yz = NULL; }
-  if (g_dedup_invariant_xz)  { addr_dedup_destroy(g_dedup_invariant_xz); g_dedup_invariant_xz = NULL; }
-  if (g_dedup_invariant_xy)  { addr_dedup_destroy(g_dedup_invariant_xy); g_dedup_invariant_xy = NULL; }
   if (g_compute_row_dedup)   { addr_dedup_destroy(g_compute_row_dedup);  g_compute_row_dedup = NULL; }
 }
 
@@ -514,9 +505,7 @@ static void advance_program_epoch_if_needed(void) {
   last_program_id_z = pid_z;
 
   if (g_dedup)              addr_dedup_reset(g_dedup);
-  if (x_changed && g_dedup_invariant_yz) addr_dedup_reset(g_dedup_invariant_yz);
-  if (y_changed && g_dedup_invariant_xz) addr_dedup_reset(g_dedup_invariant_xz);
-  if (z_changed && g_dedup_invariant_xy) addr_dedup_reset(g_dedup_invariant_xy);
+  (void)x_changed; (void)y_changed; (void)z_changed;
 }
 
 /* Resolve the dedup state to consult based on the current load
@@ -527,23 +516,21 @@ static addr_dedup_state_t *pick_load_dedup_state(const tensor_info_t *t) {
   (void)t;
   if (!g_dedup_enabled)
     return NULL;
-  switch (cur_load_class) {
-    case PIM_LOAD_PERSISTENT_XYZ: return g_dedup_persistent;
-    case PIM_LOAD_INVARIANT_YZ:   return g_dedup_invariant_yz;
-    case PIM_LOAD_INVARIANT_XZ:   return g_dedup_invariant_xz;
-    case PIM_LOAD_INVARIANT_XY:   return g_dedup_invariant_xy;
-    case PIM_LOAD_NORMAL:         return g_dedup;
-  }
+  /* All load classes route through g_dedup (the faithful per-pid host-replay
+   * collapse). The blank cross-pid persistent reuse dedups were removed
+   * 2026-06-22 — verified inert on SIMDRAM (rerouting them here left matmul/
+   * matvec cycles + ops byte-identical; SIMDRAM is compute-bound and the
+   * persistent skips were redundant with the per-pid / leader-bank / compute-row
+   * collapses). Mirrors the HBM pim_runtime.c cleanup. cur_load_class (set by
+   * the __pim_load_persistent* ABI entry points) is now unused. */
+  (void)cur_load_class;
   return g_dedup;
 }
 
 static void account_load_dedup_skip(tensor_info_t *t,
                                     const addr_dedup_state_t *which) {
-  t->dedup_skips++;
-  if (which == g_dedup_persistent)         { stat_persistent_skips++;    t->persistent_skips++; }
-  else if (which == g_dedup_invariant_yz)  { stat_invariant_yz_skips++;  t->persistent_skips++; }
-  else if (which == g_dedup_invariant_xz)  { stat_invariant_xz_skips++;  t->persistent_skips++; }
-  else if (which == g_dedup_invariant_xy)  { stat_invariant_xy_skips++;  t->persistent_skips++; }
+  (void)which;
+  t->dedup_skips++;  /* all skips are now the per-pid g_dedup host-replay collapse */
 }
 
 /*
@@ -813,8 +800,6 @@ void simdram_init(const char *trace_file) {
   const char *dedup_env = getenv("PIM_DEDUP");
   g_dedup_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
 
-  stat_persistent_skips = stat_invariant_yz_skips = 0;
-  stat_invariant_xz_skips = stat_invariant_xy_skips = 0;
 
   /* Per-consuming-bank input replication is always on; disabling it
    * would model a non-existent infinite cross-bank broadcast cache. */
@@ -857,10 +842,6 @@ void simdram_init(const char *trace_file) {
     const int perpid_cap = 4096;
     const int persistent_cap = 262144;
     g_dedup              = addr_dedup_create(perpid_cap);
-    g_dedup_persistent   = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_yz = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_xz = addr_dedup_create(persistent_cap);
-    g_dedup_invariant_xy = addr_dedup_create(persistent_cap);
     g_compute_row_dedup  = addr_dedup_create(persistent_cap);
   }
 
@@ -1067,10 +1048,6 @@ void simdram_set_phase(simdram_phase_t phase) {
    * single COMPUTE phase. */
   if (cur_phase != phase) {
     if (g_dedup)              addr_dedup_reset(g_dedup);
-    if (g_dedup_persistent)   addr_dedup_reset(g_dedup_persistent);
-    if (g_dedup_invariant_yz) addr_dedup_reset(g_dedup_invariant_yz);
-    if (g_dedup_invariant_xz) addr_dedup_reset(g_dedup_invariant_xz);
-    if (g_dedup_invariant_xy) addr_dedup_reset(g_dedup_invariant_xy);
     if (g_compute_row_dedup)  addr_dedup_reset(g_compute_row_dedup);
     g_compute_trace_count = 0;
   }
@@ -1101,14 +1078,6 @@ void simdram_finalize(void) {
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
   fprintf(stderr, "[simdram]   Dedup hits     : %" PRIu64 " (enabled=%d)\n",
           addr_dedup_hits(g_dedup), g_dedup_enabled);
-  fprintf(stderr, "[simdram]   Persistent skips (xyz invariant): %" PRIu64 "\n",
-          stat_persistent_skips);
-  fprintf(stderr, "[simdram]   Persistent skips (yz invariant) : %" PRIu64 "\n",
-          stat_invariant_yz_skips);
-  fprintf(stderr, "[simdram]   Persistent skips (xz invariant) : %" PRIu64 "\n",
-          stat_invariant_xz_skips);
-  fprintf(stderr, "[simdram]   Persistent skips (xy invariant) : %" PRIu64 "\n",
-          stat_invariant_xy_skips);
   fprintf(stderr, "[simdram]   Input replication writes        : %" PRIu64 "\n",
           stat_input_replication_writes);
   fprintf(stderr, "[simdram]   Leader-bank skips               : %" PRIu64 " (enabled=%d)\n",
