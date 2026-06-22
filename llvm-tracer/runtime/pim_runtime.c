@@ -1487,33 +1487,14 @@ static int duplicate_bcast_tensor_per_bg(tensor_info_t *t) {
 }
 
 void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
-  if (tensor_id < 0 || tensor_id >= num_tensors) {
-    fprintf(stderr,
-            "[pim-runtime] WARN: pim_set_tensor_broadcast_scalar tensor_id=%d "
-            "out of range [0,%d); ignored.\n",
-            tensor_id, num_tensors);
-    return;
-  }
-  /* Honor the global PIM_BCAST_SCALAR ablation flag: when disabled,
-   * this setter is a no-op (bcast_scalar stays 0) regardless of `on`. */
-  tensors[tensor_id].bcast_scalar = (on && g_bcast_scalar_enabled) ? 1 : 0;
-  fprintf(stderr,
-          "[pim-runtime] tensor %d: bcast_scalar=%d (requested=%d, global_enabled=%d)\n",
-          tensor_id, tensors[tensor_id].bcast_scalar, on, g_bcast_scalar_enabled);
-  /* Per-BG duplication for bcast_scalar tensors. Eligibility:
-   *   - Both flags on (g_per_bg_bcast_enabled + g_duplicate_bcast_enabled).
-   *   - Tensor is bcast_scalar (set above).
-   *
-   * Applies regardless of role (no STREAMED/OPERAND gate). Once
-   * duplicated, every access is routed to the host PE's own BG bank=0
-   * by map_element, and emit_access_by_role_phase emits BR (bank-local
-   * read). The cross-BG bus cost that would otherwise justify W for
-   * OPERAND is gone because the data is resident in the receiving BG. */
-  if (tensors[tensor_id].bcast_scalar &&
-      g_per_bg_bcast_enabled && g_duplicate_bcast_enabled &&
-      !tensors[tensor_id].duplicated) {
-    duplicate_bcast_tensor_per_bg(&tensors[tensor_id]);
-  }
+  /* REMOVED 2026-06-22: broadcast-scalar / row-duplicate was a blank reuse
+   * dedup (it modeled OptiPIM-style row_duplicate replication at trace level).
+   * Operand reuse is now realized in the IR (capacity-capped tiling) and the
+   * residual is charged by the faithful per-bank LRU + lockstep. This setter is
+   * a permanent no-op kept only for ABI compatibility with the harness bridge
+   * (pass_ablation.py wraps the call in try/except). */
+  (void)tensor_id;
+  (void)on;
 }
 
 /* Record the compiler-decided reuse-as-layout descriptor for a tensor.
@@ -1749,35 +1730,13 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
         stat_acc_resident_skips++;
       return; /* resident in PE register cache; no DRAM event */
     }
-  } else if (g_dedup_enabled && g_dedup && cur_phase == PIM_PHASE_COMPUTE &&
-      !is_write &&
-      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
-      ((!g_matched_mode &&
-        (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) ||
-       (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
-    /* For tensors flagged as broadcast-scalar (kernel reads them with
-     * the same physical address from every bank), promote dedup to the
-     * xyz-invariant persistent scope which never resets on program-id
-     * boundaries. This models a PE-register cache that retains the
-     * broadcast value for the entire COMPUTE phase. Each unique
-     * (bank, row, col) tuple still emits exactly once — the promotion
-     * catches *additional* repeats across program-id resets that the
-     * per-pid scope would otherwise re-emit. Distinct physical tuples
-     * are still emitted distinctly. ACCUMULATOR tensors are never
-     * bcast_scalar, so this branch only fires for STREAMED/OPERAND. */
-    addr_dedup_state_t *bcast_state =
-        (t->bcast_scalar && g_dedup_persistent) ? g_dedup_persistent : g_dedup;
-    int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
-    uint64_t linear_row =
-        (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (!addr_dedup_check_and_mark(bcast_state, (uint64_t)global_bank,
-                                   linear_row, (uint64_t)loc.col)) {
-      t->dedup_skips++;
-      if (t->role == PIM_ROLE_ACCUMULATOR)
-        stat_acc_resident_skips++;
-      return; /* already emitted this scope; skip */
-    }
   }
+  /* (blank reuse dedup removed 2026-06-22: the physical-per-pid g_dedup +
+   * bcast_scalar->persistent promotion branch is gone. Faithful operand reuse
+   * is the LRU register-residency branch above; cross-bank collapse is the
+   * lockstep dedup below; both are the fair mechanisms. The removed branch only
+   * fired when LRU was off, so this is behavior-preserving for the faithful
+   * config — see docs/phase-b-lowering-plan.md.) */
 
   /* Per-program-id store dedup (scalar-store path).
    *
@@ -1838,24 +1797,8 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
 
   emit_access_by_role_phase(t, &loc, is_write);
 
-  /* Per-BG broadcast fanout (PIM_PER_BG_BCAST=1). On the first emission
-   * for a bcast_scalar load (i.e. the dedup miss that just fell through
-   * to the emit above), also emit one W per other (ch, pch, bg) triple
-   * to model the cross-BG bus cycles required for that scalar to reach
-   * PEs in other bank-groups. Fires for any LOAD role tagged as
-   * bcast_scalar — STREAMED (e.g. row-tiled matmul A) and OPERAND
-   * (e.g. matvec x, conv2d Weight) both qualify.
-   *
-   * Skipped when t->duplicated: the per-BG copies are already in place
-   * (laid out by duplicate_bcast_tensor_per_bg as a pre-kernel layout
-   * property, with zero setup events), so this PE's access was already
-   * routed via map_element to its local BG copy and no cross-BG bus
-   * transfer is needed. */
-  if (!is_write && t->bcast_scalar &&
-      t->role != PIM_ROLE_ACCUMULATOR &&
-      cur_phase == PIM_PHASE_COMPUTE && !t->duplicated) {
-    emit_per_bg_bcast_fanout(t, &loc);
-  }
+  /* (per-BG broadcast fanout removed 2026-06-22 with the bcast_scalar/
+   * row-duplicate machinery — faithful configs never set bcast_scalar.) */
 }
 
 /* Persistent-scope counterpart of pim_trace_access_one. Used for loads whose
@@ -1897,25 +1840,10 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
         stat_persistent_skips++;
         return;
       }
-    } else if (!g_matched_mode && g_dedup_enabled && dedup_state) {
-      /* Legacy first-N path. Broadcast-scalar promotion: when flagged,
-       * override the axis-scope persistent state the LLVM classifier picked
-       * with the xyz-invariant g_dedup_persistent (catches repeats across
-       * program-id boundaries that axis-scoped resets would miss). */
-      addr_dedup_state_t *use_state = dedup_state;
-      uint64_t *use_skips = state_skips;
-      if (t->bcast_scalar && g_dedup_persistent) {
-        use_state = g_dedup_persistent;
-        use_skips = &stat_persistent_skips;
-      }
-      if (!addr_dedup_check_and_mark(use_state, (uint64_t)global_bank,
-                                     linear_row, (uint64_t)loc.col)) {
-        t->persistent_skips++;
-        if (use_skips)
-          (*use_skips)++;
-        return;
-      }
     }
+    /* (legacy first-N persistent dedup + bcast_scalar->xyz promotion removed
+     * 2026-06-22. Pid-invariant operand reuse now goes through the SAME faithful
+     * per-bank LRU register cache as the per-pid path above.) */
   }
 
   /* Lockstep dedup (mirrors pim_trace_access_one). Bypass for OPERAND
@@ -1937,16 +1865,7 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
   }
 
   emit_access_by_role_phase(t, &loc, 0);
-
-  /* Per-BG broadcast fanout (PIM_PER_BG_BCAST=1). See pim_trace_access_one
-   * for the rationale; identical injection point for the persistent
-   * path. Fires for any LOAD role tagged as bcast_scalar. Skipped when
-   * duplicated — the per-BG replicas make the broadcast bank-local. */
-  if (t->bcast_scalar &&
-      t->role != PIM_ROLE_ACCUMULATOR &&
-      cur_phase == PIM_PHASE_COMPUTE && !t->duplicated) {
-    emit_per_bg_bcast_fanout(t, &loc);
-  }
+  /* (per-BG broadcast fanout removed 2026-06-22 with the bcast machinery.) */
 }
 
 /* Vector-store coalescer for ACCUMULATOR drains. Two layers of dedup:
@@ -2176,33 +2095,32 @@ static void pim_trace_persistent_range(uint64_t base_addr, uint64_t size,
   }
 }
 
-/* Public entry points emitted by MemTracePass. Each one selects an axis-wise
- * dedup state (see comment block on the g_dedup_invariant_* globals). */
+/* Public entry points emitted by MemTracePass. The axis-wise persistent dedup
+ * states were removed 2026-06-22; all four now route pid-invariant operand
+ * reuse through the SAME faithful per-bank LRU register cache (the dedup_state
+ * arg is unused, passed NULL). The 4 variants are kept as distinct symbols
+ * only because MemTracePass emits calls to them (ABI). */
 void __pim_load_persistent(void *addr, uint64_t size) {
   if (!trace_fp)
     return;
-  pim_trace_persistent_range((uint64_t)addr, size, g_dedup_persistent,
-                             &stat_persistent_skips);
+  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
 }
 
 void __pim_load_persistent_yz(void *addr, uint64_t size) {
   if (!trace_fp)
     return;
-  pim_trace_persistent_range((uint64_t)addr, size, g_dedup_invariant_yz,
-                             &stat_invariant_yz_skips);
+  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
 }
 
 void __pim_load_persistent_xz(void *addr, uint64_t size) {
   if (!trace_fp)
     return;
-  pim_trace_persistent_range((uint64_t)addr, size, g_dedup_invariant_xz,
-                             &stat_invariant_xz_skips);
+  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
 }
 
 void __pim_load_persistent_xy(void *addr, uint64_t size) {
   if (!trace_fp)
     return;
-  pim_trace_persistent_range((uint64_t)addr, size, g_dedup_invariant_xy,
-                             &stat_invariant_xy_skips);
+  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
 }
 
