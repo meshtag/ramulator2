@@ -1754,30 +1754,11 @@ static void pim_trace_persistent_range(uint64_t base_addr, uint64_t size,
   }
 }
 
-/* Public entry points emitted by MemTracePass. The axis-wise persistent dedup
- * states were removed 2026-06-22; all four now route pid-invariant operand
- * reuse through the SAME faithful per-bank LRU register cache (the dedup_state
- * arg is unused, passed NULL). The 4 variants are kept as distinct symbols
- * only because MemTracePass emits calls to them (ABI). */
+/* Single persistent load entry point emitted by MemTracePass for any
+ * pid-invariant load. The per-axis variants (_yz/_xz/_xy) were consolidated
+ * away 2026-06-22 — the axis-wise reuse dedups are gone, so all pid-invariant
+ * loads route through the SAME faithful per-bank LRU register cache. */
 void __pim_load_persistent(void *addr, uint64_t size) {
-  if (!trace_fp)
-    return;
-  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
-}
-
-void __pim_load_persistent_yz(void *addr, uint64_t size) {
-  if (!trace_fp)
-    return;
-  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
-}
-
-void __pim_load_persistent_xz(void *addr, uint64_t size) {
-  if (!trace_fp)
-    return;
-  pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);
-}
-
-void __pim_load_persistent_xy(void *addr, uint64_t size) {
   if (!trace_fp)
     return;
   pim_trace_persistent_range((uint64_t)addr, size, NULL, &stat_persistent_skips);

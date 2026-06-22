@@ -403,19 +403,9 @@ static uint64_t stat_leader_bank_skips = 0;
  * with OptiPIM's input-replication cost model. */
 static int g_bcast_w_enabled = 0;
 
-/* Persistent-load classification, set by __pim_load_persistent[_*]
- * before the access falls into simdram_trace_access. The classification
- * tells simdram_trace_access which dedup state to push the access
- * through. Reset to PIM_LOAD_NORMAL after each classified call. */
-typedef enum {
-  PIM_LOAD_NORMAL = 0,
-  PIM_LOAD_PERSISTENT_XYZ,
-  PIM_LOAD_INVARIANT_YZ,
-  PIM_LOAD_INVARIANT_XZ,
-  PIM_LOAD_INVARIANT_XY,
-} pim_load_class_t;
-
-static pim_load_class_t cur_load_class = PIM_LOAD_NORMAL;
+/* (pim_load_class_t / cur_load_class removed 2026-06-22: the axis-scope reuse
+ * dedups are gone, so the persistent load classification no longer selects a
+ * dedup state — every load routes to the faithful per-pid g_dedup collapse.) */
 
 /* ================================================================
  *  Helpers
@@ -516,14 +506,11 @@ static addr_dedup_state_t *pick_load_dedup_state(const tensor_info_t *t) {
   (void)t;
   if (!g_dedup_enabled)
     return NULL;
-  /* All load classes route through g_dedup (the faithful per-pid host-replay
+  /* Every load routes through g_dedup (the faithful per-pid host-replay
    * collapse). The blank cross-pid persistent reuse dedups were removed
-   * 2026-06-22 — verified inert on SIMDRAM (rerouting them here left matmul/
-   * matvec cycles + ops byte-identical; SIMDRAM is compute-bound and the
-   * persistent skips were redundant with the per-pid / leader-bank / compute-row
-   * collapses). Mirrors the HBM pim_runtime.c cleanup. cur_load_class (set by
-   * the __pim_load_persistent* ABI entry points) is now unused. */
-  (void)cur_load_class;
+   * 2026-06-22 — verified inert on SIMDRAM (matmul/matvec/conv cycles + ops
+   * byte-identical; compute-bound, and the persistent skips were redundant
+   * with the per-pid / leader-bank / compute-row collapses). */
   return g_dedup;
 }
 
@@ -833,7 +820,6 @@ void simdram_init(const char *trace_file) {
           g_bcast_w_enabled);
 
   last_program_id = last_program_id_y = last_program_id_z = -1;
-  cur_load_class = PIM_LOAD_NORMAL;
   if (g_dedup_enabled) {
     /* Capacity hints: per-pid state sees one tile's worth of accesses
      * (small); persistent states accumulate across all pids in the
@@ -1276,25 +1262,12 @@ void __mem_trace_store(void *addr, uint64_t size) {
  * ops (the cost-loop in __compute_trace), NOT to operand-load bit-row
  * reads. Operand re-reads of the same row buffer ARE idempotent and
  * dedup-safe; we route them through the dedup states like HBM-PIM. */
+/* Single persistent load entry point (the _yz/_xz/_xy variants were
+ * consolidated away 2026-06-22 with the blank axis-scope reuse dedups). All
+ * pid-invariant loads route to the faithful per-pid g_dedup collapse, same as
+ * a normal load — so this is just __mem_trace_load. */
 void __pim_load_persistent(void *addr, uint64_t size) {
-  cur_load_class = PIM_LOAD_PERSISTENT_XYZ;
   __mem_trace_load(addr, size);
-  cur_load_class = PIM_LOAD_NORMAL;
-}
-void __pim_load_persistent_yz(void *addr, uint64_t size) {
-  cur_load_class = PIM_LOAD_INVARIANT_YZ;
-  __mem_trace_load(addr, size);
-  cur_load_class = PIM_LOAD_NORMAL;
-}
-void __pim_load_persistent_xz(void *addr, uint64_t size) {
-  cur_load_class = PIM_LOAD_INVARIANT_XZ;
-  __mem_trace_load(addr, size);
-  cur_load_class = PIM_LOAD_NORMAL;
-}
-void __pim_load_persistent_xy(void *addr, uint64_t size) {
-  cur_load_class = PIM_LOAD_INVARIANT_XY;
-  __mem_trace_load(addr, size);
-  cur_load_class = PIM_LOAD_NORMAL;
 }
 
 /* ================================================================

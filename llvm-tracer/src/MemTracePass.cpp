@@ -133,14 +133,13 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
         M.getOrInsertFunction("__mem_trace_load", TraceFnTy);
     FunctionCallee StoreFn =
         M.getOrInsertFunction("__mem_trace_store", TraceFnTy);
+    // Single persistent entry point. The per-axis variants (_yz/_xz/_xy) were
+    // consolidated 2026-06-22: the runtime no longer distinguishes the
+    // invariant axis (the blank axis-scope reuse dedups were removed; all
+    // pid-invariant loads route through the faithful per-bank LRU + lockstep),
+    // so one symbol suffices for every invariant mask.
     FunctionCallee LoadPersistentFn =
         M.getOrInsertFunction("__pim_load_persistent", TraceFnTy);
-    FunctionCallee LoadPersistentYZFn =
-        M.getOrInsertFunction("__pim_load_persistent_yz", TraceFnTy);
-    FunctionCallee LoadPersistentXZFn =
-        M.getOrInsertFunction("__pim_load_persistent_xz", TraceFnTy);
-    FunctionCallee LoadPersistentXYFn =
-        M.getOrInsertFunction("__pim_load_persistent_xy", TraceFnTy);
 
     FunctionType *VoidFnTy =
         FunctionType::get(Type::getVoidTy(Ctx), false);
@@ -200,25 +199,22 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
         Value *Ptr = LI->getPointerOperand();
         uint64_t Size = M.getDataLayout().getTypeStoreSize(LI->getType());
 
-        // Classify by axis-mask. The walker is conservative — anything we
-        // can't prove invariant routes to the per-program-id path.
+        // Classify by axis-mask. A load whose pointer is invariant in at least
+        // two pid axes (mask 0x0/0x1/0x2/0x4 — zero or single-axis dependence)
+        // has cross-pid reuse and routes to the single persistent entry point;
+        // multi-axis-dependent loads (mask with ≥2 bits) route to the
+        // per-program-id path. The walker is conservative.
         FunctionCallee Routed = LoadFn;
         if (PersistentEnabled) {
           SmallPtrSet<Value *, 32> Visited;
           unsigned mask = programIdAxesMask(Ptr, Visited);
           switch (mask) {
-          case 0x0:
+          case 0x0: // invariant in xyz
+          case 0x1: // depends on x only
+          case 0x2: // depends on y only
+          case 0x4: // depends on z only
             Routed = LoadPersistentFn;
-            break; // invariant in xyz
-          case 0x1:
-            Routed = LoadPersistentYZFn;
-            break; // depends on x only
-          case 0x2:
-            Routed = LoadPersistentXZFn;
-            break; // depends on y only
-          case 0x4:
-            Routed = LoadPersistentXYFn;
-            break; // depends on z only
+            break;
           default:
             Routed = LoadFn;
             break; // multi-axis dep
