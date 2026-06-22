@@ -145,25 +145,8 @@ typedef struct {
   pim_layout_scheme_t layout_scheme;
   uint64_t layout_linear_base;
 
-  /* Broadcast-scalar hint. When set (=1), every access to this tensor
-   * is dedup'd against the xyz-invariant persistent state, modeling a
-   * PE-register cache that retains broadcast values for the entire
-   * COMPUTE phase. See pim_set_tensor_broadcast_scalar() in the
-   * header for the correctness invariant. Default 0. */
-  int bcast_scalar;
-
-  /* Per-BG duplication state. When duplicated=1, this tensor has a
-   * complete copy in bank=0 of every (channel, pch, bg) triple,
-   * starting at row dup_row_base[bg_global_id]. Set at registration
-   * time when (bcast_scalar=1 AND g_per_bg_bcast_enabled=1 AND
-   * g_duplicate_bcast_enabled=1). map_element routes reads of a
-   * duplicated tensor to the host PE's own BG copy.
-   *
-   * bg_global_id = ch * (num_pch * num_bg) + pch * num_bg + bg.
-   * Sized at MAX_BANKS as a generous upper bound — only the first
-   * cfg_num_channels * cfg_num_pch * cfg_num_bg entries are used. */
-  int duplicated;
-  int dup_row_base[MAX_BANKS];
+  /* (bcast_scalar / duplicated / dup_row_base fields removed 2026-06-22 with
+   * the broadcast-scalar / row-duplicate blank-dedup machinery.) */
 
   /* Reuse-as-layout descriptor, set by pim_set_tensor_layout() from the
    * compiler's im-operand-residency-layout decisions. layout_kind=UNSET
@@ -207,16 +190,8 @@ static int finalized = 0;
  * ch/pch/bg/bank */
 static int next_free_row[MAX_BANKS];
 
-/* Unified DUP row allocator. All BGs share the same row index for a
- * given bcast_scalar tensor — replicas in different BGs live at the
- * SAME (sa, row, col), differing only in (ch, pch, bg, bank). This is
- * Lever 2: lockstep dedup at (tensor_id, sa, row, col) can then collapse
- * the per-BG fanout for bcast_scalar broadcasts to a single event
- * (one controller dispatch in the hardware model).
- *
- * Allocated downward from the top of bank=0's row space; -1 means
- * uninitialized (first allocation seeds it). */
-static int g_next_free_dup_row = -1;
+/* (g_next_free_dup_row / DUP row allocator removed 2026-06-22 with the
+ * row-duplicate blank-dedup machinery.) */
 
 /* Statistics */
 static uint64_t stat_bank_reads = 0;
@@ -224,19 +199,13 @@ static uint64_t stat_bank_writes = 0;
 static uint64_t stat_reads = 0;
 static uint64_t stat_writes = 0;
 static uint64_t stat_ignored = 0;
-/* Number of per-BG broadcast fan-outs emitted with PIM_PER_BG_BCAST=1.
- * Each fan-out adds (cfg_num_channels * cfg_num_pch * cfg_num_bg) - 1
- * extra W events beyond the source-bank emission. Diagnostic only. */
-static uint64_t stat_per_bg_bcast_fanouts = 0;
 static uint64_t stat_store_coalesced = 0; /* per-call BWs collapsed when a
                                              vector store had multiple lanes
                                              land on the same (bank,row,col) */
 
-/* Physical-address dedup: collapses spatially-redundant reads (multiple PEs
- * in a bank-group hitting the same row buffer) into one trace line per
- * unique (global_bank, sa+row, col). Resets per program-id. See
- * im_addr_dedup.h. */
-static addr_dedup_state_t *g_dedup = NULL;
+/* g_dedup_enabled now gates ONLY the accumulator per-pid store-dedup model
+ * (g_dedup_store_perpid). The blank physical-address per-pid dedup state
+ * (formerly g_dedup) was removed 2026-06-22. */
 static int g_dedup_enabled = 1;
 
 /* Matched-reuse fairness mode. Default = 0 (off). EXPERIMENTAL.
@@ -266,26 +235,7 @@ static int g_dedup_enabled = 1;
  * Default OFF so no other measurement regresses. */
 static int g_matched_mode = 0;
 
-/* bcast_scalar global enable flag. Default = 1 (on).
- *
- * Gates the per-tensor bcast_scalar bit set by
- * pim_set_tensor_broadcast_scalar(). When ON, tensors flagged from the
- * harness (via the kernel config's `broadcast_scalar_tensors` field)
- * become eligible for:
- *   1. xyz-invariant persistent dedup (the `bcast_scalar && g_dedup_persistent`
- *      branch in pim_trace_access_one) — collapses cross-pid repeats of the
- *      same scalar load to a single emission.
- *   2. Per-BG row-duplicate layout (PIM_DUPLICATE_BCAST=1 also required) —
- *      the tensor is replicated to bank=0 of every BG and each PE reads
- *      its host BG's local copy via BR.
- *
- * When OFF: pim_set_tensor_broadcast_scalar() is a no-op (per-tensor
- * bcast_scalar bit stays 0), neither persistent dedup nor DUP fires, and
- * scalar-broadcast operands go through the standard interleaved layout —
- * 32 PE banks emit 32 distinct BR events per logical broadcast, no
- * cross-pid dedup. Useful for ablation against an OptiPIM PimCodeGen run
- * that does NOT use alloc_method=row_duplicate. */
-static int g_bcast_scalar_enabled = 1;
+/* (g_bcast_scalar_enabled / broadcast-scalar enable flag removed 2026-06-22.) */
 /* Reuse-as-layout honoring (default OFF). When IM_HONOR_LAYOUT=1, the
  * compiler-decided layout pushed in via pim_set_tensor_layout() drives
  * physical placement (currently ROW_DUP -> per-BG resident replication, the
@@ -316,80 +266,15 @@ static int g_honor_layout = 0;
 static int g_acc_resident_enabled = 1;
 static uint64_t stat_acc_resident_skips = 0;
 
-/* Per-bank-group broadcast modeling. Default = 1 (on).
- *
- * Real HBM-PIM SCALAR_LD broadcasts a value on ONE bank-group's I/O
- * bus per command — to reach PEs in N bank-groups, the controller
- * must issue N SCALAR_LD-equivalent commands (one per BG).
- *
- * When ON (default; disable with PIM_PER_BG_BCAST=0), each unique
- * bcast_scalar logical broadcast emits one W event per (channel, pch,
- * bg) triple in the system, modelling the per-BG bus cycle required
- * for that BG's PEs to receive the value. The total event count grows
- * from 1 to cfg_num_channels * cfg_num_pch * cfg_num_bg per unique
- * broadcast.
- *
- * Default ON because the legacy "single W per broadcast" model
- * systematically under-counted cross-BG cycles in multi-BG configs.
- * Set PIM_PER_BG_BCAST=0 to fall back to that legacy single-event
- * mode (useful for ablation against older numbers). Note that when
- * PIM_DUPLICATE_BCAST=1 is also on, the fanout is bypassed for any
- * tensor that successfully duplicated — the per-BG bus cost is then
- * obviated by the per-BG row_duplicate replicas. */
-static int g_per_bg_bcast_enabled = 1;
+/* (g_per_bg_bcast_enabled + g_duplicate_bcast_enabled removed 2026-06-22 with
+ * the broadcast / row-duplicate blank-dedup machinery.) */
 
-/* Per-BG duplication of bcast_scalar tensors. Default = 1 (on).
- *
- * When ON (default; disable with PIM_DUPLICATE_BCAST=0) AND
- * PIM_PER_BG_BCAST is also on, ANY tensor flagged bcast_scalar at
- * registration time (regardless of role) is REPLICATED into a per-BG
- * local copy at the top of bank=0's row space for each (channel, pch,
- * bg) triple. All BGs share the SAME row index (alloc_dup_rows_shared),
- * so per-BG copies live at identical (sa, row, col) — enabling
- * downstream lockstep dedup to collapse the per-BG fanout to one event.
- * No setup-cost W events are emitted (parity with OptiPIM's
- * alloc_method=row_duplicate, which leaves replication implicit in the
- * layout rather than the trace).
- *
- * At runtime, each PE reads from its host BG's bank=0 copy via BR
- * (bank-local within the BG, no cross-BG fanout), sidestepping the
- * per-BG broadcast cost paid by PIM_PER_BG_BCAST alone.
- *
- * Eligibility: any bcast_scalar tensor, and only with PIM_PER_BG_BCAST
- * also on (without per-BG cost modelling there's nothing to amortise
- * away). If the dup pool is exhausted at registration, t->duplicated
- * stays 0 and the runtime falls back to per-BG W fanout for that tensor.
- *
- * Matches OptiPIM's alloc_method=row_duplicate, which physically
- * replicates Weight/operand tensors across banks. */
-static int g_duplicate_bcast_enabled = 1;
-
-/* Axis-wise persistent dedup states.
- *
- * Each state corresponds to a class of loads whose pointer is INVARIANT in
- * a particular subset of program-id axes (and therefore depends only on the
- * complementary axes — or nothing at all):
- *
- *   g_dedup_persistent     — invariant in {x,y,z}: reset only on phase change
- *   g_dedup_invariant_yz   — invariant in {y,z}, depends on x: reset on pid_x
- * change g_dedup_invariant_xz   — invariant in {x,z}, depends on y: reset on
- * pid_y change g_dedup_invariant_xy   — invariant in {x,y}, depends on z: reset
- * on pid_z change
- *
- * MemTracePass classifies each load's pointer chain and routes it to the
- * matching __pim_load_persistent[_axes] entry point. Each entry point
- * pushes its access through the corresponding state.
- *
- * Reset cadence is enforced in advance_program_epoch_if_needed by tracking
- * which axis changed between successive runtime calls. */
-static addr_dedup_state_t *g_dedup_persistent = NULL;   /* invariant in xyz */
-static addr_dedup_state_t *g_dedup_invariant_yz = NULL; /* depends on x only */
-static addr_dedup_state_t *g_dedup_invariant_xz = NULL; /* depends on y only */
-static addr_dedup_state_t *g_dedup_invariant_xy = NULL; /* depends on z only */
+/* Axis-wise persistent dedup states (g_dedup_persistent + g_dedup_invariant_*)
+ * removed 2026-06-22: the 4 __pim_load_persistent* entry points now route
+ * pid-invariant operand reuse through the faithful per-bank LRU register cache.
+ * stat_persistent_skips is retained — it counts LRU-resident skips on that
+ * path. */
 static uint64_t stat_persistent_skips = 0;
-static uint64_t stat_invariant_yz_skips = 0;
-static uint64_t stat_invariant_xz_skips = 0;
-static uint64_t stat_invariant_xy_skips = 0;
 
 /* Lockstep collapse dedup (default ON, disable with PIM_LOCKSTEP_COLLAPSE=0).
  *
@@ -583,26 +468,6 @@ static int find_tensor(uint64_t addr) {
 }
 
 static void destroy_dedup_state() {
-  if (g_dedup) {
-    addr_dedup_destroy(g_dedup);
-    g_dedup = NULL;
-  }
-  if (g_dedup_persistent) {
-    addr_dedup_destroy(g_dedup_persistent);
-    g_dedup_persistent = NULL;
-  }
-  if (g_dedup_invariant_yz) {
-    addr_dedup_destroy(g_dedup_invariant_yz);
-    g_dedup_invariant_yz = NULL;
-  }
-  if (g_dedup_invariant_xz) {
-    addr_dedup_destroy(g_dedup_invariant_xz);
-    g_dedup_invariant_xz = NULL;
-  }
-  if (g_dedup_invariant_xy) {
-    addr_dedup_destroy(g_dedup_invariant_xy);
-    g_dedup_invariant_xy = NULL;
-  }
   if (g_dedup_store_perpid) {
     addr_dedup_destroy(g_dedup_store_perpid);
     g_dedup_store_perpid = NULL;
@@ -630,36 +495,17 @@ static void advance_program_epoch_if_needed(void) {
   last_program_id_y = pid_y;
   last_program_id_z = pid_z;
 
-  /* g_dedup and g_dedup_store_perpid are per-program-id (any axis change
-   * resets). g_dedup_lockstep is also per-pid: lockstep replicas of a
-   * single SIMD dispatch are all within one pid, so the scope matches. */
-  if (g_dedup) {
-    addr_dedup_reset(g_dedup);
-  }
+  /* g_dedup_store_perpid is per-program-id (any axis change resets).
+   * g_dedup_lockstep is also per-pid: lockstep replicas of a single SIMD
+   * dispatch are all within one pid, so the scope matches. (The blank per-pid
+   * g_dedup + the axis-wise persistent states were removed 2026-06-22.) */
   if (g_dedup_store_perpid) {
     addr_dedup_reset(g_dedup_store_perpid);
   }
   if (g_dedup_lockstep) {
     addr_dedup_reset(g_dedup_lockstep);
   }
-
-  /* Axis-wise states: reset only when an axis the load depends on changes.
-   *
-   *   g_dedup_invariant_yz holds (bank,row,col) for loads that depend on
-   *   pid_x only. They're invariant across pid_y/pid_z, so we keep the state
-   *   alive when only y or z changes; we reset when x changes.
-   *
-   *   g_dedup_invariant_xz / xy follow the symmetric rule.
-   */
-  if (x_changed && g_dedup_invariant_yz) {
-    addr_dedup_reset(g_dedup_invariant_yz);
-  }
-  if (y_changed && g_dedup_invariant_xz) {
-    addr_dedup_reset(g_dedup_invariant_xz);
-  }
-  if (z_changed && g_dedup_invariant_xy) {
-    addr_dedup_reset(g_dedup_invariant_xy);
-  }
+  (void)x_changed; (void)y_changed; (void)z_changed;
 }
 
 static int compute_global_bank(int ch, int pch, int bg, int bank) {
@@ -754,34 +600,8 @@ static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
  */
 static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
                         int *bg, int *bank, int *sa, int *row, int *col) {
-  /* Per-BG duplicated tensor (PIM_DUPLICATE_BCAST=1): route to the host
-   * PE's own BG copy at bank=0. Each BG has a complete replica from the
-   * top of bank=0's row space (allocated by duplicate_bcast_tensor_per_bg).
-   * The read is bank-local within the host PE's bank-group — no cross-BG
-   * bus broadcast needed at runtime. The replication is treated as
-   * pre-existing layout (zero setup W events emitted), matching OptiPIM's
-   * alloc_method=row_duplicate semantics. */
-  if (t->duplicated) {
-    int host_bank_global = (int)__pim_get_bank_id();
-    int total_flat = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-    if (host_bank_global < 0 || host_bank_global >= total_flat) {
-      host_bank_global = 0;
-    }
-    int host_bg_global = host_bank_global / cfg_num_banks;
-    int bg_per_pch = cfg_num_bg;
-    int bg_per_ch  = cfg_num_pch * cfg_num_bg;
-    *ch   = host_bg_global / bg_per_ch;
-    *pch  = (host_bg_global / bg_per_pch) % cfg_num_pch;
-    *bg   = host_bg_global % bg_per_pch;
-    *bank = 0;
-    int linear_row = t->dup_row_base[host_bg_global]
-                   + (elem_idx / t->values_per_row);
-    *sa  = linear_row / cfg_num_rows;
-    *row = linear_row % cfg_num_rows;
-    *col = (elem_idx % t->values_per_row) / t->values_per_col;
-    return;
-  }
-
+  /* (per-BG duplicated-tensor routing removed 2026-06-22 with the
+   * row-duplicate blank-dedup machinery; t->duplicated is always 0.) */
   if (t->layout_scheme == PIM_LAYOUT_INTERLEAVED) {
     map_element_interleaved(t, elem_idx, ch, pch, bg, bank, sa, row, col);
     return;
@@ -852,17 +672,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
                                       const pim_phys_loc_t *loc, int is_write) {
   if (cur_phase == PIM_PHASE_COMPUTE) {
     if (!is_write) {
-      /* Duplicated bcast_scalar override: a per-BG replica lives in the
-       * host PE's own bank=0, so the access is bank-local regardless of
-       * the compiler-classified role. Emit BR; the cross-BG bus cost was
-       * skipped at setup (parity with OptiPIM row_duplicate). */
-      if (t->duplicated && t->bcast_scalar) {
-        emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_reads++;
-        t->emitted_br++;
-        return;
-      }
+      /* (duplicated bcast_scalar BR-override removed 2026-06-22.) */
       switch (t->role) {
       case PIM_ROLE_STREAMED:
         emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
@@ -907,64 +717,8 @@ static void emit_access_by_role_phase(tensor_info_t *t,
   }
 }
 
-/* Per-BG broadcast fanout. Called once per UNIQUE bcast_scalar logical
- * broadcast (after the persistent-dedup check has already counted the
- * source emission via the caller's normal emit path). Emits one
- * additional W event per remaining (channel, pch, bg) triple, modelling
- * the per-BG I/O-bus cycle required for each receiving bank-group's
- * PEs to latch the broadcast value into their registers.
- *
- * The source BG is identified by (loc->ch, loc->pch, loc->bg) and
- * skipped — the caller already emitted an event (BR or W per the
- * tensor role) there. The fanout always emits W, regardless of the
- * source-tensor role, because cross-BG transfer is bus-mediated (a
- * priority-read at the source, write-into-register at each receiving
- * PE) — modelled as one W per receiving BG. The "representative bank"
- * is bank 0 (deterministic, distributes load across BG controllers in
- * Ramulator2's scheduler). row/col stay at the source's row/col. */
-static void emit_per_bg_bcast_fanout(tensor_info_t *t,
-                                     const pim_phys_loc_t *src) {
-  if (!g_per_bg_bcast_enabled)
-    return;
-  if (cur_phase != PIM_PHASE_COMPUTE)
-    return;
-  for (int chan = 0; chan < cfg_num_channels; chan++) {
-    for (int pch = 0; pch < cfg_num_pch; pch++) {
-      for (int bg = 0; bg < cfg_num_bg; bg++) {
-        /* Skip source BG (already emitted by the caller). */
-        if (chan == src->ch && pch == src->pch && bg == src->bg)
-          continue;
-        emit_trace("W", chan, pch, bg, /*bank=*/0, src->sa, src->row, src->col);
-        stat_writes++;
-        t->emitted_w++;
-        stat_per_bg_bcast_fanouts++;
-      }
-    }
-  }
-}
-
-/* Allocate `n_rows` contiguous rows from the top of bank=0's row space.
- * Single shared pool — same row index applies to ALL bank-groups so the
- * per-BG replicas live at identical (sa, row, col), enabling lockstep
- * collapse downstream. Grows downward (newest allocation at the highest
- * row indices first). Returns the row index of the FIRST row, -1 on
- * failure (pool exhausted). */
-static int alloc_dup_rows_shared(int n_rows) {
-  if (g_next_free_dup_row < 0) {
-    g_next_free_dup_row = cfg_num_sa * cfg_num_rows - 1;
-  }
-  int top = g_next_free_dup_row;
-  int first = top - n_rows + 1;
-  if (first < 0) {
-    fprintf(stderr,
-            "[pim-runtime] ERROR: ran out of rows for shared dup allocation "
-            "(need %d rows; top=%d)\n",
-            n_rows, top);
-    return -1;
-  }
-  g_next_free_dup_row = first - 1;
-  return first;
-}
+/* (emit_per_bg_bcast_fanout + alloc_dup_rows_shared removed 2026-06-22 with the
+ * broadcast/row-duplicate blank-dedup machinery.) */
 
 /* ================================================================
  *  Public API
@@ -1052,7 +806,6 @@ void pim_init(const char *trace_file) {
   num_tensors = 0;
   cur_phase = PIM_PHASE_IDLE;
   memset(next_free_row, 0, sizeof(next_free_row));
-  stat_per_bg_bcast_fanouts = 0;
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
       0;
   last_program_id = -1;
@@ -1063,15 +816,7 @@ void pim_init(const char *trace_file) {
   const char *dedup_env = getenv("IM_DEDUP");
   g_dedup_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
 
-  /* bcast_scalar ablation knob: PIM_BCAST_SCALAR=0 disables the
-   * SCALAR_LD-broadcast modeling, forcing per-bank emission for
-   * what would otherwise be xyz-invariant scalar-broadcast loads.
-   * Apples-to-apples vs OptiPIM's PimCodeGen which doesn't model
-   * SCALAR_LD. Default = 1 (enabled). */
-  const char *bcast_env = getenv("PIM_BCAST_SCALAR");
-  g_bcast_scalar_enabled = (bcast_env && bcast_env[0] == '0') ? 0 : 1;
-  fprintf(stderr, "[pim-runtime] bcast_scalar=%d (set PIM_BCAST_SCALAR=0 to disable)\n",
-          g_bcast_scalar_enabled);
+  /* (PIM_BCAST_SCALAR / broadcast-scalar modeling removed 2026-06-22.) */
 
   /* Reuse-as-layout honoring knob (default OFF). When set, the compiler's
    * layout decisions (pim_set_tensor_layout) drive physical placement. See
@@ -1083,27 +828,8 @@ void pim_init(const char *trace_file) {
           "compiler layout drive placement)\n",
           g_honor_layout);
 
-  /* Per-BG broadcast modeling knob (default ON). Emits
-   * cfg_num_channels * cfg_num_pch * cfg_num_bg W events per unique
-   * scalar broadcast (one per bank-group's I/O bus cycle). Set
-   * PIM_PER_BG_BCAST=0 to revert to the legacy single-event-per-
-   * broadcast mode. See g_per_bg_bcast_enabled declaration. */
-  const char *per_bg_env = getenv("PIM_PER_BG_BCAST");
-  g_per_bg_bcast_enabled = (per_bg_env && per_bg_env[0] == '0') ? 0 : 1;
-  fprintf(stderr,
-          "[pim-runtime] per_bg_bcast=%d (set PIM_PER_BG_BCAST=0 to disable cross-BG broadcast cost modeling)\n",
-          g_per_bg_bcast_enabled);
-
-  /* Per-BG bcast_scalar duplication knob (default ON). Only effective
-   * when PIM_PER_BG_BCAST is also on — without the per-BG cost model
-   * there's nothing to amortise away. Set PIM_DUPLICATE_BCAST=0 to
-   * disable. */
-  const char *dup_env = getenv("PIM_DUPLICATE_BCAST");
-  g_duplicate_bcast_enabled = (dup_env && dup_env[0] == '0') ? 0 : 1;
-  g_next_free_dup_row = -1;
-  fprintf(stderr,
-          "[pim-runtime] duplicate_bcast=%d (set PIM_DUPLICATE_BCAST=0 to disable; requires per_bg_bcast=1 to take effect)\n",
-          g_duplicate_bcast_enabled);
+  /* (PIM_PER_BG_BCAST + PIM_DUPLICATE_BCAST / row-duplicate modeling removed
+   * 2026-06-22 with the broadcast blank-dedup machinery.) */
 
   /* Accumulator residency knob (default ON). Dedups ACCUMULATOR loads
    * at per-pid scope so K-loop partial-sum reads collapse to 1 R per
@@ -1224,26 +950,12 @@ void pim_init(const char *trace_file) {
     // See docs/ablation-levers-plan.md.
     g_dedup_lockstep = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
 
-    if (g_dedup_enabled) {
-      g_dedup               = addr_dedup_create(perpid_cap);
-      g_dedup_persistent    = addr_dedup_create(persistent_cap);
-      g_dedup_invariant_yz  = addr_dedup_create(persistent_cap);
-      g_dedup_invariant_xz  = addr_dedup_create(persistent_cap);
-      g_dedup_invariant_xy  = addr_dedup_create(persistent_cap);
-      g_dedup_store_perpid  = addr_dedup_create(perpid_cap);
-    } else {
-      g_dedup = NULL;
-      g_dedup_persistent = NULL;
-      g_dedup_invariant_yz = NULL;
-      g_dedup_invariant_xz = NULL;
-      g_dedup_invariant_xy = NULL;
-      g_dedup_store_perpid = NULL;
-    }
+    /* Only the accumulator per-pid store-dedup state remains (the blank per-pid
+     * physical g_dedup + the 4 axis-wise persistent states were removed
+     * 2026-06-22). g_dedup_enabled now gates only this store model. */
+    g_dedup_store_perpid = g_dedup_enabled ? addr_dedup_create(perpid_cap) : NULL;
   }
   stat_persistent_skips = 0;
-  stat_invariant_yz_skips = 0;
-  stat_invariant_xz_skips = 0;
-  stat_invariant_xy_skips = 0;
   stat_store_perpid_skips = 0;
 
   initialized = 1;
@@ -1299,11 +1011,8 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   t->assigned_bg = 0;
   t->assigned_bank = 0;
   t->base_row = 0;
-  t->bcast_scalar = 0;
   t->layout_scheme = cfg_layout_scheme;
   t->layout_linear_base = 0;
-  t->duplicated = 0;
-  for (int i = 0; i < MAX_BANKS; i++) t->dup_row_base[i] = 0;
 
   /* Interleaved (bit-interleaved scheme8-like) placement.
    *
@@ -1455,36 +1164,8 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   return num_tensors++;
 }
 
-/* Per-BG bcast_scalar duplication: replicate `t` into one copy in
- * bank=0 of every (ch, pch, bg). All BGs share the same row index
- * (alloc_dup_rows_shared), so the per-BG copies live at identical
- * (sa, row, col) — this lets the lockstep dedup collapse the per-BG
- * fan-out to one event downstream. The replication itself is treated
- * as a pre-kernel layout property (host arranges the data before
- * trace start) — NO setup W events are emitted. Matches OptiPIM's
- * `alloc_method=row_duplicate` semantics.
- *
- * Returns 0 on success, -1 if the shared dup pool is exhausted (caller
- * leaves t->duplicated=0 and the runtime falls back to per-BG W fanout). */
-static int duplicate_bcast_tensor_per_bg(tensor_info_t *t) {
-  int rows_needed = (t->num_elements + t->values_per_row - 1)
-                    / t->values_per_row;
-  /* Single shared allocation — all BGs use the SAME row base. This places
-   * each BG's replica at identical (sa, row, col), enabling the lockstep
-   * dedup downstream to collapse 8 per-BG events to one. */
-  int shared_base = alloc_dup_rows_shared(rows_needed);
-  if (shared_base < 0) return -1;
-  int n_bg_total = cfg_num_channels * cfg_num_pch * cfg_num_bg;
-  for (int bg_global = 0; bg_global < n_bg_total; bg_global++) {
-    t->dup_row_base[bg_global] = shared_base;
-  }
-  t->duplicated = 1;
-  fprintf(stderr,
-          "[pim-runtime] per-BG-dup layout: %d BGs reserved %d rows each "
-          "(pre-stored, no setup W emitted)\n",
-          n_bg_total, rows_needed);
-  return 0;
-}
+/* (duplicate_bcast_tensor_per_bg removed 2026-06-22 with the row-duplicate
+ * blank-dedup machinery.) */
 
 void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
   /* REMOVED 2026-06-22: broadcast-scalar / row-duplicate was a blank reuse
@@ -1561,14 +1242,6 @@ void pim_set_phase(pim_phase_t phase) {
    * scope: each phase is a distinct logical workload and any cached row
    * activations from one phase must not carry into the next. */
   if (phase != cur_phase) {
-    if (g_dedup_persistent)
-      addr_dedup_reset(g_dedup_persistent);
-    if (g_dedup_invariant_yz)
-      addr_dedup_reset(g_dedup_invariant_yz);
-    if (g_dedup_invariant_xz)
-      addr_dedup_reset(g_dedup_invariant_xz);
-    if (g_dedup_invariant_xy)
-      addr_dedup_reset(g_dedup_invariant_xy);
     if (g_dedup_store_perpid)
       addr_dedup_reset(g_dedup_store_perpid);
     /* The per-bank register cache persists across program-ids but is cleared at
@@ -1606,20 +1279,9 @@ void pim_finalize(void) {
           stat_ignored);
   fprintf(stderr, "[pim-runtime]   Total PIM ops  : %" PRIu64 "\n",
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
-  fprintf(stderr, "[pim-runtime]   Dedup hits     : %" PRIu64 " (enabled=%d)\n",
-          addr_dedup_hits(g_dedup), g_dedup_enabled);
   fprintf(stderr,
-          "[pim-runtime]   Persistent skips (xyz invariant): %" PRIu64 "\n",
+          "[pim-runtime]   Persistent (LRU-resident) skips : %" PRIu64 "\n",
           stat_persistent_skips);
-  fprintf(stderr,
-          "[pim-runtime]   Persistent skips (yz invariant) : %" PRIu64 "\n",
-          stat_invariant_yz_skips);
-  fprintf(stderr,
-          "[pim-runtime]   Persistent skips (xz invariant) : %" PRIu64 "\n",
-          stat_invariant_xz_skips);
-  fprintf(stderr,
-          "[pim-runtime]   Persistent skips (xy invariant) : %" PRIu64 "\n",
-          stat_invariant_xy_skips);
   fprintf(stderr,
           "[pim-runtime]   Store dedup skips (per-pid)     : %" PRIu64 "\n",
           stat_store_perpid_skips);
@@ -1632,9 +1294,6 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   Store coalesce (intra-vector)   : %" PRIu64 "\n",
           stat_store_coalesced);
-  fprintf(stderr,
-          "[pim-runtime]   Per-BG bcast fanouts (extra W)  : %" PRIu64 " (per_bg_bcast=%d)\n",
-          stat_per_bg_bcast_fanouts, g_per_bg_bcast_enabled);
 
   /* Per-tensor breakdown — Stage-0 diagnostics. Useful for figuring out
    * which tensor's accesses dominate the trace and where dedup is biting.
