@@ -197,21 +197,28 @@ static int g_redcol_extent = 0;
 /* Per-role operand residency gates (ABLATION KNOBS; DEFAULT = hold resident, i.e.
  * let the im.residency classifier's per-tensor decision govern via attr-gating).
  *
- * IMPORTANT (conv audit 2026-06-26): the STREAMED/OPERAND emission ROLE maps to
- * DIFFERENT logical operands per workload, so a GLOBAL re-stream flag is the WRONG
- * abstraction:
- *   - matmul: load-bearing reuse is on OPERAND(B) (re-streaming it explodes 30-45x);
- *             STREAMED(A) residency is minor (~+2-6%).
- *   - conv:   load-bearing reuse is on STREAMED (the INPUT, reused across ALL CO
- *             output channels); re-streaming it is CATASTROPHIC (conv 1.33x->0.755x).
- * OptiPIM holds the INPUT register-resident (write-once) and re-streams the WEIGHT
- * in BOTH workloads, so HOLDING the classifier-marked operands resident is the
- * OptiPIM-symmetric, defensible default. Hence BOTH gates DEFAULT 1; residency still
- * fires ONLY for classifier-marked tensors (g_attr_gated_residency). The gates stay
- * as ablation knobs: IM_RESIDENT_STREAMED=0 / IM_RESIDENT_OPERAND=0 re-stream that
- * role to attribute per-operand reuse (NB: =0 on STREAMED breaks conv -> not a
- * default). A true per-tensor "re-stream weight / hold input" split would need the
- * classifier to label input-vs-weight; deferred. */
+ * IMPORTANT (per-lever ablation MEASURED 2026-06-26, leave-one-out cycle ratios
+ * toggled/full-config-baseline; register-role map: STREAMED=matmul A / conv INPUT,
+ * OPERAND=matmul B / conv WEIGHT). The load-bearing reuse lives almost ENTIRELY on
+ * the OPERAND role in BOTH workloads -- a global re-stream flag is the wrong knob:
+ *   - matmul: OPERAND(B)-off = 32.7x (== all-reuse-off 32.8x, i.e. ~all of it);
+ *             STREAMED(A)-off = 1.06x (A barely reused).
+ *   - conv:   OPERAND(WEIGHT)-off = 60x -- the weight is stationary across the
+ *             BLOCK_HW output positions of a tile, so re-streaming it costs ~BLOCK_HW
+ *             extra reads/value. STREAMED(INPUT)-off = only 1.59x on 16x32x28x28,
+ *             and 0.82x (FASTER) on deep-CI 64x64x28x28: holding the low-reuse input
+ *             resident EVICTS the high-reuse weight from the 136-int32 GRF (capacity
+ *             contention -> motivates per-tensor capacity-aware residency).
+ * (Supersedes the earlier audit note that called conv's input/STREAMED reuse "load-
+ * bearing/catastrophic" -- measurement shows the WEIGHT/OPERAND dominates by ~40x.)
+ * Holding the classifier-marked reused operands resident is the OptiPIM-symmetric,
+ * defensible default, so BOTH gates DEFAULT 1; residency fires ONLY for tensors the
+ * classifier marked (g_attr_gated_residency). The gates stay as ablation knobs:
+ * IM_RESIDENT_STREAMED=0 / IM_RESIDENT_OPERAND=0 re-stream that role to attribute
+ * per-operand reuse (NB: =0 on STREAMED regresses small/mid conv in aggregate but
+ * HELPS deep-CI conv -- shape-dependent, hence not a global default). A true
+ * per-tensor "re-stream weight / hold input" split needs the classifier to label
+ * input-vs-weight; deferred. */
 static int g_resident_streamed = 1;
 static int g_resident_operand = 1;
 static pim_phase_t cur_phase = PIM_PHASE_IDLE;
