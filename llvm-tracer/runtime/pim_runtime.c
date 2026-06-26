@@ -282,26 +282,11 @@ static int g_matched_mode = 0;
  * byte-identical and A/B comparison is a single env flag. */
 static int g_honor_layout = 0;
 
-/* Accumulator residency. Default = 1 (on).
- *
- * Models the OptiPIM "accumulator stays in PE register across the
- * K-loop" pattern. Without this, an inner-product kernel emits one R
- * (load partial sum) + one BW (store partial sum) per K iteration —
- * the BW side is already deduped per-pid by g_dedup_store_perpid (one
- * BW per output tuple per program-id), but the R side is NOT deduped,
- * so a K=64 matmul still emits 64 R events per output tuple.
- *
- * When ON (set PIM_ACC_RESIDENT=0 to disable), ACCUMULATOR loads are
- * deduped at per-pid scope (same scope as the store side, keyed on
- * (global_bank, linear_row, col)). Within one program-id, the first
- * R to a tuple emits; subsequent R's at the same tuple are dropped —
- * modelling "the accumulator value lives in the PE register, no need
- * to re-fetch from the bank." Combined with the existing per-pid BW
- * dedup, this produces 1 R + 1 BW per accumulator tuple per program-
- * id, matching OptiPIM's first_time_in_col + single_bank_opt
- * semantics for accumulator residency. */
-static int g_acc_resident_enabled = 1;
-static uint64_t stat_acc_resident_skips = 0;
+/* (g_acc_resident_enabled + stat_acc_resident_skips removed 2026-06-26: the
+ * accumulator-read reuse dedup was proven byte-identical inert — the psum is
+ * loop-carried SSA in codegen and never round-trips to DRAM, so there are no
+ * ACCUMULATOR loads to collapse. Accumulator residency is realized in compiler
+ * codegen, not a runtime reuse skip.) */
 
 /* (g_per_bg_bcast_enabled + g_duplicate_bcast_enabled removed 2026-06-22 with
  * the broadcast / row-duplicate blank-dedup machinery.) */
@@ -896,15 +881,9 @@ void pim_init(const char *trace_file) {
   /* (PIM_PER_BG_BCAST + PIM_DUPLICATE_BCAST / row-duplicate modeling removed
    * 2026-06-22 with the broadcast blank-dedup machinery.) */
 
-  /* Accumulator residency knob (default ON). Dedups ACCUMULATOR loads
-   * at per-pid scope so K-loop partial-sum reads collapse to 1 R per
-   * output tuple per program-id. Set PIM_ACC_RESIDENT=0 to disable. */
-  const char *acc_env = getenv("PIM_ACC_RESIDENT");
-  g_acc_resident_enabled = (acc_env && acc_env[0] == '0') ? 0 : 1;
-  stat_acc_resident_skips = 0;
-  fprintf(stderr,
-          "[pim-runtime] acc_resident=%d (set PIM_ACC_RESIDENT=0 to disable)\n",
-          g_acc_resident_enabled);
+  /* (Accumulator-residency runtime knob removed 2026-06-26 — accumulator reuse
+   * is realized in codegen via the loop-carried-SSA psum; the runtime dedup was
+   * proven inert. PIM_ACC_RESIDENT is no longer read.) */
 
   /* Lockstep collapse knob (default ON). See g_dedup_lockstep declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
@@ -1351,9 +1330,6 @@ void pim_finalize(void) {
           "[pim-runtime]   Store dedup skips (per-pid)     : %" PRIu64 "\n",
           stat_store_perpid_skips);
   fprintf(stderr,
-          "[pim-runtime]   Acc residency skips (R per-pid) : %" PRIu64 " (acc_resident=%d)\n",
-          stat_acc_resident_skips, g_acc_resident_enabled);
-  fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
   fprintf(stderr,
@@ -1424,24 +1400,24 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * (global_bank, sa*rows+row, col) within the current per-program-id scope.
    *
    * Scope:
-   *   - Only in COMPUTE phase.
-   *   - STREAMED/OPERAND loads: always.
-   *   - ACCUMULATOR loads: only when PIM_ACC_RESIDENT is on. Models
-   *     the partial sum staying in the PE register across K iterations,
-   *     so the first R to (bank, row, col) per program-id emits and
-   *     subsequent reads at the same tuple are dropped. This pairs
-   *     with the existing per-pid store dedup to produce 1 R + 1 BW
-   *     per accumulator tuple per pid (matching OptiPIM).
-   *   - Stores are handled separately (per-program-id store dedup, below). */
+   *   - Only in COMPUTE phase, and only the OPERAND tensors (STREAMED/OPERAND
+   *     roles, gated by the per-role residency knobs + the im.residency
+   *     classifier via attr-gating). This is the physical PE-register (GRF)
+   *     residency model for reused operands.
+   *   - ACCUMULATOR (psum) residency is NOT a runtime skip: it is realized in
+   *     compiler codegen (loop-carried SSA — the psum never round-trips to DRAM),
+   *     so the old PIM_ACC_RESIDENT dedup was removed 2026-06-26 (proven inert).
+   *   - Stores are handled separately (per-program-id store write-once, below). */
   if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
       (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
-       (t->role == PIM_ROLE_OPERAND && g_resident_operand) ||
-       (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
-    /* Faithful PE-register residency: a hit is served from the register
-     * (no DRAM event); a miss re-fetches (LRU eviction at GRF capacity).
-     * Unifies the per-pid / persistent / bcast scopes into one physical
-     * per-bank register cache. */
+       (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
+    /* Faithful PE-register residency for the OPERAND tensors: a hit is served
+     * from the register (no DRAM event); a miss re-fetches (LRU eviction at GRF
+     * capacity). The ACCUMULATOR (psum) is NOT handled here: its residency is
+     * realized in compiler codegen (loop-carried SSA — the psum never round-trips
+     * to DRAM), so the runtime acc-residency dedup was removed 2026-06-26 (proven
+     * byte-identical inert across all 34 matmul/matvec/conv shapes). */
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
@@ -1451,8 +1427,6 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
                                           (int)loc.col))) {
       t->dedup_skips++;
-      if (t->role == PIM_ROLE_ACCUMULATOR)
-        stat_acc_resident_skips++;
       return; /* resident in PE register cache; no DRAM event */
     }
   }
