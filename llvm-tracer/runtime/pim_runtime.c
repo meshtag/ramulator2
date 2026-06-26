@@ -235,10 +235,10 @@ static uint64_t stat_store_coalesced = 0; /* per-call BWs collapsed when a
                                              vector store had multiple lanes
                                              land on the same (bank,row,col) */
 
-/* g_dedup_enabled now gates ONLY the accumulator per-pid store-dedup model
- * (g_dedup_store_perpid). The blank physical-address per-pid dedup state
+/* g_store_write_once_enabled now gates ONLY the accumulator per-pid store-dedup model
+ * (g_store_write_once). The blank physical-address per-pid dedup state
  * (formerly g_dedup) was removed 2026-06-22. */
-static int g_dedup_enabled = 1;
+static int g_store_write_once_enabled = 1;
 
 /* Matched-reuse fairness mode. Default = 0 (off). EXPERIMENTAL.
  *
@@ -323,7 +323,27 @@ static uint64_t stat_persistent_skips = 0;
  * the per-PE register-load cost in our trace at OptiPIM's abstraction
  * level. STREAMED/ACCUMULATOR tensors still collapse — those are
  * genuine bank-parallel reads, not bus broadcasts. */
-static addr_dedup_state_t *g_dedup_lockstep = NULL;
+/* ============================================================================
+ * RUNTIME ACCESS-COLLAPSE TAXONOMY — what suppresses a trace event, and why.
+ * NONE of these are the (removed) "blank reuse dedups"; they are, distinctly:
+ *
+ *   1. LOCKSTEP COLLAPSE  (g_lockstep_collapse)  — EMULATION ARTIFACT, not reuse.
+ *      Collapses the bank-replicas the host-replay over-emits (`for pid: for
+ *      bank: kernel()` runs each kernel ~32x/phase) into one SIMD dispatch ==
+ *      OptiPIM single_bank_opt. Faithful HW model; keep.
+ *   2. OPERAND GRF RESIDENCY  (g_lru_resident / lru_touch)  — the ONE reuse
+ *      mechanism. Models the physical PE register file (136 int32/bank); a hit
+ *      is register-resident. Compiler-gated (im.residency -> attr-gating). It is
+ *      the only thing that removes *reuse* accesses, and it is named lru/resident
+ *      (NOT "dedup"). Irreducible without grid-serializing codegen (slower).
+ *   3. STORE WRITE-ONCE  (g_store_write_once)  — CORRECTNESS, not reuse. One BW
+ *      per output tuple per program-id (psum written back once). Keep.
+ *
+ * `addr_dedup_*` is a generic hash-set HELPER (im_addr_dedup.c) backing #1 and
+ * #3 — that is why the token "dedup" appears throughout the file; it is the data
+ * structure's name, not N separate reuse dedups.
+ * ============================================================================ */
+static addr_dedup_state_t *g_lockstep_collapse = NULL;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
 
@@ -454,8 +474,8 @@ static inline uint64_t lru_key(int tensor_id, uint64_t linear_row, int col) {
  *   Reset on any program-id axis change (same cadence as g_dedup, the
  *   per-program-id load state).
  */
-static addr_dedup_state_t *g_dedup_store_perpid = NULL;
-static uint64_t stat_store_perpid_skips = 0;
+static addr_dedup_state_t *g_store_write_once = NULL;
+static uint64_t stat_store_write_once_skips = 0;
 
 static int last_program_id = -1;
 static int last_program_id_y = -1;
@@ -490,13 +510,13 @@ static int find_tensor(uint64_t addr) {
 }
 
 static void destroy_dedup_state() {
-  if (g_dedup_store_perpid) {
-    addr_dedup_destroy(g_dedup_store_perpid);
-    g_dedup_store_perpid = NULL;
+  if (g_store_write_once) {
+    addr_dedup_destroy(g_store_write_once);
+    g_store_write_once = NULL;
   }
-  if (g_dedup_lockstep) {
-    addr_dedup_destroy(g_dedup_lockstep);
-    g_dedup_lockstep = NULL;
+  if (g_lockstep_collapse) {
+    addr_dedup_destroy(g_lockstep_collapse);
+    g_lockstep_collapse = NULL;
   }
 }
 
@@ -517,15 +537,15 @@ static void advance_program_epoch_if_needed(void) {
   last_program_id_y = pid_y;
   last_program_id_z = pid_z;
 
-  /* g_dedup_store_perpid is per-program-id (any axis change resets).
-   * g_dedup_lockstep is also per-pid: lockstep replicas of a single SIMD
+  /* g_store_write_once is per-program-id (any axis change resets).
+   * g_lockstep_collapse is also per-pid: lockstep replicas of a single SIMD
    * dispatch are all within one pid, so the scope matches. (The blank per-pid
    * g_dedup + the axis-wise persistent states were removed 2026-06-22.) */
-  if (g_dedup_store_perpid) {
-    addr_dedup_reset(g_dedup_store_perpid);
+  if (g_store_write_once) {
+    addr_dedup_reset(g_store_write_once);
   }
-  if (g_dedup_lockstep) {
-    addr_dedup_reset(g_dedup_lockstep);
+  if (g_lockstep_collapse) {
+    addr_dedup_reset(g_lockstep_collapse);
   }
   (void)x_changed; (void)y_changed; (void)z_changed;
 }
@@ -862,9 +882,11 @@ void pim_init(const char *trace_file) {
   last_program_id_y = -1;
   last_program_id_z = -1;
 
-  /* Allow disabling the physical-address dedup for ablation: IM_DEDUP=0. */
+  /* Store write-once gate. IM_DEDUP=0 disables it for ablation (env name kept
+   * for back-compat; it now gates ONLY the accumulator store write-once model,
+   * NOT any reuse dedup — see the access-collapse taxonomy near the globals). */
   const char *dedup_env = getenv("IM_DEDUP");
-  g_dedup_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
+  g_store_write_once_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
 
   /* (PIM_BCAST_SCALAR / broadcast-scalar modeling removed 2026-06-22.) */
 
@@ -885,7 +907,7 @@ void pim_init(const char *trace_file) {
    * is realized in codegen via the loop-carried-SSA psum; the runtime dedup was
    * proven inert. PIM_ACC_RESIDENT is no longer read.) */
 
-  /* Lockstep collapse knob (default ON). See g_dedup_lockstep declaration
+  /* Lockstep collapse knob (default ON). See g_lockstep_collapse declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
@@ -986,21 +1008,21 @@ void pim_init(const char *trace_file) {
 
     // Lockstep collapse is FAITHFUL host-emulation-artifact correction: real
     // HBM-PIM issues one all-bank command, but launcher.py replays the kernel
-    // per (pid,bank). It is allocated independently of g_dedup_enabled so the
+    // per (pid,bank). It is allocated independently of g_store_write_once_enabled so the
     // blank operand dedups (per-pid physical + persistent scope) can be
-    // disabled (IM_DEDUP=0) while lockstep stays on. (Previously g_dedup_lockstep
-    // lived inside the g_dedup_enabled block, so IM_DEDUP=0 silently killed
+    // disabled (IM_DEDUP=0) while lockstep stays on. (Previously g_lockstep_collapse
+    // lived inside the g_store_write_once_enabled block, so IM_DEDUP=0 silently killed
     // lockstep too — conflating an artifact correction with the blank dedups.)
     // See docs/ablation-levers-plan.md.
-    g_dedup_lockstep = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
+    g_lockstep_collapse = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
 
     /* Only the accumulator per-pid store-dedup state remains (the blank per-pid
      * physical g_dedup + the 4 axis-wise persistent states were removed
-     * 2026-06-22). g_dedup_enabled now gates only this store model. */
-    g_dedup_store_perpid = g_dedup_enabled ? addr_dedup_create(perpid_cap) : NULL;
+     * 2026-06-22). g_store_write_once_enabled now gates only this store model. */
+    g_store_write_once = g_store_write_once_enabled ? addr_dedup_create(perpid_cap) : NULL;
   }
   stat_persistent_skips = 0;
-  stat_store_perpid_skips = 0;
+  stat_store_write_once_skips = 0;
 
   initialized = 1;
   finalized = 0;
@@ -1286,8 +1308,8 @@ void pim_set_phase(pim_phase_t phase) {
    * scope: each phase is a distinct logical workload and any cached row
    * activations from one phase must not carry into the next. */
   if (phase != cur_phase) {
-    if (g_dedup_store_perpid)
-      addr_dedup_reset(g_dedup_store_perpid);
+    if (g_store_write_once)
+      addr_dedup_reset(g_store_write_once);
     /* The per-bank register cache persists across program-ids but is cleared at
      * a phase boundary (a distinct logical workload). */
     if (g_lru_residency) {
@@ -1328,7 +1350,7 @@ void pim_finalize(void) {
           stat_persistent_skips);
   fprintf(stderr,
           "[pim-runtime]   Store dedup skips (per-pid)     : %" PRIu64 "\n",
-          stat_store_perpid_skips);
+          stat_store_write_once_skips);
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
@@ -1450,16 +1472,16 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * Scalar stores have n=1, so there is no intra-vector coalescing step; they
    * consult only this state.
    */
-  if (g_dedup_enabled && g_dedup_store_perpid &&
+  if (g_store_write_once_enabled && g_store_write_once &&
       cur_phase == PIM_PHASE_COMPUTE && is_write &&
       (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
       t->role == PIM_ROLE_ACCUMULATOR) {
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (!addr_dedup_check_and_mark(g_dedup_store_perpid, (uint64_t)global_bank,
+    if (!addr_dedup_check_and_mark(g_store_write_once, (uint64_t)global_bank,
                                    linear_row, (uint64_t)loc.col)) {
-      stat_store_perpid_skips++;
+      stat_store_write_once_skips++;
       t->dedup_skips++;
       return;
     }
@@ -1481,12 +1503,12 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * still collapse — those are genuine SIMD-bank-parallel bank-reads,
    * not bus broadcasts. */
   int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
-  if (g_lockstep_enabled && g_dedup_lockstep &&
+  if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     uint64_t tensor_key = (uint64_t)(t - tensors);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (!addr_dedup_check_and_mark(g_dedup_lockstep, tensor_key,
+    if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key,
                                    linear_row, (uint64_t)loc.col)) {
       stat_lockstep_skips++;
       t->dedup_skips++;
@@ -1551,12 +1573,12 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
    * cost matching OptiPIM's PimCodeGen abstraction). Persistent-scope
    * loads are always reads here. */
   int is_operand_load_p = (t->role == PIM_ROLE_OPERAND);
-  if (g_lockstep_enabled && g_dedup_lockstep &&
+  if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load_p) {
     uint64_t tensor_key = (uint64_t)(t - tensors);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (!addr_dedup_check_and_mark(g_dedup_lockstep, tensor_key,
+    if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key,
                                    linear_row, (uint64_t)loc.col)) {
       stat_lockstep_skips++;
       t->dedup_skips++;
@@ -1578,7 +1600,7 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
  *     buffer catches these intra-vector duplicates without touching the
  *     global hashmap.
  *
- *   Layer 2 (cross-vector, g_dedup_store_perpid): under the Triton
+ *   Layer 2 (cross-vector, g_store_write_once): under the Triton
  *     execution model, each program-id is one unit of work and materializes
  *     its outputs once per program-id. Multiple vector stores within the
  *     same program-id that resolve to the same physical tuple correspond
@@ -1656,14 +1678,14 @@ static void pim_trace_store_tile_coalesced(tensor_info_t *t, uint64_t base_addr,
     /* Otherwise the per-call buffer is full — fall through to layer 2. */
 
     /* Layer 2: cross-vector dedup within the current program-id. */
-    if (g_dedup_enabled && g_dedup_store_perpid &&
+    if (g_store_write_once_enabled && g_store_write_once &&
         (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET)) {
       uint64_t linear_row =
           (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
-      if (!addr_dedup_check_and_mark(g_dedup_store_perpid,
+      if (!addr_dedup_check_and_mark(g_store_write_once,
                                      (uint64_t)global_bank, linear_row,
                                      (uint64_t)col)) {
-        stat_store_perpid_skips++;
+        stat_store_write_once_skips++;
         t->dedup_skips++;
         continue;
       }
@@ -1672,11 +1694,11 @@ static void pim_trace_store_tile_coalesced(tensor_info_t *t, uint64_t base_addr,
     /* Layer 3: lockstep collapse. Per (tensor_id, sa, row, col) within a
      * pid, only the first bank's BW emits — the remaining 31 banks are
      * lockstep replicas of the same SIMD store. */
-    if (g_lockstep_enabled && g_dedup_lockstep) {
+    if (g_lockstep_enabled && g_lockstep_collapse) {
       uint64_t tensor_key = (uint64_t)(t - tensors);
       uint64_t linear_row =
           (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
-      if (!addr_dedup_check_and_mark(g_dedup_lockstep, tensor_key,
+      if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key,
                                      linear_row, (uint64_t)col)) {
         stat_lockstep_skips++;
         t->dedup_skips++;
