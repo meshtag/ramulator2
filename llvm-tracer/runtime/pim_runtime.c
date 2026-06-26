@@ -182,6 +182,38 @@ static int num_tensors = 0;
  *  Runtime state
  * ================================================================ */
 static FILE *trace_fp = NULL;
+
+/* Reduction-col-axis lever. When IM_REDUCTION_COL=1, map_element_interleaved
+ * transposes the OPERAND tensor's flat [extent,stride] view to [stride,extent]
+ * so the contraction (K) axis lands on the column-low bits — turning the K
+ * row-buffer thrash (one ACT per access) into one open row per physical bank.
+ * stride/extent are supplied for the proof via IM_REDCOL_STRIDE/EXTENT (=N,K);
+ * the production lever will carry these per-tensor from the im.residency
+ * classifier. Default OFF => dead branch => trace byte-identical. */
+static int g_reduction_col = 0;
+static int g_redcol_stride = 0;
+static int g_redcol_extent = 0;
+
+/* Per-role operand residency gates (ABLATION KNOBS; DEFAULT = hold resident, i.e.
+ * let the im.residency classifier's per-tensor decision govern via attr-gating).
+ *
+ * IMPORTANT (conv audit 2026-06-26): the STREAMED/OPERAND emission ROLE maps to
+ * DIFFERENT logical operands per workload, so a GLOBAL re-stream flag is the WRONG
+ * abstraction:
+ *   - matmul: load-bearing reuse is on OPERAND(B) (re-streaming it explodes 30-45x);
+ *             STREAMED(A) residency is minor (~+2-6%).
+ *   - conv:   load-bearing reuse is on STREAMED (the INPUT, reused across ALL CO
+ *             output channels); re-streaming it is CATASTROPHIC (conv 1.33x->0.755x).
+ * OptiPIM holds the INPUT register-resident (write-once) and re-streams the WEIGHT
+ * in BOTH workloads, so HOLDING the classifier-marked operands resident is the
+ * OptiPIM-symmetric, defensible default. Hence BOTH gates DEFAULT 1; residency still
+ * fires ONLY for classifier-marked tensors (g_attr_gated_residency). The gates stay
+ * as ablation knobs: IM_RESIDENT_STREAMED=0 / IM_RESIDENT_OPERAND=0 re-stream that
+ * role to attribute per-operand reuse (NB: =0 on STREAMED breaks conv -> not a
+ * default). A true per-tensor "re-stream weight / hold input" split would need the
+ * classifier to label input-vs-weight; deferred. */
+static int g_resident_streamed = 1;
+static int g_resident_operand = 1;
 static pim_phase_t cur_phase = PIM_PHASE_IDLE;
 static int initialized = 0;
 static int finalized = 0;
@@ -222,9 +254,14 @@ static int g_dedup_enabled = 1;
  *     DISABLED for STREAMED/OPERAND loads (temporal/cross-pid re-reads are
  *     emitted, not collapsed), and the bcast_scalar->persistent unbounded
  *     promotion is suppressed;
- *   - lockstep bank-collapse stays as in default mode: it collapses STREAMED
- *     bank-replicas (genuine broadcast: all banks read the same (sa,row,col)),
- *     but OPERAND loads keep the lockstep BYPASS so per-bank operand work
+ *   - lockstep bank-collapse stays as in default mode: it collapses the 32
+ *     STREAMED bank-events at one (sa,row,col) OFFSET into ONE SIMD dispatch.
+ *     NOTE (corrected 2026-06-25): this is NOT a data broadcast — the 32 banks
+ *     hold DISTINCT bank-spread elements (verified bank0=A[0..3],
+ *     bank1=A[256..259]); they share the (sa,row,col) offset and are accessed
+ *     in PARALLEL, so collapsing to one dispatch is the free-bank-parallelism
+ *     convention, symmetric with OptiPIM single_bank_opt (emit-one-bank+break).
+ *     OPERAND loads keep the lockstep BYPASS so per-bank operand work
  *     stays SPREAD across the 32 banks — matching OptiPIM codegen_bank_new,
  *     which fans each input write across all spatial banks (input
  *     replication) rather than serializing on one bank. (An earlier version
@@ -560,6 +597,20 @@ static void decode_flat_bank(int global_bank, int *ch, int *pch, int *bg,
 static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
                                     int *ch, int *pch, int *bg, int *bank,
                                     int *sa, int *row, int *col) {
+  /* Reduction-col-axis lever: transpose the contraction axis onto the
+   * column-low bits. Gated (default OFF => byte-identical). Applies only to
+   * the OPERAND operand (the stride-N reduction matrix) with pow2 stride and
+   * extent. This is a pure trace-address remap — it never touches computed
+   * data, so correctness is invariant; only ramulator cycles change. */
+  if (g_reduction_col && t->role == PIM_ROLE_OPERAND &&
+      g_redcol_stride > 1 && g_redcol_extent > 1 &&
+      (g_redcol_stride & (g_redcol_stride - 1)) == 0 &&
+      (g_redcol_extent & (g_redcol_extent - 1)) == 0) {
+    int S = g_redcol_stride, Kd = g_redcol_extent;
+    int k = elem_idx / S;
+    int n = elem_idx % S;
+    elem_idx = n * Kd + k;
+  }
   uint64_t linear = t->layout_linear_base + (uint64_t)elem_idx;
 
   int log2_vpc      = ilog2_pow2(t->values_per_col);
@@ -759,6 +810,20 @@ void pim_init(const char *trace_file) {
     cfg_num_cols = atoi(v);
   if ((v = getenv("PIM_DQ_BITS")))
     cfg_dq_bits = atoi(v);
+
+  /* Reduction-col-axis lever (default OFF). */
+  if ((v = getenv("IM_REDUCTION_COL")))
+    g_reduction_col = atoi(v);
+  if ((v = getenv("IM_REDCOL_STRIDE")))
+    g_redcol_stride = atoi(v);
+  if ((v = getenv("IM_REDCOL_EXTENT")))
+    g_redcol_extent = atoi(v);
+
+  /* Per-role residency gates (default ON). */
+  if ((v = getenv("IM_RESIDENT_STREAMED")))
+    g_resident_streamed = atoi(v);
+  if ((v = getenv("IM_RESIDENT_OPERAND")))
+    g_resident_operand = atoi(v);
 
   /* Placement scheme: PIM_LAYOUT=interleaved (default) | striped
    * Interleaved is bit-interleaved scheme8-like placement; sequential
@@ -1370,7 +1435,8 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    *   - Stores are handled separately (per-program-id store dedup, below). */
   if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
       (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
-      (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND ||
+      ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
+       (t->role == PIM_ROLE_OPERAND && g_resident_operand) ||
        (t->role == PIM_ROLE_ACCUMULATOR && g_acc_resident_enabled))) {
     /* Faithful PE-register residency: a hit is served from the register
      * (no DRAM event); a miss re-fetches (LRU eviction at GRF capacity).
@@ -1481,7 +1547,8 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
 
   if (cur_phase == PIM_PHASE_COMPUTE &&
       (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
-      (t->role == PIM_ROLE_STREAMED || t->role == PIM_ROLE_OPERAND)) {
+      ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
+       (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
