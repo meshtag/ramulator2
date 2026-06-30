@@ -203,6 +203,19 @@ private:
 
     return request_found;
   }
+
+  // [P0.2 drain-tail fix] mirror OptiPIM pim_dram_controller.cpp::clear(): the
+  // controller is "clear" only when every queue is empty, so finished() waits
+  // for the memory drain tail (33-942 cyc) that TritonIM previously skipped.
+  bool clear() override {
+    bool no_pending = true;
+    if (m_active_buffer.size()) no_pending = false;
+    if (m_priority_buffer.size()) no_pending = false;
+    if (m_read_buffer.size()) no_pending = false;
+    if (m_write_buffer.size()) no_pending = false;
+    if (pending.size()) no_pending = false;
+    return no_pending;
+  }
 };
 
 } // namespace Ramulator

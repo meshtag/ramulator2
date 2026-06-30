@@ -49,7 +49,14 @@ class IDRAMController : public Clocked<IDRAMController> {
      * 
      */
     virtual void tick() = 0;
-   
+
+    /**
+     * @brief  [P0.2 drain-tail fix] True only when the controller's queues are
+     *         drained. Mirrors OptiPIM's convention so both stacks terminate
+     *         identically (was: TritonIM finished()==true, under-counting the tail).
+     */
+    virtual bool clear() { return true; };
+
 };
 
 }       // namespace Ramulator

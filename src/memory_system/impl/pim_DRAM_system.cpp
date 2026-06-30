@@ -107,7 +107,17 @@ public:
 
   float get_tCK() override { return m_dram->m_timing_vals("tCK_ps") / 1000.0f; }
 
-  bool finished() override { return true; }
+  bool finished() override {
+    // [P0.2 drain-tail fix] terminate only once all controllers are drained
+    // (mirrors OptiPIM pim_DRAM_system::finished). Previously returned true
+    // unconditionally, under-counting cycles by the memory drain tail and
+    // inflating near-1.0 TritonIM/OptiPIM ratios.
+    bool all_clear = true;
+    for (auto controller : m_controllers) {
+      all_clear &= controller->clear();
+    }
+    return all_clear;
+  }
 };
 
 } // namespace Ramulator

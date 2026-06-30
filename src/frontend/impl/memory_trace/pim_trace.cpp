@@ -66,7 +66,13 @@ public:
     }
   };
 
-  bool is_finished() override { return m_curr_trace_idx >= m_trace_length; };
+  // [P0.2 drain-tail fix] Finish only when every trace request is issued AND the
+  // memory system has drained (mirrors OptiPIM PimTrace::is_finished, which returns
+  // m_memory_system->finished()). Previously finished at issue-complete, skipping the
+  // 33-942-cycle memory drain tail OptiPIM pays — which inflated near-1.0 ratios.
+  bool is_finished() override {
+    return m_curr_trace_idx >= m_trace_length && m_memory_system->finished();
+  };
 
 private:
   void init_trace(const std::string &file_path_str) {
