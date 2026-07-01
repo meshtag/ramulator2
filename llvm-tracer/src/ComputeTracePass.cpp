@@ -80,37 +80,37 @@ static int mapOpcode(unsigned LLVMOp) {
 }
 
 /*
- * Forward def-use walker to find the eventual StoreInst that a
- * BinaryOperator's result flows into.
+ * Forward def-use walker: does a BinaryOperator's result flow into a genuine
+ * DATA store? Returns the terminal store instruction (a StoreInst, or an
+ * llvm.masked.store / llvm.masked.scatter) reached DFS-first; the caller
+ * inserts __compute_trace immediately before it so the destination address
+ * dominates the call site in SSA (avoids "instruction does not dominate all
+ * uses" verifier failures). Sets DestAddr to the store's pointer operand
+ * (null for masked.scatter's vector-of-pointers → runtime resolves via
+ * current_acc).
  *
- * Returns the StoreInst (DFS-first reached); the caller takes the
- * store's pointer operand as the destination address. We return the
- * Store rather than the address so the caller can insert the
- * compute_trace call immediately before the Store — that guarantees
- * the address (the Store's pointer operand) dominates the call site
- * in SSA, avoiding "instruction does not dominate all uses" verifier
- * failures that would result from instrumenting at the BO position
- * where the destination address is computed later in program order.
+ * W4 FIX (2026-07-01): returns nullptr for BinaryOperators whose value never
+ * reaches a data store — i.e. pure ADDRESS/INDEX/LOOP-CONTROL arithmetic, which
+ * flows only into GEPs (address computation), CmpInsts + PHIs (loop induction),
+ * or int↔ptr casts, and NEVER into a stored data value. Previously such BOs
+ * were still charged as PE compute via a null-dest fallback, so the SIMDRAM
+ * compute column over-counted host loop-counter/address arithmetic as bit-serial
+ * PE work (the reviewer's construct-validity + unroll-sensitivity bug). Charging
+ * only value-producing compute that lands in a data store makes the compute count
+ * proportional to actual output elements, hence unroll-invariant. Legitimate
+ * INTEGER PE compute (bit-serial int8/int4 MAC) is preserved: it reaches a data
+ * store, unlike index math which terminates at a GEP.
  *
- * Walks transparently through value-propagating ops (BinaryOperator,
- * PHINode, SelectInst, CastInst, vector shuffles, value-producing
- * intrinsics like fmuladd/vector reductions). Stops at LoadInst,
- * GEPs, int↔ptr conversions, and opaque calls — those don't propagate
- * our value into a stored destination.
+ * Walks transparently through value-propagating ops (BinaryOperator, PHINode,
+ * SelectInst, CastInst, vector shuffles, value-producing intrinsics like
+ * fmuladd/vector reductions). Stops at LoadInst, GEPs, int↔ptr conversions, and
+ * opaque calls — those don't propagate our value into a stored destination.
  *
  * Imprecision:
- *   - Vector BO: all lanes resolve to the vector store's tile-base
- *     pointer. For SIMDRAM's bit-serial layout where dq_bits values
- *     share one col_slot, this resolves to the col_slot containing
- *     the tile's first lane — acceptable granularity.
- *   - DAG fan-out (BO feeds multiple stores): we return the first
- *     store reached. Mild misattribution for fused-with-scratch
- *     kernels.
- *   - BO never stored: returns nullptr; caller falls back to
- *     instrumenting at the BO position with a null dest_addr, which
- *     the runtime resolves via current_acc.
+ *   - Vector BO: all lanes resolve to the vector store's tile-base pointer.
+ *   - DAG fan-out (BO feeds multiple stores): first store reached.
  */
-static StoreInst *findEventualStore(BinaryOperator *BO) {
+static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
   SmallVector<Value *, 16> worklist;
   SmallSet<Value *, 32> visited;
   worklist.push_back(BO);
@@ -122,8 +122,10 @@ static StoreInst *findEventualStore(BinaryOperator *BO) {
 
     for (User *U : cur->users()) {
       if (auto *Store = dyn_cast<StoreInst>(U)) {
-        if (Store->getValueOperand() == cur)
+        if (Store->getValueOperand() == cur) {
+          DestAddr = Store->getPointerOperand();
           return Store;
+        }
         continue;
       }
 
@@ -134,6 +136,19 @@ static StoreInst *findEventualStore(BinaryOperator *BO) {
       if (auto *Call = dyn_cast<CallInst>(U)) {
         if (auto *II = dyn_cast<IntrinsicInst>(Call)) {
           switch (II->getIntrinsicID()) {
+          // Masked vector stores are genuine data stores (vectorized epilogue).
+          case Intrinsic::masked_store:
+            if (II->getArgOperand(0) == cur) {   // (value, ptr, align, mask)
+              DestAddr = II->getArgOperand(1);
+              return II;
+            }
+            break;
+          case Intrinsic::masked_scatter:
+            if (II->getArgOperand(0) == cur) {   // (value, <vec ptr>, align, mask)
+              DestAddr = nullptr;                 // vector of ptrs → current_acc
+              return II;
+            }
+            break;
           case Intrinsic::fmuladd:
           case Intrinsic::fma:
           case Intrinsic::minnum:
@@ -220,31 +235,32 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
       Value *NullPtr = ConstantPointerNull::get(PtrTy);
 
       for (auto *BO : BinOps) {
+        // W4 FIX: only charge BinaryOperators whose value flows into a genuine
+        // DATA store as PE compute. BOs that never reach a data store are pure
+        // address/index/loop-control arithmetic (they terminate at GEPs, CmpInsts
+        // or int↔ptr casts) and are NOT bit-serial PE work — skipping them removes
+        // the host-arithmetic over-count and makes the compute cost unroll-invariant.
+        Value *DestAddr = nullptr;
+        Instruction *Store = reachesDataStore(BO, DestAddr);
+        if (!Store)
+          continue;
+
         int op = mapOpcode(BO->getOpcode());
         unsigned bits = BO->getType()->getScalarSizeInBits();
         Value *opArg = ConstantInt::get(Type::getInt32Ty(Ctx), op);
         Value *bitsArg = ConstantInt::get(Type::getInt32Ty(Ctx), bits);
 
-        // Forward def-use to find the BinaryOp's eventual store.
-        // Insert __compute_trace at the STORE position (not the BO
-        // position) so the dest_addr (the store's pointer operand)
-        // dominates the call — instrumenting at the BO would reference
-        // a not-yet-defined SSA value and trip the LLVM verifier.
-        StoreInst *Store = findEventualStore(BO);
-
-        if (Store) {
-          IRBuilder<> Builder(Store);
-          Value *DestAddr = Store->getPointerOperand();
-          if (DestAddr->getType() != PtrTy)
-            DestAddr = Builder.CreateBitOrPointerCast(DestAddr, PtrTy);
-          Builder.CreateCall(ComputeFn, {opArg, bitsArg, DestAddr});
-        } else {
-          // No store found — instrument at the BO position with a
-          // null dest_addr; the runtime falls back to current_acc.
-          IRBuilder<> Builder(BO->getNextNode() ? BO->getNextNode()
-                                                : (Instruction *)BO);
-          Builder.CreateCall(ComputeFn, {opArg, bitsArg, NullPtr});
+        // Insert __compute_trace at the STORE position (not the BO position) so
+        // the dest_addr dominates the call — instrumenting at the BO would
+        // reference a not-yet-defined SSA value and trip the LLVM verifier.
+        IRBuilder<> Builder(Store);
+        Value *Dest = NullPtr;
+        if (DestAddr) {
+          Dest = DestAddr;
+          if (Dest->getType() != PtrTy)
+            Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
         }
+        Builder.CreateCall(ComputeFn, {opArg, bitsArg, Dest});
         Modified = true;
       }
     }
