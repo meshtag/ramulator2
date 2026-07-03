@@ -158,6 +158,15 @@ typedef struct {
   uint32_t bank_spread_mask; /* bitmask of tensor axes spread across banks */
   int resident_capacity;     /* resident budget in tuples; 0 = unbounded */
 
+  /* Per-tensor, per-bank register-residency cache honoring the COMPILER's
+   * resident_capacity partition of the physical register file (used when
+   * g_honor_layout). This REPLACES the single global per-bank LRU that was
+   * shared across all tensors: the compiler decides each operand's register
+   * budget (resident_capacity) so a low-reuse operand can no longer evict a
+   * high-reuse one (the capacity-contention flaw of the shared LRU). NULL until
+   * pim_set_tensor_layout allocates it (only for resident_capacity > 0). */
+  struct lru_cache *resident_cache[MAX_BANKS];
+
   /* Per-tensor diagnostic counters (Stage 0). Emitted = trace lines actually
    * written; dedup_skips = times check_and_mark returned 0 for this tensor;
    * range_calls = number of __mem_trace_load/store invocations into this
@@ -280,14 +289,14 @@ static int g_store_write_once_enabled = 1;
 static int g_matched_mode = 0;
 
 /* (g_bcast_scalar_enabled / broadcast-scalar enable flag removed 2026-06-22.) */
-/* Reuse-as-layout honoring (default OFF). When IM_HONOR_LAYOUT=1, the
- * compiler-decided layout pushed in via pim_set_tensor_layout() drives
- * physical placement (currently ROW_DUP -> per-BG resident replication, the
- * same audited path as a manual broadcast_scalar, matching OptiPIM's
- * alloc_method=row_duplicate). Default 0 keeps pim_set_tensor_layout()
- * ABI-only (record + log, no behavior change) so existing traces are
- * byte-identical and A/B comparison is a single env flag. */
-static int g_honor_layout = 0;
+/* Reuse-as-layout honoring (DEFAULT ON as of 2026-07-03). The compiler-decided
+ * layout pushed in via pim_set_tensor_layout() drives residency: each tensor is
+ * held resident in its own per-bank register partition sized to the compiler's
+ * resident_capacity, and the generic shared per-bank LRU is DROPPED (used only as
+ * the IM_HONOR_LAYOUT=0 ablation fallback). This makes operand reuse a COMPILER
+ * decision the runtime merely enforces, per the layout-via-compiler directive.
+ * Set IM_HONOR_LAYOUT=0 to revert to the legacy shared-LRU residency for ablation. */
+static int g_honor_layout = 1;
 
 /* (g_acc_resident_enabled + stat_acc_resident_skips removed 2026-06-26: the
  * accumulator-read reuse dedup was proven byte-identical inert — the psum is
@@ -369,7 +378,7 @@ static uint64_t stat_lockstep_skips = 0;
  *  Enable with IM_LRU_RESIDENCY=1; capacity = g_resident_per_bank.
  * ============================================================ */
 #define LRU_EMPTY ((uint64_t)-1)
-typedef struct {
+typedef struct lru_cache {
   int cap;
   uint64_t *keys;
   uint64_t *ts;
@@ -434,6 +443,13 @@ static void lru_reset(lru_cache_t *c) {
   for (int i = 0; i < c->cap; i++)
     c->keys[i] = LRU_EMPTY;
   c->clock = 0;
+}
+static void lru_destroy(lru_cache_t *c) {
+  if (!c)
+    return;
+  free(c->keys);
+  free(c->ts);
+  free(c);
 }
 static inline uint64_t lru_key(int tensor_id, uint64_t linear_row, int col) {
   return ((uint64_t)(tensor_id & 0x3F) << 58) |
@@ -901,10 +917,12 @@ void pim_init(const char *trace_file) {
    * layout decisions (pim_set_tensor_layout) drive physical placement. See
    * g_honor_layout. */
   const char *honor_env = getenv("IM_HONOR_LAYOUT");
-  g_honor_layout = (honor_env && honor_env[0] == '1') ? 1 : 0;
+  /* DEFAULT ON: compiler layout drives residency. IM_HONOR_LAYOUT=0 reverts to
+   * the legacy shared-LRU residency (ablation). */
+  g_honor_layout = (honor_env && honor_env[0] == '0') ? 0 : 1;
   fprintf(stderr,
-          "[pim-runtime] honor_layout=%d (set IM_HONOR_LAYOUT=1 to let the "
-          "compiler layout drive placement)\n",
+          "[pim-runtime] honor_layout=%d (compiler residency; set "
+          "IM_HONOR_LAYOUT=0 for legacy shared-LRU ablation)\n",
           g_honor_layout);
 
   /* (PIM_PER_BG_BCAST + PIM_DUPLICATE_BCAST / row-duplicate modeling removed
@@ -1289,20 +1307,37 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
   if (!g_honor_layout)
     return; /* ABI-only: record the descriptor, change no emitted trace */
 
-  /* Honor the layout decision by driving the existing physical-placement
-   * machinery. ROW_DUP (the pass's BroadcastReplicate class) maps onto the
-   * per-BG resident replication map_element already implements, which matches
-   * OptiPIM's alloc_method=row_duplicate — the FAIR layout for a scalar-
-   * broadcast operand and the compiler-decided replacement for a manual
-   * broadcast_scalar annotation. BANK_SPREAD is the default placement (no
-   * change); RESIDENT/LEADER and reduction_col_axis/resident_capacity
-   * honoring land in a later increment. */
+  /* Honor the layout decision by driving the physical-placement machinery.
+   * ROW_DUP (the pass's BroadcastReplicate class) maps onto the per-BG resident
+   * replication map_element implements (== OptiPIM alloc_method=row_duplicate). */
   switch (layout_kind) {
   case PIM_LAYOUT_KIND_ROW_DUP:
     pim_set_tensor_broadcast_scalar(tensor_id, 1);
     break;
   default:
     break;
+  }
+
+  /* COMPILER-PARTITIONED REGISTER RESIDENCY (drops the global shared LRU).
+   * The compiler decided this tensor's register budget = resident_capacity
+   * (tuples/bank). Allocate this tensor its OWN per-bank residency cache of
+   * exactly that capacity; the operand-residency skip sites consult it instead
+   * of the global g_lru_resident[] cache when g_honor_layout is set. A tensor
+   * the compiler did NOT mark resident (capacity 0) gets NO cache -> every
+   * access re-streams (faithful: the compiler chose not to hold it resident).
+   * Because each operand has its own compiler-sized partition, a low-reuse
+   * operand can no longer evict a high-reuse one — the capacity-contention flaw
+   * of the single shared LRU. */
+  int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  if (n_banks > MAX_BANKS)
+    n_banks = MAX_BANKS;
+  for (int b = 0; b < n_banks; b++) {
+    if (t->resident_cache[b]) { /* re-registration: rebuild at new capacity */
+      lru_destroy(t->resident_cache[b]);
+      t->resident_cache[b] = NULL;
+    }
+    if (resident_capacity > 0)
+      t->resident_cache[b] = lru_create(resident_capacity);
   }
 }
 
@@ -1318,12 +1353,18 @@ void pim_set_phase(pim_phase_t phase) {
     if (g_store_write_once)
       addr_dedup_reset(g_store_write_once);
     /* The per-bank register cache persists across program-ids but is cleared at
-     * a phase boundary (a distinct logical workload). */
+     * a phase boundary (a distinct logical workload). Reset BOTH the legacy
+     * global shared LRU and every tensor's compiler-partitioned residency. */
+    int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    if (n_banks > MAX_BANKS)
+      n_banks = MAX_BANKS;
     if (g_lru_residency) {
-      int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-      for (int b = 0; b < n_banks && b < MAX_BANKS; b++)
+      for (int b = 0; b < n_banks; b++)
         lru_reset(g_lru_resident[b]);
     }
+    for (int ti = 0; ti < num_tensors; ti++)
+      for (int b = 0; b < n_banks; b++)
+        lru_reset(tensors[ti].resident_cache[b]);
   }
   cur_phase = phase;
 }
@@ -1437,16 +1478,33 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    *     compiler codegen (loop-carried SSA — the psum never round-trips to DRAM),
    *     so the old PIM_ACC_RESIDENT dedup was removed 2026-06-26 (proven inert).
    *   - Stores are handled separately (per-program-id store write-once, below). */
-  if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
-      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
-      ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
-       (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
-    /* Faithful PE-register residency for the OPERAND tensors: a hit is served
-     * from the register (no DRAM event); a miss re-fetches (LRU eviction at GRF
-     * capacity). The ACCUMULATOR (psum) is NOT handled here: its residency is
-     * realized in compiler codegen (loop-carried SSA — the psum never round-trips
-     * to DRAM), so the runtime acc-residency dedup was removed 2026-06-26 (proven
-     * byte-identical inert across all 34 matmul/matvec/conv shapes). */
+  if (cur_phase == PIM_PHASE_COMPUTE && !is_write && g_honor_layout) {
+    /* COMPILER-PARTITIONED register residency (the global shared LRU is dropped
+     * under g_honor_layout). Consult THIS tensor's own per-bank cache, sized to
+     * the compiler's resident_capacity. resident_capacity==0 -> no cache -> the
+     * access re-streams (the compiler chose not to hold this operand resident).
+     * No role gate and no global LRU: the compiler's per-tensor register budget
+     * IS the residency decision, so a low-reuse operand cannot evict a
+     * high-reuse one. A hit is register-resident (no DRAM event). */
+    int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
+    uint64_t linear_row =
+        (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+    lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
+                             ? t->resident_cache[global_bank]
+                             : NULL;
+    if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
+                                          (int)loc.col))) {
+      t->dedup_skips++;
+      return; /* resident in this tensor's compiler-sized register partition */
+    }
+  } else if (g_lru_residency && cur_phase == PIM_PHASE_COMPUTE && !is_write &&
+             (!g_attr_gated_residency ||
+              t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
+             ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
+              (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
+    /* LEGACY global-shared-LRU residency (ablation fallback, g_honor_layout=0):
+     * a single per-bank cache of g_resident_per_bank shared across all tensors.
+     * Superseded by the compiler partition above; kept for ablation. */
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
@@ -1548,31 +1606,43 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
     return;
   }
 
-  if (cur_phase == PIM_PHASE_COMPUTE &&
-      (!g_attr_gated_residency || t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
-      ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
-       (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
+  if (cur_phase == PIM_PHASE_COMPUTE && g_honor_layout) {
+    /* COMPILER-PARTITIONED residency for pid-invariant operand reuse (e.g.
+     * matmul B reused across M-tiles). Same physical register file as the
+     * per-pid path (pim_trace_access_one), so route through THIS tensor's own
+     * compiler-sized per-bank cache. resident_capacity==0 -> re-stream. */
     int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
     uint64_t linear_row =
         (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    if (g_lru_residency) {
-      /* Faithful path: route pid-invariant operand reuse (e.g. matmul B
-       * reused across M-tiles) through the SAME per-bank register cache as
-       * the per-pid path — one physical PE register file. A skip provably
-       * means register-resident at GRF capacity, not a first-N artifact. */
-      lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
-                               ? g_lru_resident[global_bank]
-                               : NULL;
-      if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
-                                            (int)loc.col))) {
-        t->persistent_skips++;
-        stat_persistent_skips++;
-        return;
-      }
+    lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
+                             ? t->resident_cache[global_bank]
+                             : NULL;
+    if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
+                                          (int)loc.col))) {
+      t->persistent_skips++;
+      stat_persistent_skips++;
+      return;
     }
-    /* (legacy first-N persistent dedup + bcast_scalar->xyz promotion removed
-     * 2026-06-22. Pid-invariant operand reuse now goes through the SAME faithful
-     * per-bank LRU register cache as the per-pid path above.) */
+  } else if (cur_phase == PIM_PHASE_COMPUTE && g_lru_residency &&
+             (!g_attr_gated_residency ||
+              t->layout_kind != PIM_LAYOUT_KIND_UNSET) &&
+             ((t->role == PIM_ROLE_STREAMED && g_resident_streamed) ||
+              (t->role == PIM_ROLE_OPERAND && g_resident_operand))) {
+    /* LEGACY global-shared-LRU path (ablation fallback, g_honor_layout=0): route
+     * pid-invariant operand reuse through the SAME shared per-bank cache as the
+     * per-pid path — one physical PE register file, first-come reuse. */
+    int global_bank = compute_global_bank(loc.ch, loc.pch, loc.bg, loc.bank);
+    uint64_t linear_row =
+        (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+    lru_cache_t *cache = (global_bank >= 0 && global_bank < MAX_BANKS)
+                             ? g_lru_resident[global_bank]
+                             : NULL;
+    if (cache && lru_touch(cache, lru_key((int)(t - tensors), linear_row,
+                                          (int)loc.col))) {
+      t->persistent_skips++;
+      stat_persistent_skips++;
+      return;
+    }
   }
 
   /* Lockstep dedup (mirrors pim_trace_access_one). Bypass for OPERAND
