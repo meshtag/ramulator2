@@ -157,6 +157,14 @@ typedef struct {
   int reduction_col_axis;    /* contraction axis -> column-low bits; -1 = none */
   uint32_t bank_spread_mask; /* bitmask of tensor axes spread across banks */
   int resident_capacity;     /* resident budget in tuples; 0 = unbounded */
+  /* Reduction-to-column layout (compiler-honored, per-tensor). When both are
+   * powers of two > 1, this tensor's contraction axis is transposed onto the
+   * column-low address bits so the K-reduction sweeps columns within one open
+   * DRAM row instead of activating a new row per K step. Set by
+   * pim_set_tensor_redcol() from the compiler's im.residency reduction_to_column
+   * decision + the shape-derived (stride=N, extent=K). 0 = disabled (default). */
+  int redcol_stride;         /* stride between consecutive contraction steps (=N) */
+  int redcol_extent;         /* contraction extent (=K) */
 
   /* Per-tensor, per-bank register-residency cache honoring the COMPILER's
    * resident_capacity partition of the physical register file (used when
@@ -626,15 +634,27 @@ static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
                                     int *ch, int *pch, int *bg, int *bank,
                                     int *sa, int *row, int *col) {
   /* Reduction-col-axis lever: transpose the contraction axis onto the
-   * column-low bits. Gated (default OFF => byte-identical). Applies only to
-   * the OPERAND operand (the stride-N reduction matrix) with pow2 stride and
-   * extent. This is a pure trace-address remap — it never touches computed
-   * data, so correctness is invariant; only ramulator cycles change. */
-  if (g_reduction_col && t->role == PIM_ROLE_OPERAND &&
-      g_redcol_stride > 1 && g_redcol_extent > 1 &&
-      (g_redcol_stride & (g_redcol_stride - 1)) == 0 &&
-      (g_redcol_extent & (g_redcol_extent - 1)) == 0) {
-    int S = g_redcol_stride, Kd = g_redcol_extent;
+   * column-low bits. Applies only to the OPERAND operand (the stride-N
+   * reduction matrix) with pow2 stride and extent. This is a pure trace-address
+   * remap — it never touches computed data, so correctness is invariant; only
+   * ramulator cycles change. Two sources: (a) the compiler-honored PER-TENSOR
+   * decision set by pim_set_tensor_redcol() (redcol_stride/extent), active under
+   * g_honor_layout; (b) the legacy GLOBAL env proof hook (IM_REDUCTION_COL,
+   * default OFF). Per-tensor takes precedence. */
+  int rc_stride = 0, rc_extent = 0;
+  if (t->role == PIM_ROLE_OPERAND) {
+    if (g_honor_layout && t->redcol_stride > 1 && t->redcol_extent > 1) {
+      rc_stride = t->redcol_stride;
+      rc_extent = t->redcol_extent;
+    } else if (g_reduction_col && g_redcol_stride > 1 && g_redcol_extent > 1) {
+      rc_stride = g_redcol_stride;
+      rc_extent = g_redcol_extent;
+    }
+  }
+  if (rc_stride > 1 && rc_extent > 1 &&
+      (rc_stride & (rc_stride - 1)) == 0 &&
+      (rc_extent & (rc_extent - 1)) == 0) {
+    int S = rc_stride, Kd = rc_extent;
     int k = elem_idx / S;
     int n = elem_idx % S;
     elem_idx = n * Kd + k;
@@ -1339,6 +1359,28 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
     if (resident_capacity > 0)
       t->resident_cache[b] = lru_create(resident_capacity);
   }
+}
+
+/* Compiler-honored reduction-to-column layout for one tensor. Sets the stride
+ * (=N, between consecutive contraction steps) and extent (=K, contraction
+ * length) that map_element_interleaved uses to transpose the reduction axis
+ * onto the column-low bits. Both must be powers of two > 1 to take effect (the
+ * remap is guarded); 0 leaves the tensor unremapped. ABI-additive — separate
+ * from pim_set_tensor_layout so older callers are unaffected. */
+void pim_set_tensor_redcol(int tensor_id, int redcol_stride, int redcol_extent) {
+  if (tensor_id < 0 || tensor_id >= num_tensors) {
+    fprintf(stderr,
+            "[pim-runtime] WARN: pim_set_tensor_redcol tensor_id=%d "
+            "out of range [0,%d); ignored.\n",
+            tensor_id, num_tensors);
+    return;
+  }
+  tensors[tensor_id].redcol_stride = redcol_stride;
+  tensors[tensor_id].redcol_extent = redcol_extent;
+  fprintf(stderr,
+          "[pim-runtime] tensor %d: reduction-col stride=%d extent=%d "
+          "(honor=%d)\n",
+          tensor_id, redcol_stride, redcol_extent, g_honor_layout);
 }
 
 void pim_set_phase(pim_phase_t phase) {

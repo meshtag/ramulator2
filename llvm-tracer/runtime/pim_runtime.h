@@ -162,6 +162,12 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
                            int reduction_col_axis, uint32_t bank_spread_mask,
                            int resident_capacity);
 
+/* Compiler-honored reduction-to-column layout for one tensor: transpose its
+ * contraction axis onto the column-low address bits (stride=N, extent=K). Both
+ * must be pow2 > 1 to take effect. ABI-additive; absent (older build) the
+ * tensor stays unremapped. Correctness-invariant (pure trace-address remap). */
+void pim_set_tensor_redcol(int tensor_id, int redcol_stride, int redcol_extent);
+
 #ifdef __cplusplus
 }
 #endif
