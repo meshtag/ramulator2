@@ -211,6 +211,16 @@ static int g_reduction_col = 0;
 static int g_redcol_stride = 0;
 static int g_redcol_extent = 0;
 
+/* Bankgroup-interleave lever (PIM_BG_INTERLEAVE=1, default OFF). Places the
+ * bankgroup bits BELOW the column bits in the interleaved element->physical map
+ * so consecutive elements round-robin the bankgroups. Consecutive column
+ * commands then hit DIFFERENT bankgroups (nCCDS spacing) instead of the same
+ * one (nCCDL) -> up to ~2x column throughput on the streamed reduction operand.
+ * Pure address-bit reorder over power-of-two hardware dims (bijective ->
+ * correctness-invariant; only ramulator cycles change). The row bits are the
+ * same high bits either way, so row-buffer locality is preserved. */
+static int g_bg_interleave = 0;
+
 /* Per-role operand residency gates (ABLATION KNOBS; DEFAULT = hold resident, i.e.
  * let the im.residency classifier's per-tensor decision govern via attr-gating).
  *
@@ -671,14 +681,30 @@ static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
   /* Strip the within-DQ bits (multiple values share one physical column). */
   linear >>= log2_vpc;
 
-  *col = (int)(linear & ((1ULL << log2_cols) - 1));
-  linear >>= log2_cols;
+  if (g_bg_interleave) {
+    /* Bankgroup on the LOW bits: consecutive elements round-robin the
+     * bankgroups so consecutive column commands hit different BGs (nCCDS)
+     * rather than the same BG (nCCDL). The row bits (high) are unchanged, so
+     * row-buffer locality is preserved; only col/bank/bg reassign among the
+     * same low bits (a bijection -> correctness-invariant). */
+    *bg = (int)(linear & ((1ULL << log2_bg) - 1));
+    linear >>= log2_bg;
 
-  *bank = (int)(linear & ((1ULL << log2_banks_bg) - 1));
-  linear >>= log2_banks_bg;
+    *col = (int)(linear & ((1ULL << log2_cols) - 1));
+    linear >>= log2_cols;
 
-  *bg = (int)(linear & ((1ULL << log2_bg) - 1));
-  linear >>= log2_bg;
+    *bank = (int)(linear & ((1ULL << log2_banks_bg) - 1));
+    linear >>= log2_banks_bg;
+  } else {
+    *col = (int)(linear & ((1ULL << log2_cols) - 1));
+    linear >>= log2_cols;
+
+    *bank = (int)(linear & ((1ULL << log2_banks_bg) - 1));
+    linear >>= log2_banks_bg;
+
+    *bg = (int)(linear & ((1ULL << log2_bg) - 1));
+    linear >>= log2_bg;
+  }
 
   *pch = (int)(linear & ((1ULL << log2_pch) - 1));
   linear >>= log2_pch;
@@ -866,6 +892,10 @@ void pim_init(const char *trace_file) {
     g_redcol_stride = atoi(v);
   if ((v = getenv("IM_REDCOL_EXTENT")))
     g_redcol_extent = atoi(v);
+
+  /* Bankgroup-interleave lever (default OFF). */
+  if ((v = getenv("PIM_BG_INTERLEAVE")))
+    g_bg_interleave = atoi(v);
 
   /* Per-role residency gates (default ON). */
   if ((v = getenv("IM_RESIDENT_STREAMED")))
