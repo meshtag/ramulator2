@@ -316,6 +316,20 @@ static int g_matched_mode = 0;
  * Set IM_HONOR_LAYOUT=0 to revert to the legacy shared-LRU residency for ablation. */
 static int g_honor_layout = 1;
 
+/* Per-pid residency reset (DEFAULT ON as of 2026-07-07). Real hardware has NO
+ * cross-program-id operand reuse: GPU registers/shared-memory are strictly
+ * intra-thread-block (grid-wide register reuse does not exist; cross-block reuse
+ * is only opportunistic L2, which neither Aquabolt-XL nor SIMDRAM has), and the
+ * PIM register file is reloaded per SIMD dispatch. Cross-tile operand reuse would
+ * require a persistent kernel (one pid iterating many tiles = intra-pid reuse),
+ * not automatic cross-pid residency. OptiPIM does not model cross-pid reuse
+ * either, so persisting our register residency across program-ids is an
+ * unphysical asymmetry in our favor. Therefore reset every tensor's register
+ * residency at each program-id boundary, making residency INTRA-pid only.
+ * Set IM_CROSS_PID_RESIDENCY=1 to restore the legacy persistent-across-pid cache
+ * (ablation / cross-pid-contribution delta measurement only). */
+static int g_perpid_residency_reset = 1;
+
 /* (g_acc_resident_enabled + stat_acc_resident_skips removed 2026-06-26: the
  * accumulator-read reuse dedup was proven byte-identical inert — the psum is
  * loop-carried SSA in codegen and never round-trips to DRAM, so there are no
@@ -587,6 +601,22 @@ static void advance_program_epoch_if_needed(void) {
   }
   if (g_lockstep_collapse) {
     addr_dedup_reset(g_lockstep_collapse);
+  }
+  /* Register residency is intra-pid only (see g_perpid_residency_reset): reset
+   * every tensor's per-bank register partition (and the legacy shared LRU) at
+   * each program-id boundary so no operand carries resident into the next tile.
+   * Mirrors the phase-boundary reset in pim_set_phase(). */
+  if (g_perpid_residency_reset) {
+    int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    if (n_banks > MAX_BANKS)
+      n_banks = MAX_BANKS;
+    if (g_lru_residency) {
+      for (int b = 0; b < n_banks; b++)
+        lru_reset(g_lru_resident[b]);
+    }
+    for (int ti = 0; ti < num_tensors; ti++)
+      for (int b = 0; b < n_banks; b++)
+        lru_reset(tensors[ti].resident_cache[b]);
   }
   (void)x_changed; (void)y_changed; (void)z_changed;
 }
@@ -974,6 +1004,16 @@ void pim_init(const char *trace_file) {
           "[pim-runtime] honor_layout=%d (compiler residency; set "
           "IM_HONOR_LAYOUT=0 for legacy shared-LRU ablation)\n",
           g_honor_layout);
+
+  /* Per-pid residency reset knob. DEFAULT ON: no cross-program-id operand reuse
+   * (matches real HW + OptiPIM symmetry, see g_perpid_residency_reset).
+   * IM_CROSS_PID_RESIDENCY=1 restores the legacy persistent-across-pid cache. */
+  const char *xpid_env = getenv("IM_CROSS_PID_RESIDENCY");
+  g_perpid_residency_reset = (xpid_env && xpid_env[0] == '1') ? 0 : 1;
+  fprintf(stderr,
+          "[pim-runtime] perpid_residency_reset=%d (intra-pid residency only; "
+          "set IM_CROSS_PID_RESIDENCY=1 for legacy cross-pid cache)\n",
+          g_perpid_residency_reset);
 
   /* (PIM_PER_BG_BCAST + PIM_DUPLICATE_BCAST / row-duplicate modeling removed
    * 2026-06-22 with the broadcast blank-dedup machinery.) */
