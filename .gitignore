@@ -5,3 +5,4 @@ ramulator2
 *.so
 autobuild.sh
 .cache/
+*.dylib
