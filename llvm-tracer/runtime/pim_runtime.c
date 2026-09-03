@@ -148,21 +148,19 @@ typedef struct {
   /* (bcast_scalar / duplicated / dup_row_base fields removed 2026-06-22 with
    * the broadcast-scalar / row-duplicate blank-dedup machinery.) */
 
-  /* Reuse-as-layout descriptor, set by pim_set_tensor_layout() from the
-   * compiler's im-operand-residency-layout decisions. layout_kind=UNSET
-   * (=0, the zero-initialized default for the static tensors[] array)
-   * preserves every existing mapping and accounting path unchanged. The
-   * other fields are recorded now and consumed by a later increment. */
-  int layout_kind;           /* pim_layout_kind_t */
-  int reduction_col_axis;    /* contraction axis -> column-low bits; -1 = none */
-  uint32_t bank_spread_mask; /* bitmask of tensor axes spread across banks */
-  int resident_capacity;     /* resident budget in tuples; 0 = unbounded */
+  /* Reuse-as-layout descriptor from the compiler's
+   * im-operand-residency-layout decisions. UNSET is the zero-initialized
+   * default and means no residency. */
+  int layout_kind;        /* pim_layout_kind_t. Only UNSET vs not is read. */
+  int reduction_col_axis; /* contraction axis. Recorded, not yet read. */
+  int resident_capacity;  /* per-bank register budget. 0 = no cache. */
   /* Reduction-to-column layout (compiler-honored, per-tensor). When both are
    * powers of two > 1, this tensor's contraction axis is transposed onto the
    * column-low address bits so the K-reduction sweeps columns within one open
    * DRAM row instead of activating a new row per K step. Set by
-   * pim_set_tensor_redcol() from the compiler's im.residency reduction_to_column
-   * decision + the shape-derived (stride=N, extent=K). 0 = disabled (default). */
+   * pim_set_tensor_redcol() from the compiler's im.residency
+   * reduction_to_column decision + the shape-derived (stride=N, extent=K). 0 =
+   * disabled (default). */
   int redcol_stride;         /* stride between consecutive contraction steps (=N) */
   int redcol_extent;         /* contraction extent (=K) */
 
@@ -1152,6 +1150,66 @@ void pim_init(const char *trace_file) {
                                                       : "striped");
 }
 
+/* ================================================================
+ *  Compiler-emitted residency descriptor
+ * ================================================================
+ * emitPimLayoutTable (TritonIMToLLVM.cpp) puts these globals in the KERNEL
+ * object. Kernel and runtime link into one dylib, so we just read them.
+ *
+ * Record: [operand_arg, layout_kind, reduction_col_axis, resident_capacity].
+ * operand_arg == tensor id, because pointer args are registered first and in
+ * signature order.
+ *
+ * resident_capacity is always 0 from the compiler. The pass cannot see a
+ * runtime-valued reduction extent, so the host sends it via
+ * pim_set_tensor_capacity(). */
+#define PIM_LAYOUT_REC_WORDS 4
+
+/* Weak DEFINITIONS, not weak references. A weak reference does not link on
+ * Mach-O when nothing defines the symbol, which is the normal case whenever
+ * im-operand-residency-layout is skipped. So count == 0, not a null pointer,
+ * is the "no compiler decision" signal.
+ * The split decl/def keeps external linkage under C++ and dodges
+ * -Wextern-initializer. */
+__attribute__((
+    weak)) extern const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS];
+__attribute__((weak)) extern const int32_t __pim_layout_count;
+
+const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
+const int32_t __pim_layout_count = 0;
+
+static int stat_layout_from_compiler = 0;
+
+/* Honor the compiler's descriptor for one tensor. No-op if the kernel has none.
+ */
+static void apply_compiler_layout(int tensor_id) {
+  int n = (int)__pim_layout_count;
+  if (n <= 0)
+    return; /* weak fallback in force: no table in this kernel */
+  const int32_t *table = __pim_layout_table;
+  for (int i = 0; i < n; i++) {
+    const int32_t *rec = table + (size_t)i * PIM_LAYOUT_REC_WORDS;
+    if (rec[0] != tensor_id)
+      continue;
+    if (stat_layout_from_compiler == 0)
+      fprintf(
+          stderr,
+          "[pim-runtime] compiler-emitted layout table found in the kernel "
+          "artifact (%d entries); host ctypes descriptor push is not used\n",
+          n);
+    pim_set_tensor_layout(tensor_id, rec[1], rec[2], rec[3]);
+    stat_layout_from_compiler++;
+    return;
+  }
+}
+
+/* Shared tail for every pim_register_tensor return path. */
+static int pim_finish_register(void) {
+  int tid = num_tensors++;
+  apply_compiler_layout(tid);
+  return tid;
+}
+
 int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
                         pim_role_t role) {
   if (num_tensors >= MAX_TENSORS) {
@@ -1268,7 +1326,7 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
             (unsigned long long)t->layout_linear_base,
             (unsigned long long)((total + elems_per_global_row - 1) /
                                  elems_per_global_row));
-    return num_tensors++;
+    return pim_finish_register();
   }
 
   if (rows_needed < total_flat_banks) {
@@ -1299,7 +1357,7 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
             num_tensors, role_str, total, t->total_bytes, t->assigned_ch,
             t->assigned_pch, t->assigned_bg, t->assigned_bank, first_sa,
             last_sa, t->base_row, t->base_row + rows_needed - 1);
-    return num_tensors++;
+    return pim_finish_register();
   }
 
   t->striped = 1;
@@ -1342,7 +1400,7 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
           num_tensors, role_str, total, t->total_bytes, banks_used, rows_needed,
           max_rows_per_bank);
 
-  return num_tensors++;
+  return pim_finish_register();
 }
 
 /* (duplicate_bcast_tensor_per_bg removed 2026-06-22 with the row-duplicate
@@ -1364,11 +1422,9 @@ void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
  * log. ABI-only at this stage — the fields are recorded but not yet read by
  * map_element or the dedup accounting, so calling this leaves every emitted
  * trace byte-identical. A later increment teaches the mapping/accounting to
- * honor layout_kind / reduction_col_axis / bank_spread_mask /
- * resident_capacity. */
+ * honor layout_kind / reduction_col_axis / resident_capacity. */
 void pim_set_tensor_layout(int tensor_id, int layout_kind,
-                           int reduction_col_axis, uint32_t bank_spread_mask,
-                           int resident_capacity) {
+                           int reduction_col_axis, int resident_capacity) {
   if (tensor_id < 0 || tensor_id >= num_tensors) {
     fprintf(stderr,
             "[pim-runtime] WARN: pim_set_tensor_layout tensor_id=%d "
@@ -1379,7 +1435,6 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
   tensor_info_t *t = &tensors[tensor_id];
   t->layout_kind = layout_kind;
   t->reduction_col_axis = reduction_col_axis;
-  t->bank_spread_mask = bank_spread_mask;
   t->resident_capacity = resident_capacity;
 
   static const char *kind_names[] = {"UNSET", "RESIDENT", "BANK_SPREAD",
@@ -1390,9 +1445,9 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
           : "?";
   fprintf(stderr,
           "[pim-runtime] tensor %d: layout_kind=%s reduction_col_axis=%d "
-          "bank_spread_mask=0x%x resident_capacity=%d (honor=%d)\n",
-          tensor_id, kname, reduction_col_axis, bank_spread_mask,
-          resident_capacity, g_honor_layout);
+          "resident_capacity=%d (honor=%d)\n",
+          tensor_id, kname, reduction_col_axis, resident_capacity,
+          g_honor_layout);
 
   if (!g_honor_layout)
     return; /* ABI-only: record the descriptor, change no emitted trace */
@@ -1423,6 +1478,58 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
     n_banks = MAX_BANKS;
   for (int b = 0; b < n_banks; b++) {
     if (t->resident_cache[b]) { /* re-registration: rebuild at new capacity */
+      lru_destroy(t->resident_cache[b]);
+      t->resident_cache[b] = NULL;
+    }
+    if (resident_capacity > 0)
+      t->resident_cache[b] = lru_create(resident_capacity);
+  }
+}
+
+/* Set only the per-bank register budget, leaving the compiler's structural
+ * layout alone. Split from pim_set_tensor_layout so the host can size a
+ * residency but not invent one. Budget comes from partition_register_file
+ * (run_optipim_tritonim_comparison.py). */
+void pim_set_tensor_capacity(int tensor_id, int resident_capacity) {
+  if (tensor_id < 0 || tensor_id >= num_tensors) {
+    fprintf(stderr,
+            "[pim-runtime] WARN: pim_set_tensor_capacity tensor_id=%d out of "
+            "range [0,%d); ignored.\n",
+            tensor_id, num_tensors);
+    return;
+  }
+  tensor_info_t *t = &tensors[tensor_id];
+
+  /* No compiler layout means no residency, whatever the host says. Without this
+   * the host budget silently re-enables reuse when the pass is skipped, which
+   * makes that ablation measure nothing. */
+  if (t->layout_kind == PIM_LAYOUT_KIND_UNSET) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr,
+              "[pim-runtime] host offered resident_capacity=%d for tensor %d "
+              "but the compiler marked no layout for it (layout_kind=UNSET); "
+              "ignoring -- no compiler decision means no residency\n",
+              resident_capacity, tensor_id);
+    }
+    return;
+  }
+
+  if (t->resident_capacity == resident_capacity)
+    return; /* nothing to rebuild */
+  t->resident_capacity = resident_capacity;
+  fprintf(stderr,
+          "[pim-runtime] tensor %d: resident_capacity=%d (host-supplied "
+          "register budget; layout_kind=%d from the kernel artifact)\n",
+          tensor_id, resident_capacity, t->layout_kind);
+  if (!g_honor_layout)
+    return;
+  int n_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  if (n_banks > MAX_BANKS)
+    n_banks = MAX_BANKS;
+  for (int b = 0; b < n_banks; b++) {
+    if (t->resident_cache[b]) {
       lru_destroy(t->resident_cache[b]);
       t->resident_cache[b] = NULL;
     }

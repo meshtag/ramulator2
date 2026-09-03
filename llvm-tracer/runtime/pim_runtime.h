@@ -146,21 +146,21 @@ void pim_set_tensor_broadcast_scalar(int tensor_id, int on);
  *  post-hoc from trace dedup, and the basis for an apples-to-apples
  *  layout comparison against OptiPIM.
  *
- *    layout_kind        - pim_layout_kind_t (UNSET => no change)
- *    reduction_col_axis - tensor axis to place on the column-low bits
- *                         (the contraction dim), or -1 if none
- *    bank_spread_mask   - bitmask of tensor axes spread across the banks
- *    resident_capacity  - resident working-set budget in tuples; 0 means
- *                         unbounded (current behavior). A later increment
- *                         charges reuse beyond this budget as a re-fetch.
+ *    layout_kind        - pim_layout_kind_t. Only UNSET vs non-UNSET is read.
+ *    reduction_col_axis - contraction axis for the column-low bits, or -1.
+ *                         Recorded but not yet read.
+ *    resident_capacity  - per-bank register budget in tuples. 0 means no cache,
+ *                         so every access re-streams.
  *
- *  ABI-only at this stage: recording these fields changes no emitted
- *  trace until a later increment teaches map_element and the dedup
- *  accounting to honor them. Absent this call (e.g. an older runtime
- *  build) every tensor stays UNSET, so existing traces are unaffected. */
+ *  Normally called by apply_compiler_layout() from the table the kernel object
+ *  carries. A tensor never given a layout stays UNSET and gets no residency. */
 void pim_set_tensor_layout(int tensor_id, int layout_kind,
-                           int reduction_col_axis, uint32_t bank_spread_mask,
-                           int resident_capacity);
+                           int reduction_col_axis, int resident_capacity);
+
+/* Per-bank register budget only. The kernel artifact owns the structural layout
+ * (see __pim_layout_table in pim_runtime.c). Ignored for a tensor the compiler
+ * left UNSET. ABI-additive. */
+void pim_set_tensor_capacity(int tensor_id, int resident_capacity);
 
 /* Compiler-honored reduction-to-column layout for one tensor: transpose its
  * contraction axis onto the column-low address bits (stride=N, extent=K). Both
