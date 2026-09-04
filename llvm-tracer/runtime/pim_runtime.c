@@ -154,6 +154,7 @@ typedef struct {
   int layout_kind;        /* pim_layout_kind_t. Only UNSET vs not is read. */
   int reduction_col_axis; /* contraction axis. Recorded, not yet read. */
   int resident_capacity;  /* per-bank register budget. 0 = no cache. */
+  int capacity_from_compiler; /* budget came from the artifact footprint */
   /* Reduction-to-column layout (compiler-honored, per-tensor). When both are
    * powers of two > 1, this tensor's contraction axis is transposed onto the
    * column-low address bits so the K-reduction sweeps columns within one open
@@ -1160,10 +1161,17 @@ void pim_init(const char *trace_file) {
  * operand_arg == tensor id, because pointer args are registered first and in
  * signature order.
  *
- * resident_capacity is always 0 from the compiler. The pass cannot see a
- * runtime-valued reduction extent, so the host sends it via
- * pim_set_tensor_capacity(). */
-#define PIM_LAYOUT_REC_WORDS 4
+ * Words 3.. carry the operand's ADDRESS FOOTPRINT: the axis count, then one
+ * {extent, stride factor, arg, arg, arg} group per axis. The pass leaves the
+ * footprint logical because turning it into a register-slot count needs the
+ * bank/row/column interleaving, which lives here. A stride it could not fold to
+ * a number arrives as a product of kernel argument indices, resolved against
+ * pim_set_kernel_scalars(). Zero axes means the address was not affine in the
+ * tile ranges, and then the host's pim_set_tensor_capacity() still stands. */
+#define PIM_MAX_FP_AXES 3
+#define PIM_MAX_STRIDE_ARGS 3
+#define PIM_FP_AXIS_WORDS (2 + PIM_MAX_STRIDE_ARGS)
+#define PIM_LAYOUT_REC_WORDS (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on
  * Mach-O when nothing defines the symbol, which is the normal case whenever
@@ -1179,6 +1187,144 @@ const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
 
 static int stat_layout_from_compiler = 0;
+
+/* Kernel scalar arguments, indexed the way the compiler numbers tt.func
+ * arguments (pointers first, then scalars, no constexprs). Pointer slots go
+ * unused. This is the host reporting its own launch, not deciding anything. */
+#define PIM_MAX_KERNEL_SCALARS 64
+static int32_t g_kernel_scalars[PIM_MAX_KERNEL_SCALARS];
+static int g_num_kernel_scalars = 0;
+
+void pim_set_kernel_scalars(const int32_t *vals, int n) {
+  if (!vals || n < 0)
+    return;
+  if (n > PIM_MAX_KERNEL_SCALARS)
+    n = PIM_MAX_KERNEL_SCALARS;
+  for (int i = 0; i < n; i++)
+    g_kernel_scalars[i] = vals[i];
+  g_num_kernel_scalars = n;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return (x > y) - (x < y);
+}
+
+/* Register slots one bank must hold for the compiler's declared footprint.
+ * Maps every offset the tile touches through the trace path's own mapper and
+ * counts distinct (row, col) per bank, the residency LRU's key. Returns 0 when
+ * the footprint is absent, unresolvable or too big to enumerate, and the host
+ * budget then stands. IM_COMPILER_CAPACITY=0 forces that, for the A/B. */
+#define PIM_FP_ENUM_MAX (1 << 18)
+#define PIM_FP_SCAN_MAX (8 << 20)
+
+static int64_t gcd_i64(int64_t a, int64_t b) {
+  if (a < 0)
+    a = -a;
+  if (b < 0)
+    b = -b;
+  while (b) {
+    int64_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+static int footprint_slots(const tensor_info_t *t, const int32_t *rec) {
+  static int gate = -1;
+  if (gate < 0) {
+    const char *e = getenv("IM_COMPILER_CAPACITY");
+    gate = (e && e[0] == '0') ? 0 : 1; /* =0 hands the budget back to the host */
+  }
+  if (!gate)
+    return 0;
+  int naxes = rec[3];
+  if (naxes <= 0 || naxes > PIM_MAX_FP_AXES)
+    return 0;
+  int64_t ext[PIM_MAX_FP_AXES], str[PIM_MAX_FP_AXES], total = 1;
+  for (int a = 0; a < naxes; a++) {
+    const int32_t *ax = rec + 4 + a * PIM_FP_AXIS_WORDS;
+    int64_t stride = ax[1];
+    for (int j = 0; j < PIM_MAX_STRIDE_ARGS; j++) {
+      int idx = ax[2 + j];
+      if (idx < 0)
+        continue;
+      if (idx >= g_num_kernel_scalars)
+        return 0; /* host did not push the launch arguments */
+      stride *= g_kernel_scalars[idx];
+    }
+    ext[a] = ax[0];
+    str[a] = stride;
+    if (ext[a] <= 0)
+      return 0;
+    total *= ext[a];
+    if (total > PIM_FP_ENUM_MAX)
+      return 0;
+  }
+
+  /* The base moves with the program id, so the pass cannot emit it, and it
+   * decides how the tile splits across banks and columns. Scan every base the
+   * grid reaches and take the worst: one slot short turns a sweep of N+1
+   * columns into an all-miss stream. A tiled axis steps the base by its own
+   * span, so the reachable bases are the multiples of their gcd, and the
+   * (bank, col) pattern repeats every values_per_col * columns * banks. */
+  int vpc = t->values_per_col > 0 ? t->values_per_col : 1;
+  int64_t period = (int64_t)vpc * cfg_num_cols * cfg_num_channels *
+                   cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int64_t step = period;
+  for (int a = 0; a < naxes; a++)
+    step = gcd_i64(step, ext[a] * str[a]);
+  if (step < 1)
+    step = period;
+  int64_t nbases = period / step;
+  if (nbases * total > PIM_FP_SCAN_MAX)
+    return 0; /* cannot bound it honestly, so leave the budget to the host */
+
+  uint64_t *keys = (uint64_t *)malloc((size_t)total * sizeof(uint64_t));
+  if (!keys)
+    return 0;
+  int worst = 0;
+  for (int64_t b = 0; b < nbases; b++) {
+    int64_t phase = b * step;
+    int64_t idx[PIM_MAX_FP_AXES] = {0};
+    for (int64_t n = 0; n < total; n++) {
+      int64_t elem = phase;
+      for (int a = 0; a < naxes; a++)
+        elem += idx[a] * str[a];
+      int ch, pch, bg, bank, sa, row, col;
+      map_element_interleaved(t, (int)elem, &ch, &pch, &bg, &bank, &sa, &row,
+                              &col);
+      int gb = compute_global_bank(ch, pch, bg, bank);
+      keys[n] = ((uint64_t)(gb & 0xFF) << 56) |
+                ((uint64_t)(uint32_t)row << 16) | (uint64_t)(uint16_t)col;
+      for (int a = naxes - 1; a >= 0; a--) {
+        if (++idx[a] < ext[a])
+          break;
+        idx[a] = 0;
+      }
+    }
+    qsort(keys, (size_t)total, sizeof(uint64_t), cmp_u64);
+
+    int best = 0, run = 0, uniq = 0;
+    uint64_t prev = 0;
+    for (int64_t n = 0; n < total; n++) {
+      if (n && keys[n] == prev)
+        continue;
+      uniq++;
+      run = (n && (keys[n] >> 56) == (prev >> 56)) ? run + 1 : 1;
+      if (run > best)
+        best = run;
+      prev = keys[n];
+    }
+    /* Every bank reads a row-duplicated operand, so each holds all of it. */
+    int need = t->layout_kind == PIM_LAYOUT_KIND_ROW_DUP ? uniq : best;
+    if (need > worst)
+      worst = need;
+  }
+  free(keys);
+  return worst;
+}
+
 
 /* Honor the compiler's descriptor for one tensor. No-op if the kernel has none.
  */
@@ -1197,8 +1343,23 @@ static void apply_compiler_layout(int tensor_id) {
           "[pim-runtime] compiler-emitted layout table found in the kernel "
           "artifact (%d entries); host ctypes descriptor push is not used\n",
           n);
-    pim_set_tensor_layout(tensor_id, rec[1], rec[2], rec[3]);
+    pim_set_tensor_layout(tensor_id, rec[1], rec[2], 0);
     stat_layout_from_compiler++;
+    /* Clamped to the PE register file so a tile sized past the hardware
+     * re-streams its overflow. g_resident_per_bank counts int32 while a slot is
+     * a values_per_col-wide column, so the bound is loose by that factor.
+     * Tightening it changes results, so it stays where the host had it. */
+    tensor_info_t *t = &tensors[tensor_id];
+    int slots = footprint_slots(t, rec);
+    if (slots > 0) {
+      int cap = slots < g_resident_per_bank ? slots : g_resident_per_bank;
+      pim_set_tensor_capacity(tensor_id, cap);
+      t->capacity_from_compiler = 1;
+      fprintf(stderr,
+              "[pim-runtime] tensor %d: footprint -> %d slots/bank, "
+              "resident_capacity=%d (compiler)\n",
+              tensor_id, slots, cap);
+    }
     return;
   }
 }
@@ -1436,6 +1597,9 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
   t->layout_kind = layout_kind;
   t->reduction_col_axis = reduction_col_axis;
   t->resident_capacity = resident_capacity;
+  /* Re-registration tears the caches down below, so a budget claimed by an
+   * earlier run of this same tensor must not keep the rebuild locked out. */
+  t->capacity_from_compiler = 0;
 
   static const char *kind_names[] = {"UNSET", "RESIDENT", "BANK_SPREAD",
                                      "ROW_DUP", "LEADER"};
@@ -1499,6 +1663,8 @@ void pim_set_tensor_capacity(int tensor_id, int resident_capacity) {
     return;
   }
   tensor_info_t *t = &tensors[tensor_id];
+  if (t->capacity_from_compiler)
+    return; /* the artifact already sized this one */
 
   /* No compiler layout means no residency, whatever the host says. Without this
    * the host budget silently re-enables reuse when the pass is skipped, which

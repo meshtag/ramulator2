@@ -162,6 +162,11 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
  * left UNSET. ABI-additive. */
 void pim_set_tensor_capacity(int tensor_id, int resident_capacity);
 
+/* Kernel scalar arguments in tt.func argument order (pointer slots unused).
+ * Lets the runtime resolve a footprint stride the compiler left symbolic,
+ * such as conv's CI*R*S weight pitch. Push before registering tensors. */
+void pim_set_kernel_scalars(const int32_t *vals, int n);
+
 /* Compiler-honored reduction-to-column layout for one tensor: transpose its
  * contraction axis onto the column-low address bits (stride=N, extent=K). Both
  * must be pow2 > 1 to take effect. ABI-additive; absent (older build) the
