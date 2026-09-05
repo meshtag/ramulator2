@@ -183,6 +183,26 @@ typedef struct {
 static tensor_info_t tensors[MAX_TENSORS];
 static int num_tensors = 0;
 
+/* Namespace bits for the lockstep-collapse key.
+ *
+ * CRITICAL: im_addr_dedup's pack_keys() keeps only the LOW 16 BITS of k1 (k2 gets
+ * 32, k3 gets 16). Anything above bit 15 here is silently dropped, so this must
+ * stay inside 16 bits. tid < MAX_TENSORS(16) = 4b, ch < 32 = 5b, pch < 4 = 2b,
+ * write = 1b, total 12b.
+ *
+ * ch/pch are in the key because an all-bank PIM command reaches the banks of ONE
+ * pseudochannel; replicas in another pch or channel ride a separate command bus.
+ * Bank/bankgroup stay OUT: collapsing those IS the all-bank SIMD model.
+ * The write bit separates stores from loads, without which an ACCUMULATOR load
+ * (the read half of a read-modify-write drain) marks the key the store then
+ * consults, making partial-sum write-back free. Both found 2026-09-05. */
+static inline uint64_t lockstep_ns(const tensor_info_t *t, int ch, int pch,
+                                   int is_write) {
+  return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
+         (((uint64_t)pch & 0x3ULL) << 9) |
+         ((uint64_t)(is_write ? 1 : 0) << 11);
+}
+
 /* ================================================================
  *  Runtime state
  * ================================================================ */
@@ -351,6 +371,26 @@ static uint64_t stat_persistent_skips = 0;
  * structure's name, not N separate reuse dedups.
  * ============================================================================ */
 static addr_dedup_state_t *g_lockstep_collapse = NULL;
+
+/* Operand-delivery amortization is bounded by the PHYSICAL register file. A PE can
+ * hold only so many distinct operand values, so "already delivered this pid" is
+ * free only up to that many distinct elements per (tensor, receiving bank); past
+ * it a repeat must be re-delivered. 136 int32 = the HBM-PIM GRF+SRF budget
+ * (16x256b GRF + 8x32b SRF, Lee et al. ISCA'21 Table IV). Without this bound the
+ * amortization grants an unbounded per-bank register file, which is unphysical for
+ * any operand tile larger than the GRF (conv weights especially). Override with
+ * PIM_OPERAND_GRF_ENTRIES for the ablation. */
+static int g_operand_grf_entries = 136;
+/* Operand delivery is amortized over the whole COMPUTE PHASE, not per program-id,
+ * mirroring OptiPIM's first_time_in_use: codegen_bank_new gates its entire input
+ * write block on that flag (fimdram.cpp:58-61) and the temporal loop sets
+ * first_time_in_col once per column, so their bank fanout is charged ONCE and
+ * reused across every later temporal step. Charging it per-pid instead re-delivered
+ * each operand per tile and cost us exactly the 32x bank multiplier against their
+ * 8192. The GRF bound below is what keeps this physical: a PE can only hold
+ * g_operand_grf_entries distinct values, so anything past that re-delivers. */
+static addr_dedup_state_t *g_operand_deliv = NULL;
+static uint16_t g_operand_deliv_count[MAX_TENSORS][MAX_BANKS];
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
 
@@ -468,6 +508,10 @@ static void advance_program_epoch_if_needed(void) {
   if (g_lockstep_collapse) {
     addr_dedup_reset(g_lockstep_collapse);
   }
+  if (g_operand_deliv) {
+    addr_dedup_reset(g_operand_deliv);
+  }
+  memset(g_operand_deliv_count, 0, sizeof(g_operand_deliv_count));
   (void)x_changed; (void)y_changed; (void)z_changed;
 }
 
@@ -475,6 +519,18 @@ static int compute_global_bank(int ch, int pch, int bg, int bank) {
   int banks_per_pch = cfg_num_bg * cfg_num_banks;
   int banks_per_ch = cfg_num_pch * banks_per_pch;
   return ch * banks_per_ch + pch * banks_per_pch + bg * cfg_num_banks + bank;
+}
+
+/* Inverse of compute_global_bank: flat replay bank id -> (ch,pch,bg,bank). */
+static void decompose_global_bank(int g, int *ch, int *pch, int *bg, int *bank) {
+  int nb = cfg_num_banks > 0 ? cfg_num_banks : 1;
+  int nbg = cfg_num_bg > 0 ? cfg_num_bg : 1;
+  int npch = cfg_num_pch > 0 ? cfg_num_pch : 1;
+  if (g < 0) g = 0;
+  *bank = g % nb;  g /= nb;
+  *bg   = g % nbg; g /= nbg;
+  *pch  = g % npch; g /= npch;
+  *ch   = g;
 }
 
 static void decode_flat_bank(int global_bank, int *ch, int *pch, int *bg,
@@ -685,22 +741,25 @@ static void emit_access_by_role_phase(tensor_info_t *t,
         stat_bank_reads++;
         t->emitted_br++;
         break;
-      case PIM_ROLE_OPERAND:
-        if (t->layout_kind == PIM_LAYOUT_KIND_ROW_DUP) {
-          /* Broadcast operand: one WB reaches all banks of the (ch,pch), vs 32
-           * per-bank W. Faithful bus-broadcast cost; retires the residency LRU
-           * that used to dedup the replicated writes. */
-          emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                     loc->row, loc->col);
-          stat_bank_writes++;
-          t->emitted_bw++;
-        } else {
-          emit_trace("W", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                     loc->row, loc->col);
-          stat_writes++;
-          t->emitted_w++;
-        }
+      case PIM_ROLE_OPERAND: {
+        /* An operand load is a bus-mediated write into the RECEIVING PE's register
+         * file, so address it at the replay bank rather than at the source
+         * element's home bank. Otherwise all N fanout writes pile onto one bank and
+         * serialize, which over-charges us relative to OptiPIM, whose codegen writes
+         * to global_bank_id + i (fimdram.cpp:63-76) and parallelizes.
+         *
+         * There is deliberately NO broadcast here. docs/path1-bank-model-scope.md
+         * forbade costing an all-bank op as ONE dispatch: it drops below OptiPIM's
+         * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
+         * (its broadcast shortcut is commented out). The BCAST_W path added
+         * 2026-09-04 was that forbidden option and is reverted here (2026-09-05). */
+        int dch, dpch, dbg, dbank;
+        decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+        emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
+        stat_writes++;
+        t->emitted_w++;
         break;
+      }
       case PIM_ROLE_ACCUMULATOR:
         emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
@@ -868,6 +927,11 @@ void pim_init(const char *trace_file) {
 
   /* Lockstep collapse knob (default ON). See g_lockstep_collapse declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
+  if ((v = getenv("PIM_OPERAND_GRF_ENTRIES")))
+    g_operand_grf_entries = atoi(v);
+  if (g_operand_grf_entries < 1) g_operand_grf_entries = 1;
+  memset(g_operand_deliv_count, 0, sizeof(g_operand_deliv_count));
+
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
   stat_lockstep_skips = 0;
@@ -945,6 +1009,7 @@ void pim_init(const char *trace_file) {
     // lockstep too — conflating an artifact correction with the blank dedups.)
     // See docs/ablation-levers-plan.md.
     g_lockstep_collapse = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
+    g_operand_deliv = addr_dedup_create(persistent_cap);
 
     /* Only the accumulator per-pid store-dedup state remains (the blank per-pid
      * physical g_dedup + the 4 axis-wise persistent states were removed
@@ -1475,13 +1540,19 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * collapse the 32 replicas and emit a single WB (below). Only a BANK_SPREAD
    * operand (distinct value per PE) bypasses collapse and pays per-bank W. This
    * replaces the residency LRU that used to dedup the broadcast. */
-  int is_broadcast_operand = (t->role == PIM_ROLE_OPERAND &&
-                              t->layout_kind == PIM_LAYOUT_KIND_ROW_DUP);
-  int is_operand_load =
-      (!is_write && t->role == PIM_ROLE_OPERAND && !is_broadcast_operand);
+  /* EVERY operand load bypasses the collapse and pays its per-bank write: that is
+   * the per-PE register-load bus cost OptiPIM also charges. (The ROW_DUP broadcast
+   * exception added 2026-09-04 is reverted; see emit_access_by_role_phase.) */
+  int is_broadcast_operand = 0;
+  int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
-    uint64_t tensor_key = (uint64_t)(t - tensors);
+    /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
+     * banks of a single (ch,pch); replicas in a different pch or channel ride a
+     * separate command bus and need their own event. Omitting them collapsed
+     * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
+     * OUT of the key: collapsing those IS the all-bank SIMD model. */
+    uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write);
     uint64_t key_row, key_col;
     if (is_broadcast_operand) {
       /* A broadcast replicates the SAME logical element across all banks, so its
@@ -1499,6 +1570,39 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
       stat_lockstep_skips++;
       t->dedup_skips++;
       return;
+    }
+  }
+
+
+  /* Operand delivery amortization, symmetric with OptiPIM's first_time_in_use
+   * (fimdram.cpp:44-50): the FIRST write of element e into receiving bank b within
+   * a program-id costs a W; a repeat inside the same pid is already in that PE's
+   * register and is free. Keyed per RECEIVING bank, so this is a fanout, never a
+   * broadcast, and it resets per pid so there is no cross-pid reuse. Without it we
+   * charged every repeat access and over-paid conv operands 18-24x against
+   * OptiPIM's own write count (2026-09-05). */
+  if (is_operand_load && g_operand_deliv &&
+      cur_phase == PIM_PHASE_COMPUTE && t->elem_size > 0) {
+    int _gb = __pim_get_bank_id();
+    int _dch, _dpch, _dbg, _dbank;
+    decompose_global_bank(_gb, &_dch, &_dpch, &_dbg, &_dbank);
+    uint64_t _ns = lockstep_ns(t, _dch, _dpch, /*is_write=*/1) | (1ULL << 12);
+    uint64_t _elem = (addr - (uint64_t)t->base_addr) / (uint64_t)t->elem_size;
+    int _ti = (int)(t - tensors);
+    int _held = (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS)
+                    ? g_operand_deliv_count[_ti][_gb]
+                    : g_operand_grf_entries;
+    if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
+                                   (uint64_t)_gb)) {
+      /* Seen this pid. Free only if it still fits the register file. */
+      if (_held <= g_operand_grf_entries) {
+        stat_lockstep_skips++;
+        t->dedup_skips++;
+        return;
+      }
+    } else if (_held < g_operand_grf_entries && _gb >= 0 && _gb < MAX_BANKS &&
+               _ti >= 0 && _ti < MAX_TENSORS) {
+      g_operand_deliv_count[_ti][_gb]++;
     }
   }
 
@@ -1538,13 +1642,16 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
    * replicas to one WB, keyed on the logical element (bank-independent). Only a
    * BANK_SPREAD operand (distinct value per PE) bypasses collapse and pays per-bank
    * W. Mirrors the per-pid path in pim_trace_access_one. */
-  int is_broadcast_operand_p = (t->role == PIM_ROLE_OPERAND &&
-                                t->layout_kind == PIM_LAYOUT_KIND_ROW_DUP);
-  int is_operand_load_p =
-      (t->role == PIM_ROLE_OPERAND && !is_broadcast_operand_p);
+  int is_broadcast_operand_p = 0;
+  int is_operand_load_p = (t->role == PIM_ROLE_OPERAND);
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load_p) {
-    uint64_t tensor_key = (uint64_t)(t - tensors);
+    /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
+     * banks of a single (ch,pch); replicas in a different pch or channel ride a
+     * separate command bus and need their own event. Omitting them collapsed
+     * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
+     * OUT of the key: collapsing those IS the all-bank SIMD model. */
+    uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, /*is_write=*/0);
     uint64_t key_row, key_col;
     if (is_broadcast_operand_p) {
       key_row = (uint64_t)((addr - (uint64_t)t->base_addr) / t->elem_size);
@@ -1558,6 +1665,39 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
       stat_lockstep_skips++;
       t->dedup_skips++;
       return;
+    }
+  }
+
+
+  /* Operand delivery amortization, symmetric with OptiPIM's first_time_in_use
+   * (fimdram.cpp:44-50): the FIRST write of element e into receiving bank b within
+   * a program-id costs a W; a repeat inside the same pid is already in that PE's
+   * register and is free. Keyed per RECEIVING bank, so this is a fanout, never a
+   * broadcast, and it resets per pid so there is no cross-pid reuse. Without it we
+   * charged every repeat access and over-paid conv operands 18-24x against
+   * OptiPIM's own write count (2026-09-05). */
+  if (is_operand_load_p && g_operand_deliv &&
+      cur_phase == PIM_PHASE_COMPUTE && t->elem_size > 0) {
+    int _gb = __pim_get_bank_id();
+    int _dch, _dpch, _dbg, _dbank;
+    decompose_global_bank(_gb, &_dch, &_dpch, &_dbg, &_dbank);
+    uint64_t _ns = lockstep_ns(t, _dch, _dpch, /*is_write=*/1) | (1ULL << 12);
+    uint64_t _elem = (addr - (uint64_t)t->base_addr) / (uint64_t)t->elem_size;
+    int _ti = (int)(t - tensors);
+    int _held = (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS)
+                    ? g_operand_deliv_count[_ti][_gb]
+                    : g_operand_grf_entries;
+    if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
+                                   (uint64_t)_gb)) {
+      /* Seen this pid. Free only if it still fits the register file. */
+      if (_held <= g_operand_grf_entries) {
+        stat_lockstep_skips++;
+        t->dedup_skips++;
+        return;
+      }
+    } else if (_held < g_operand_grf_entries && _gb >= 0 && _gb < MAX_BANKS &&
+               _ti >= 0 && _ti < MAX_TENSORS) {
+      g_operand_deliv_count[_ti][_gb]++;
     }
   }
 
@@ -1665,11 +1805,15 @@ static void pim_trace_store_tile_coalesced(tensor_info_t *t, uint64_t base_addr,
       }
     }
 
-    /* Layer 3: lockstep collapse. Per (tensor_id, sa, row, col) within a
-     * pid, only the first bank's BW emits — the remaining 31 banks are
-     * lockstep replicas of the same SIMD store. */
+    /* Layer 3: lockstep collapse. Per (tensor_id, ch, pch, sa, row, col) within a
+     * pid, only the first bank's BW emits — the remaining banks of that
+     * pseudochannel are lockstep replicas of the same SIMD store.
+     * Bit 63 NAMESPACES writes away from reads: without it an ACCUMULATOR load
+     * (the read half of a read-modify-write drain) marks this key and the store
+     * then finds it taken and skips, making partial-sum write-back free
+     * (K-tiled matmul emitted BW=0). 2026-09-05 audit. */
     if (g_lockstep_enabled && g_lockstep_collapse) {
-      uint64_t tensor_key = (uint64_t)(t - tensors);
+      uint64_t tensor_key = lockstep_ns(t, ch, pch, /*is_write=*/1);
       uint64_t linear_row =
           (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
       if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key,
@@ -1771,6 +1915,13 @@ static void pim_trace_persistent_range(uint64_t base_addr, uint64_t size,
   }
   tensor_info_t *t = &tensors[tidx];
   t->persistent_calls++;
+
+  /* Same pid-boundary tracking as pim_trace_access_range. Without it the lockstep
+   * set straddles two program-ids: a broadcast operand is emitted, wiped by the
+   * store-triggered reset, then re-emitted, charging it 2x (2026-09-05 audit). */
+  if (cur_phase == PIM_PHASE_COMPUTE) {
+    advance_program_epoch_if_needed();
+  }
 
   int elem_size = t->elem_size > 0 ? t->elem_size : 1;
   uint64_t n_elements = size / (uint64_t)elem_size;
