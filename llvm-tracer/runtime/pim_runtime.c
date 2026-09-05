@@ -381,14 +381,25 @@ static addr_dedup_state_t *g_lockstep_collapse = NULL;
  * any operand tile larger than the GRF (conv weights especially). Override with
  * PIM_OPERAND_GRF_ENTRIES for the ablation. */
 static int g_operand_grf_entries = 136;
-/* Operand delivery is amortized over the whole COMPUTE PHASE, not per program-id,
- * mirroring OptiPIM's first_time_in_use: codegen_bank_new gates its entire input
- * write block on that flag (fimdram.cpp:58-61) and the temporal loop sets
- * first_time_in_col once per column, so their bank fanout is charged ONCE and
- * reused across every later temporal step. Charging it per-pid instead re-delivered
- * each operand per tile and cost us exactly the 32x bank multiplier against their
- * 8192. The GRF bound below is what keeps this physical: a PE can only hold
- * g_operand_grf_entries distinct values, so anything past that re-delivers. */
+/* Operand delivery dedup, scoped to the whole COMPUTE PHASE (kernel lifetime).
+ *
+ * An operand written into a PE register stays there and is free to re-use on a later
+ * temporal step. OptiPIM models the same thing: `tensor_row_idx` in codegen_new
+ * (fimdram.cpp) is allocated OUTSIDE the temporal loop and never evicted, so an
+ * element already seen at a spatial slot skips the entire input-write block on every
+ * later step.
+ *
+ * This REVERSES the per-pid re-baseline, which dropped cross-program-id operand
+ * reuse believing that was OptiPIM-symmetric. It is not -- OptiPIM amortizes across
+ * temporal steps -- so per-pid scope was over-conservative against us (2026-09-05).
+ *
+ * We copy their INTENT, not their mechanism. Theirs is one `first_time_in_col`
+ * boolean per (step, tensor), set on the first new element and never cleared, so a
+ * step is charged all-or-nothing; that is why their charge per operand element is
+ * ~32-64x on matvec but ~1x on matmul/conv. Ours is per (tensor, element, receiving
+ * bank) and bounded by the register file below, hence uniform across operators.
+ * Expect us to look cheaper than them on matvec and dearer on matmul/conv, precisely
+ * because ours is self-consistent and theirs is not. */
 static addr_dedup_state_t *g_operand_deliv = NULL;
 static uint16_t g_operand_deliv_count[MAX_TENSORS][MAX_BANKS];
 static int g_lockstep_enabled = 1;
@@ -508,10 +519,6 @@ static void advance_program_epoch_if_needed(void) {
   if (g_lockstep_collapse) {
     addr_dedup_reset(g_lockstep_collapse);
   }
-  if (g_operand_deliv) {
-    addr_dedup_reset(g_operand_deliv);
-  }
-  memset(g_operand_deliv_count, 0, sizeof(g_operand_deliv_count));
   (void)x_changed; (void)y_changed; (void)z_changed;
 }
 
@@ -1388,6 +1395,10 @@ void pim_set_phase(pim_phase_t phase) {
   if (phase != cur_phase) {
     if (g_store_write_once)
       addr_dedup_reset(g_store_write_once);
+    /* Operand delivery amortizes over the whole COMPUTE phase; reset only here. */
+    if (g_operand_deliv)
+      addr_dedup_reset(g_operand_deliv);
+    memset(g_operand_deliv_count, 0, sizeof(g_operand_deliv_count));
   }
   cur_phase = phase;
 }
