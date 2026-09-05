@@ -146,21 +146,14 @@ void pim_set_tensor_broadcast_scalar(int tensor_id, int on);
  *  post-hoc from trace dedup, and the basis for an apples-to-apples
  *  layout comparison against OptiPIM.
  *
- *    layout_kind        - pim_layout_kind_t. Only UNSET vs non-UNSET is read.
+ *    layout_kind        - pim_layout_kind_t. UNSET vs ROW_DUP (broadcast) read.
  *    reduction_col_axis - contraction axis for the column-low bits, or -1.
- *                         Recorded but not yet read.
- *    resident_capacity  - per-bank register budget in tuples. 0 means no cache,
- *                         so every access re-streams.
+ *                         Recorded for the redcol hook.
  *
  *  Normally called by apply_compiler_layout() from the table the kernel object
- *  carries. A tensor never given a layout stays UNSET and gets no residency. */
+ *  carries. (Operand residency was retired 2026-09-04; there is no capacity.) */
 void pim_set_tensor_layout(int tensor_id, int layout_kind,
-                           int reduction_col_axis, int resident_capacity);
-
-/* Per-bank register budget only. The kernel artifact owns the structural layout
- * (see __pim_layout_table in pim_runtime.c). Ignored for a tensor the compiler
- * left UNSET. ABI-additive. */
-void pim_set_tensor_capacity(int tensor_id, int resident_capacity);
+                           int reduction_col_axis);
 
 /* Kernel scalar arguments in tt.func argument order (pointer slots unused).
  * Lets the runtime resolve a footprint stride the compiler left symbolic,

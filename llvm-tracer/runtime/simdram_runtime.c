@@ -325,6 +325,9 @@ static uint64_t stat_compute_row_skips = 0;
  * baseline (every compute_trace emits its full maj_cost). */
 static int g_k_amort_batch = 0;
 static uint64_t g_compute_trace_count = 0;
+/* Per-opcode batch counters: a MUL and an ADD amortize independently because
+ * their MAJ-3 costs differ by ~14x. */
+static uint64_t g_compute_trace_count_by_op[SIMDRAM_OP_COUNT] = {0};
 static uint64_t stat_k_amort_emissions = 0;
 
 
@@ -842,14 +845,18 @@ void simdram_init(const char *trace_file) {
           "[simdram] row_compute_dedup=%d (set PIM_ROW_COMPUTE_DEDUP=0 to disable)\n",
           g_compute_row_dedup_enabled);
 
-  /* K-axis batch amortization: emit MAJ-3 cost every BATCH
-   * compute_traces. Default BATCH = column-parallel TRA width × bit-
-   * serial depth = n_cols × dq_bits × ... wait, let me redo:
-   * BATCH = cfg_num_cols * cfg_dq_bits / cfg_pe_bits. This represents
-   * the number of arithmetic operations one row activation amortizes
-   * across (cells-per-row × pe-bits). PIM_K_AMORT_BATCH overrides;
-   * set to 1 for the no-amortization baseline. */
-  g_k_amort_batch = (cfg_num_cols * cfg_dq_bits) / cfg_pe_bits;
+  /* K-axis batch amortization: emit one MAJ-3 cost block every BATCH
+   * compute_traces of the same opcode.
+   *
+   * BATCH = cfg_num_cols * cfg_dq_bits = bitlines in one open row = the number
+   * of independent VALUES one triple-row-activate pass covers. NOT divided by
+   * pe_bits: maj_cost already sweeps all n bit-planes (7n^2+1), so dividing here
+   * would charge n twice. Identical to OptiPIM's n_values_per_row =
+   * count[column]*dq (simdram.cpp:88-89), whose row_offset advances pe_bits rows
+   * per 8192 values. (Was /cfg_pe_bits = 512 until 2026-09-05, a 16x
+   * under-amortization that made us charge ~9x OptiPIM for the same conv.)
+   * PIM_K_AMORT_BATCH overrides; 1 = no amortization. */
+  g_k_amort_batch = cfg_num_cols * cfg_dq_bits;
   if (g_k_amort_batch < 1) g_k_amort_batch = 1;
   const char *kamort_env = getenv("PIM_K_AMORT_BATCH");
   if (kamort_env) {
@@ -857,6 +864,7 @@ void simdram_init(const char *trace_file) {
     if (v >= 1) g_k_amort_batch = v;
   }
   g_compute_trace_count = 0;
+  memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   stat_k_amort_emissions = 0;
   fprintf(stderr,
           "[simdram] k_amort_batch=%d (set PIM_K_AMORT_BATCH=N to override; 1 disables)\n",
@@ -1036,6 +1044,7 @@ void simdram_set_phase(simdram_phase_t phase) {
     if (g_dedup)              addr_dedup_reset(g_dedup);
     if (g_compute_row_dedup)  addr_dedup_reset(g_compute_row_dedup);
     g_compute_trace_count = 0;
+    memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   }
   cur_phase = phase;
 }
@@ -1400,19 +1409,24 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
    * still amortize within a batch, K-iters across batches do not
    * collapse. */
   int cost;
+  /* Amortize PER OPCODE: a MUL costs 7n^2+1 but an ADD only 8n+1, so batching
+   * them on one counter and always charging MUL over-charges every accumulate
+   * (half the instrumented sites) by ~14x. */
+  int op_slot = (opcode >= 0 && opcode < SIMDRAM_OP_COUNT) ? opcode
+                                                           : SIMDRAM_OP_OTHER;
   if (g_compute_row_dedup_enabled && g_k_amort_batch > 1) {
-    g_compute_trace_count++;
-    if ((g_compute_trace_count % (uint64_t)g_k_amort_batch) != 1) {
+    g_compute_trace_count_by_op[op_slot]++;
+    if ((g_compute_trace_count_by_op[op_slot] % (uint64_t)g_k_amort_batch) != 1) {
       stat_compute_row_skips++;
       return;
     }
+    g_compute_trace_count++;
     stat_k_amort_emissions++;
-    cost = maj_cost(SIMDRAM_OP_MUL);
+    cost = maj_cost(opcode);
   } else if (g_compute_row_dedup_enabled) {
-    /* BATCH=1 → emit a MUL's MAJ-3 every compute_trace (no
-     * amortization). Same as the original honest per-arithmetic-op
-     * baseline. */
-    cost = maj_cost(SIMDRAM_OP_MUL);
+    /* BATCH=1 → emit this opcode's MAJ-3 every compute_trace (no
+     * amortization). The honest per-arithmetic-op baseline. */
+    cost = maj_cost(opcode);
   } else {
     /* row-dedup disabled → emit per the opcode that fired. */
     cost = maj_cost(opcode);

@@ -1,5 +1,6 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -214,6 +215,8 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
 
     bool Modified = false;
 
+    auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
@@ -233,6 +236,7 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
       }
 
       Value *NullPtr = ConstantPointerNull::get(PtrTy);
+      DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
       for (auto *BO : BinOps) {
         // W4 FIX: only charge BinaryOperators whose value flows into a genuine
@@ -250,15 +254,23 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
         Value *opArg = ConstantInt::get(Type::getInt32Ty(Ctx), op);
         Value *bitsArg = ConstantInt::get(Type::getInt32Ty(Ctx), bits);
 
-        // Insert __compute_trace at the STORE position (not the BO position) so
-        // the dest_addr dominates the call — instrumenting at the BO would
-        // reference a not-yet-defined SSA value and trip the LLVM verifier.
-        IRBuilder<> Builder(Store);
+        // Insert at the BO, so the call fires once per ARITHMETIC EXECUTION.
+        // Inserting at the store (the old behavior) put it OUTSIDE the reduction
+        // loop, so a K-deep MAC chain was charged like a single MAC and SIMDRAM
+        // cost was independent of the arithmetic. dest_addr is passed only when it
+        // dominates the BO; otherwise null, and the runtime attributes to
+        // current_acc. (void)Store keeps reachesDataStore as the "is this real PE
+        // work vs address math" filter.
+        (void)Store;
+        IRBuilder<> Builder(BO->getNextNode());
         Value *Dest = NullPtr;
         if (DestAddr) {
-          Dest = DestAddr;
-          if (Dest->getType() != PtrTy)
-            Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
+          auto *DestI = dyn_cast<Instruction>(DestAddr);
+          if (!DestI || DT.dominates(DestI, BO)) {
+            Dest = DestAddr;
+            if (Dest->getType() != PtrTy)
+              Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
+          }
         }
         Builder.CreateCall(ComputeFn, {opArg, bitsArg, Dest});
         Modified = true;
