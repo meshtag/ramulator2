@@ -1053,7 +1053,11 @@ void pim_init(const char *trace_file) {
  * emitPimLayoutTable (TritonIMToLLVM.cpp) puts these globals in the KERNEL
  * object. Kernel and runtime link into one dylib, so we just read them.
  *
- * Record: [operand_arg, layout_kind, reduction_col_axis, num_axes, footprint...].
+ * Record: [operand_arg, layout_kind, reduction_col_axis, bank_replicated,
+ * num_axes, footprint...]. bank_replicated is the compiler-DERIVED role: 1 when
+ * every bank sees the same elements (deliver to each PE = OPERAND), 0 when the
+ * tensor is bank-partitioned (read bank-locally = STREAMED), -1 when the pass
+ * said nothing and the host's role stands.
  * operand_arg == tensor id, because pointer args are registered first and in
  * signature order. Only layout_kind and reduction_col_axis are read now; words
  * 3.. (the address footprint) fed the retired residency capacity and are ignored,
@@ -1062,7 +1066,7 @@ void pim_init(const char *trace_file) {
 #define PIM_MAX_FP_AXES 3
 #define PIM_MAX_STRIDE_ARGS 3
 #define PIM_FP_AXIS_WORDS (2 + PIM_MAX_STRIDE_ARGS)
-#define PIM_LAYOUT_REC_WORDS (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
+#define PIM_LAYOUT_REC_WORDS (5 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on
  * Mach-O when nothing defines the symbol, which is the normal case whenever
@@ -1115,9 +1119,30 @@ static void apply_compiler_layout(int tensor_id) {
           "[pim-runtime] compiler-emitted layout table found in the kernel "
           "artifact (%d entries); host ctypes descriptor push is not used\n",
           n);
-    /* Only layout_kind (rec[1]) and reduction_col (rec[2]) are honored now;
-     * the footprint axes (rec[3..]) fed the retired residency capacity. */
+    /* layout_kind (rec[1]) and reduction_col (rec[2]) are honored; the footprint
+     * axes fed the retired residency capacity and are ignored. */
     pim_set_tensor_layout(tensor_id, rec[1], rec[2]);
+
+    /* COMPILER-DERIVED ROLE (rec[3]). Whether a tensor is replicated across banks
+     * is a property of the LAYOUT, so the pass reads it off the encoding and we
+     * honor it over the role the host asserted at registration. The host string
+     * was written for one particular layout, so any layout change silently
+     * inverted the charge: a transposed matmul accumulator measured 31x too fast
+     * because both operands ended up in the free role (2026-09-06). The
+     * accumulator is exempt -- a store's role is decided by what it is, not by
+     * how it is spread. */
+    tensor_info_t *_t = &tensors[tensor_id];
+    if (rec[3] >= 0 && _t->role != PIM_ROLE_ACCUMULATOR) {
+      int derived = rec[3] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
+      if (derived != _t->role) {
+        fprintf(stderr,
+                "[pim-runtime] tensor %d: role %s -> %s (compiler-derived from "
+                "the layout; host said otherwise)\n",
+                tensor_id, _t->role == PIM_ROLE_OPERAND ? "OPERAND" : "STREAMED",
+                derived == PIM_ROLE_OPERAND ? "OPERAND" : "STREAMED");
+        _t->role = derived;
+      }
+    }
     stat_layout_from_compiler++;
     return;
   }
