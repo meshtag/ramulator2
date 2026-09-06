@@ -29,6 +29,14 @@ static int cfg_num_sa = 16;
 static int cfg_num_rows = 512;
 static int cfg_num_cols = 64;
 static int cfg_dq_bits = 128;
+/* Width of one modelled DATA VALUE in bits. This is a HARDWARE property (the shared
+ * spec's data_width / pe_bits, 16 on this HBM3-PIM part), NOT the width of whatever
+ * the host happens to store the test arrays in. Column packing must follow the
+ * hardware: values_per_col = dq_bits / data_width. Deriving it from the numpy dtype
+ * instead made us pack 4 int32 per column where the spec, and OptiPIM, pack 8, so we
+ * paid double the bank-reads for the same tensor (2026-09-06). Override with
+ * PIM_DATA_WIDTH_BITS. */
+static int cfg_data_width_bits = 16;
 
 /* Placement scheme. Selectable at init time via PIM_LAYOUT env var:
  *
@@ -840,6 +848,10 @@ void pim_init(const char *trace_file) {
     cfg_num_cols = atoi(v);
   if ((v = getenv("PIM_DQ_BITS")))
     cfg_dq_bits = atoi(v);
+  if ((v = getenv("PIM_DATA_WIDTH_BITS")))
+    cfg_data_width_bits = atoi(v);
+  if (cfg_data_width_bits < 1)
+    cfg_data_width_bits = 1;
 
   /* Reduction-col-axis lever (default OFF). */
   if ((v = getenv("IM_REDUCTION_COL")))
@@ -1177,9 +1189,12 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   t->total_bytes = (size_t)total * elem_size;
   memset(t->base_rows, 0, sizeof(t->base_rows));
 
-  /* Compute how many elements fit per column and per row */
-  t->values_per_col = cfg_dq_bits / (elem_size * 8);
-  // if (t->values_per_col < 1) t->values_per_col = 1;
+  /* Column packing follows the MODELLED data width, not the host array's dtype.
+   * elem_size stays in use for address decoding (addr -> element index), which is
+   * genuinely a property of how the host stores the array. */
+  t->values_per_col = cfg_dq_bits / cfg_data_width_bits;
+  if (t->values_per_col < 1)
+    t->values_per_col = 1;
   t->values_per_row = cfg_num_cols * t->values_per_col;
 
   int rows_needed = (total + t->values_per_row - 1) / t->values_per_row;
