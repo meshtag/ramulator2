@@ -401,7 +401,7 @@ static int g_operand_grf_entries = 136;
  * Expect us to look cheaper than them on matvec and dearer on matmul/conv, precisely
  * because ours is self-consistent and theirs is not. */
 static addr_dedup_state_t *g_operand_deliv = NULL;
-static uint16_t g_operand_deliv_count[MAX_TENSORS][MAX_BANKS];
+static uint32_t g_operand_deliv_count[MAX_TENSORS][MAX_BANKS];
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
 
@@ -1016,7 +1016,15 @@ void pim_init(const char *trace_file) {
     // lockstep too — conflating an artifact correction with the blank dedups.)
     // See docs/ablation-levers-plan.md.
     g_lockstep_collapse = g_lockstep_enabled ? addr_dedup_create(perpid_cap) : NULL;
-    g_operand_deliv = addr_dedup_create(persistent_cap);
+    /* Sized to the most the GRF bound can ever track: grf_entries distinct elements
+     * per (tensor, receiving bank). Sizing it to the register file alone
+     * (active_banks*136) made it overflow on any larger workload, and
+     * addr_dedup_check_and_mark fails safe to "new", which silently switched
+     * amortization off for big shapes while leaving small ones amortized. */
+    long operand_cap = (long)g_operand_grf_entries * active_banks * MAX_TENSORS;
+    if (operand_cap < persistent_cap) operand_cap = persistent_cap;
+    if (operand_cap > (1L << 22)) operand_cap = 1L << 22;
+    g_operand_deliv = addr_dedup_create((int)operand_cap);
 
     /* Only the accumulator per-pid store-dedup state remains (the blank per-pid
      * physical g_dedup + the 4 axis-wise persistent states were removed
@@ -1600,19 +1608,24 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     uint64_t _ns = lockstep_ns(t, _dch, _dpch, /*is_write=*/1) | (1ULL << 12);
     uint64_t _elem = (addr - (uint64_t)t->base_addr) / (uint64_t)t->elem_size;
     int _ti = (int)(t - tensors);
-    int _held = (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS)
-                    ? g_operand_deliv_count[_ti][_gb]
-                    : g_operand_grf_entries;
-    if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
-                                   (uint64_t)_gb)) {
-      /* Seen this pid. Free only if it still fits the register file. */
-      if (_held <= g_operand_grf_entries) {
+    /* A PE can hold only g_operand_grf_entries distinct operand values, so track
+     * exactly that many per (tensor, receiving bank): a repeat among them is
+     * register-resident and free. Once the per-bank working set exceeds the file we
+     * assume it thrashes, charge every later access, and stop touching the dedup
+     * table -- which is what keeps the table bounded (see its sizing at init).
+     * Two bugs fixed here 2026-09-06: the counter used to saturate AT the cap while
+     * the free-path tested `<= cap`, so the bound never fired; and the table used to
+     * be consulted past the bound, so it overflowed on any shape needing more than
+     * active_banks*136 pairs and then failed safe to "never seen", silently
+     * disabling amortization on exactly the large shapes. */
+    if (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS &&
+        g_operand_deliv_count[_ti][_gb] < (uint32_t)g_operand_grf_entries) {
+      if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
+                                     (uint64_t)_gb)) {
         stat_lockstep_skips++;
         t->dedup_skips++;
         return;
       }
-    } else if (_held < g_operand_grf_entries && _gb >= 0 && _gb < MAX_BANKS &&
-               _ti >= 0 && _ti < MAX_TENSORS) {
       g_operand_deliv_count[_ti][_gb]++;
     }
   }
@@ -1695,19 +1708,24 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
     uint64_t _ns = lockstep_ns(t, _dch, _dpch, /*is_write=*/1) | (1ULL << 12);
     uint64_t _elem = (addr - (uint64_t)t->base_addr) / (uint64_t)t->elem_size;
     int _ti = (int)(t - tensors);
-    int _held = (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS)
-                    ? g_operand_deliv_count[_ti][_gb]
-                    : g_operand_grf_entries;
-    if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
-                                   (uint64_t)_gb)) {
-      /* Seen this pid. Free only if it still fits the register file. */
-      if (_held <= g_operand_grf_entries) {
+    /* A PE can hold only g_operand_grf_entries distinct operand values, so track
+     * exactly that many per (tensor, receiving bank): a repeat among them is
+     * register-resident and free. Once the per-bank working set exceeds the file we
+     * assume it thrashes, charge every later access, and stop touching the dedup
+     * table -- which is what keeps the table bounded (see its sizing at init).
+     * Two bugs fixed here 2026-09-06: the counter used to saturate AT the cap while
+     * the free-path tested `<= cap`, so the bound never fired; and the table used to
+     * be consulted past the bound, so it overflowed on any shape needing more than
+     * active_banks*136 pairs and then failed safe to "never seen", silently
+     * disabling amortization on exactly the large shapes. */
+    if (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS &&
+        g_operand_deliv_count[_ti][_gb] < (uint32_t)g_operand_grf_entries) {
+      if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
+                                     (uint64_t)_gb)) {
         stat_lockstep_skips++;
         t->dedup_skips++;
         return;
       }
-    } else if (_held < g_operand_grf_entries && _gb >= 0 && _gb < MAX_BANKS &&
-               _ti >= 0 && _ti < MAX_TENSORS) {
       g_operand_deliv_count[_ti][_gb]++;
     }
   }
