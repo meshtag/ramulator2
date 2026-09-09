@@ -6,6 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* Compiler-emitted descriptor globals. Included with the other headers because the
+ * env-reading code in pim_init references __pim_bg_interleave, which sits far above
+ * where this used to be included. */
+#define PIM_LAYOUT_TABLE_DEFINE
+#include "pim_layout_table.h"
 
 /*
  * PIM Runtime Library
@@ -388,7 +393,11 @@ static addr_dedup_state_t *g_lockstep_collapse = NULL;
  * amortization grants an unbounded per-bank register file, which is unphysical for
  * any operand tile larger than the GRF (conv weights especially). Override with
  * PIM_OPERAND_GRF_ENTRIES for the ablation. */
-static int g_operand_grf_entries = 136;
+/* Bits of PE register file: 16x256b GRF + 8x32b SRF (Lee et al. ISCA'21 Table IV).
+ * How many VALUES that holds depends on cfg_data_width_bits, the same declared width
+ * the column packing uses. Sizing it in int32 slots counted half the file. */
+#define PIM_PE_REGISTER_BITS (16 * 256 + 8 * 32)
+static int g_operand_grf_entries = PIM_PE_REGISTER_BITS / 16;
 /* Operand delivery dedup, scoped to the whole COMPUTE PHASE (kernel lifetime).
  *
  * An operand written into a PE register stays there and is free to re-use on a later
@@ -410,6 +419,73 @@ static int g_operand_grf_entries = 136;
  * because ours is self-consistent and theirs is not. */
 static addr_dedup_state_t *g_operand_deliv = NULL;
 static uint32_t g_operand_deliv_count[MAX_TENSORS][MAX_BANKS];
+/* Bus-word memo, per (tensor, receiving bank). One command moves one DQ word, so a
+ * value already in the word just transferred needs no new command. A MEMO on the
+ * immediately preceding access, never a set: a set that remembers every word ever
+ * touched is a cache, and one here cut a small matmul 22-86x where the 8:1 bus can
+ * justify 8x. This pays only when the tensor's LAYOUT makes lane-axis accesses
+ * contiguous; with row-major A it fires 0/262144 times, which is correct. */
+/* DEFAULT ON (PIM_OPERAND_BUS_COLLAPSE=0 to disable for ablation).
+ *
+ * One command moves one DQ word, so values already in the word just transferred need
+ * no new command. Fires at exactly 7/8 on a contiguous operand, which is the 8:1 bus
+ * and no more, and at 0/N on a strided one, which is also correct.
+ *
+ * Briefly disabled 2026-09-07 because with it on, matvec charged 8x fewer operand
+ * writes than OptiPIM. That comparison was against a baseline our own bridge had
+ * inflated by handing OptiPIM the GEMV transposed. Against the CORRECTED baseline,
+ * OptiPIM writes a constant 1024 on matvec 512x64 / 1024x64 / 512x256 / 2048x256,
+ * while ours is K*banks/8: exactly equal on both K=256 shapes and 4x cheaper on the
+ * K=64 ones. With the collapse OFF we are 2-8x DEARER than a baseline that packs its
+ * own bus, which is the indefensible side. */
+static int g_operand_bus_collapse = 1;
+
+/* OPTIPIM-COMPARABLE ADDRESSING (PIM_OPTIPIM_ADDRESSING=1, DEFAULT OFF).
+ *
+ * NOT FAITHFUL. This exists only so our trace can be compared like-for-like with
+ * OptiPIM's, which pushes its output reads and operand writes at the unmodified
+ * base address with row and column left at zero (fimdram.cpp:44 and :69). Every such
+ * request therefore lands in one already-open row of one bank and never pays an
+ * activation, which understates its cycles by whatever the real row-miss traffic
+ * would cost. Measured directly against this simulator: a row-hit bank read is 1.00
+ * cycle, a same-bank row miss 28.0.
+ *
+ * The DEFAULT is honest accounting: real addresses, real row misses. Turn this on to
+ * answer "what would we score under their addressing", never to report a number. */
+static int g_optipim_addressing = 0;
+
+/* ACCUMULATOR SPILL (pim_set_acc_spill, default inactive).
+ *
+ * The 2-D matmul kernel holds acc as a BLOCK_M x BLOCK_N register tensor across the
+ * whole K loop, i.e. BM*BN/banks values per PE against a register file of
+ * g_operand_grf_entries. When the tile overflows, hardware must write the excess back
+ * to DRAM and re-read it every K step. Nothing in the kernel's memory trace shows
+ * that, so an over-capacity tile used to look FREE, and the harness refused such
+ * tiles rather than report a fictitious number.
+ *
+ * Refusing hides a real tradeoff: a larger tile costs spill traffic but saves operand
+ * re-delivery, and which wins is an empirical question the search should decide. So
+ * the overflow is charged instead: per K step, `overflow` values are written back and
+ * read again, emitted as ordinary BW/BR at real accumulator addresses so Ramulator
+ * prices the row behaviour rather than a scalar being added to a total.
+ *
+ * MODELLED, NOT OBSERVED. The kernel does not really perform these accesses; the
+ * count comes from the tile geometry the host declares. That is a weaker footing than
+ * the rest of the trace and it is why this is stated explicitly here. */
+static void emit_acc_spill(void);
+static int g_acc_spill_tensor = -1;
+static int g_acc_spill_overflow = 0;   /* values per PE beyond the register file */
+static int g_acc_spill_ksteps = 0;
+static uint64_t stat_acc_spill_emitted = 0;
+static uint64_t g_operand_last_word[MAX_TENSORS][MAX_BANKS];
+/* How many values the current command has already carried for that word. One command
+ * moves values_per_col of them; the next access needs a new command. Without this
+ * bound the memo collapses an arbitrarily long run of same-tuple accesses, which
+ * PIM_BG_INTERLEAVE produces (it maps 32 elements to one tuple) and which then read
+ * as a 4x speedup that is purely the model over-crediting. */
+static uint32_t g_operand_word_run[MAX_TENSORS][MAX_BANKS];
+static uint64_t stat_operand_word_skips = 0;
+static uint64_t stat_operand_word_tested = 0;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
 
@@ -746,6 +822,18 @@ static int resolve_access_location(const tensor_info_t *t, uint64_t addr,
  * role for an already-resolved physical tuple. */
 static void emit_access_by_role_phase(tensor_info_t *t,
                                       const pim_phys_loc_t *loc, int is_write) {
+  /* Comparison mode only, applied at the single funnel every record passes through so
+   * it cannot be half-applied. See g_optipim_addressing. */
+  pim_phys_loc_t _flat;
+  if (g_optipim_addressing) {
+    _flat = *loc;
+    _flat.sa = 0;   /* a different subarray is a different row buffer, so pinning
+                     * row alone still leaves misses; OptiPIM's requests all land in
+                     * one open row per bank, which needs sa pinned too. */
+    _flat.row = 0;
+    _flat.col = 0;
+    loc = &_flat;
+  }
   if (cur_phase == PIM_PHASE_COMPUTE) {
     if (!is_write) {
       /* (duplicated bcast_scalar BR-override removed 2026-06-22.) */
@@ -862,6 +950,9 @@ void pim_init(const char *trace_file) {
     g_redcol_extent = atoi(v);
 
   /* Bankgroup-interleave lever (default OFF). */
+  /* Compiler decision first; the env var stays for ablation only. */
+  if (__pim_bg_interleave)
+    g_bg_interleave = 1;
   if ((v = getenv("PIM_BG_INTERLEAVE")))
     g_bg_interleave = atoi(v);
 
@@ -946,6 +1037,19 @@ void pim_init(const char *trace_file) {
 
   /* Lockstep collapse knob (default ON). See g_lockstep_collapse declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
+  /* Derive from the declared data width first, then let the ablation override. */
+  if (cfg_data_width_bits > 0)
+    g_operand_grf_entries = PIM_PE_REGISTER_BITS / cfg_data_width_bits;
+  if ((v = getenv("PIM_OPTIPIM_ADDRESSING"))) {
+    g_optipim_addressing = atoi(v) != 0;
+    if (g_optipim_addressing)
+      fprintf(stderr,
+              "[pim-runtime] WARNING: PIM_OPTIPIM_ADDRESSING=1. Row/col forced to 0 to "
+              "mirror OptiPIM's addressing. Cycles are NOT faithful and must not be "
+              "reported as ours.\n");
+  }
+  if ((v = getenv("PIM_OPERAND_BUS_COLLAPSE")))
+    g_operand_bus_collapse = atoi(v) != 0;
   if ((v = getenv("PIM_OPERAND_GRF_ENTRIES")))
     g_operand_grf_entries = atoi(v);
   if (g_operand_grf_entries < 1) g_operand_grf_entries = 1;
@@ -1037,6 +1141,7 @@ void pim_init(const char *trace_file) {
     if (operand_cap < persistent_cap) operand_cap = persistent_cap;
     if (operand_cap > (1L << 22)) operand_cap = 1L << 22;
     g_operand_deliv = addr_dedup_create((int)operand_cap);
+    memset(g_operand_last_word, 0xFF, sizeof(g_operand_last_word));
 
     /* Only the accumulator per-pid store-dedup state remains (the blank per-pid
      * physical g_dedup + the 4 axis-wise persistent states were removed
@@ -1074,24 +1179,8 @@ void pim_init(const char *trace_file) {
  * signature order. Only layout_kind and reduction_col_axis are read now; words
  * 3.. (the address footprint) fed the retired residency capacity and are ignored,
  * but the record width is kept in sync with emitPimLayoutTable's kRecWords so the
- * table still strides correctly. */
-#define PIM_MAX_FP_AXES 3
-#define PIM_MAX_STRIDE_ARGS 3
-#define PIM_FP_AXIS_WORDS (2 + PIM_MAX_STRIDE_ARGS)
-#define PIM_LAYOUT_REC_WORDS (5 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
-
-/* Weak DEFINITIONS, not weak references. A weak reference does not link on
- * Mach-O when nothing defines the symbol, which is the normal case whenever
- * im-operand-residency-layout is skipped. So count == 0, not a null pointer,
- * is the "no compiler decision" signal.
- * The split decl/def keeps external linkage under C++ and dodges
- * -Wextern-initializer. */
-__attribute__((
-    weak)) extern const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS];
-__attribute__((weak)) extern const int32_t __pim_layout_count;
-
-const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
-const int32_t __pim_layout_count = 0;
+ * table still strides correctly. The record layout itself lives in
+ * pim_layout_table.h so the SIMDRAM runtime reads the same definition. */
 
 static int stat_layout_from_compiler = 0;
 
@@ -1116,7 +1205,28 @@ void pim_set_kernel_scalars(const int32_t *vals, int n) {
 
 /* Honor the compiler's descriptor for one tensor. No-op if the kernel has none.
  */
+/* Refuse a descriptor whose record width is not the one we stride by. The compiler's
+ * kRecWords and this runtime's PIM_LAYOUT_REC_WORDS are in separate submodules, so a
+ * change to one alone misreads every record past the first, silently and plausibly. */
+static void check_layout_rec_words(void) {
+  static int checked = 0;
+  if (checked)
+    return;
+  checked = 1;
+  int emitted = (int)__pim_layout_rec_words;
+  if (emitted > 0 && emitted != PIM_LAYOUT_REC_WORDS) {
+    fprintf(stderr,
+            "[pim-runtime] FATAL: layout record width mismatch. The compiler emitted "
+            "%d words per record, this runtime strides by %d. The Triton and "
+            "ramulator2 submodules have drifted; every record past the first would be "
+            "misread. Rebuild both.\n",
+            emitted, PIM_LAYOUT_REC_WORDS);
+    abort();
+  }
+}
+
 static void apply_compiler_layout(int tensor_id) {
+  check_layout_rec_words();
   int n = (int)__pim_layout_count;
   if (n <= 0)
     return; /* weak fallback in force: no table in this kernel */
@@ -1416,6 +1526,22 @@ void pim_set_tensor_layout(int tensor_id, int layout_kind,
  * onto the column-low bits. Both must be powers of two > 1 to take effect (the
  * remap is guarded); 0 leaves the tensor unremapped. ABI-additive — separate
  * from pim_set_tensor_layout so older callers are unaffected. */
+void pim_set_acc_spill(int tensor_id, int overflow_per_pe, int k_steps) {
+  if (tensor_id < 0 || tensor_id >= num_tensors || overflow_per_pe <= 0 ||
+      k_steps <= 0) {
+    g_acc_spill_tensor = -1;
+    return;
+  }
+  g_acc_spill_tensor = tensor_id;
+  g_acc_spill_overflow = overflow_per_pe;
+  g_acc_spill_ksteps = k_steps;
+  fprintf(stderr,
+          "[pim-runtime] accumulator spill MODELLED for tensor %d: %d values/PE over "
+          "the %d-entry register file, %d K steps -> %lld extra BW+BR pairs per bank\n",
+          tensor_id, overflow_per_pe, g_operand_grf_entries, k_steps,
+          (long long)overflow_per_pe * k_steps);
+}
+
 void pim_set_tensor_redcol(int tensor_id, int redcol_stride, int redcol_extent) {
   if (tensor_id < 0 || tensor_id >= num_tensors) {
     fprintf(stderr,
@@ -1441,14 +1567,48 @@ void pim_set_phase(pim_phase_t phase) {
    * scope: each phase is a distinct logical workload and any cached row
    * activations from one phase must not carry into the next. */
   if (phase != cur_phase) {
+    /* Leaving COMPUTE: charge the modelled accumulator spill before the dedup scopes
+     * reset, so it lands in the phase whose work it belongs to. */
+    if (cur_phase == PIM_PHASE_COMPUTE)
+      emit_acc_spill();
     if (g_store_write_once)
       addr_dedup_reset(g_store_write_once);
     /* Operand delivery amortizes over the whole COMPUTE phase; reset only here. */
     if (g_operand_deliv)
       addr_dedup_reset(g_operand_deliv);
     memset(g_operand_deliv_count, 0, sizeof(g_operand_deliv_count));
+    memset(g_operand_last_word, 0xFF, sizeof(g_operand_last_word));
   }
   cur_phase = phase;
+}
+
+/* Emit the modelled accumulator spill. Called once as COMPUTE ends, so it lands in
+ * the same phase as the work it belongs to. Addresses walk the accumulator's own
+ * elements per bank, so Ramulator sees real rows rather than a synthetic constant. */
+static void emit_acc_spill(void) {
+  if (g_acc_spill_tensor < 0 || g_acc_spill_tensor >= num_tensors)
+    return;
+  tensor_info_t *t = &tensors[g_acc_spill_tensor];
+  int banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  if (banks < 1)
+    banks = 1;
+  if (banks > MAX_BANKS)
+    banks = MAX_BANKS;
+  long long pairs = (long long)g_acc_spill_overflow * g_acc_spill_ksteps;
+  for (int b = 0; b < banks; b++) {
+    int ch, pch, bg, bank;
+    decompose_global_bank(b, &ch, &pch, &bg, &bank);
+    for (long long i = 0; i < pairs; i++) {
+      int elem = (int)((i * banks + b) % (t->num_elements > 0 ? t->num_elements : 1));
+      int e_ch, e_pch, e_bg, e_bank, sa, row, col;
+      map_element(t, elem, &e_ch, &e_pch, &e_bg, &e_bank, &sa, &row, &col);
+      emit_trace("BW", ch, pch, bg, bank, sa, row, col);
+      emit_trace("BR", ch, pch, bg, bank, sa, row, col);
+      stat_acc_spill_emitted += 2;
+    }
+  }
+  fprintf(stderr, "[pim-runtime]   Accumulator spill (MODELLED): %" PRIu64 " records\n",
+          stat_acc_spill_emitted);
 }
 
 void pim_finalize(void) {
@@ -1484,6 +1644,10 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
+  fprintf(stderr,
+          "[pim-runtime]   Operand DQ-word skips           : %" PRIu64 "/%" PRIu64 " (bus %d/%d)\n",
+          stat_operand_word_skips, stat_operand_word_tested, cfg_dq_bits,
+          cfg_data_width_bits);
   fprintf(stderr,
           "[pim-runtime]   Store coalesce (intra-vector)   : %" PRIu64 "\n",
           stat_store_coalesced);
@@ -1637,7 +1801,13 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * (fimdram.cpp:44-50): the FIRST write of element e into receiving bank b within
    * a program-id costs a W; a repeat inside the same pid is already in that PE's
    * register and is free. Keyed per RECEIVING bank, so this is a fanout, never a
-   * broadcast, and it resets per pid so there is no cross-pid reuse. Without it we
+   * broadcast. SCOPE: it does NOT reset per pid. g_operand_deliv is reset only at a
+   * phase boundary (pim_set_phase), never in advance_program_epoch_if_needed, so
+   * reuse DOES cross program ids. That is DELIBERATE and OptiPIM-symmetric: their
+   * tensor_row_idx is declared outside the temporal loop (fimdram.cpp:246, comment
+   * "We only need to load input once") and never cleared, so they amortize across
+   * temporal steps too. Verified 2026-09-08. See the declaration at g_operand_deliv
+   * for the full argument. Without it we
    * charged every repeat access and over-paid conv operands 18-24x against
    * OptiPIM's own write count (2026-09-05). */
   if (is_operand_load && g_operand_deliv &&
@@ -1657,7 +1827,12 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * the free-path tested `<= cap`, so the bound never fired; and the table used to
      * be consulted past the bound, so it overflowed on any shape needing more than
      * active_banks*136 pairs and then failed safe to "never seen", silently
-     * disabling amortization on exactly the large shapes. */
+     * disabling amortization on exactly the large shapes.
+     * NOTE the bound is tested BEFORE the lookup and the counter increments on every
+     * miss, so once a bank's operand working set exceeds g_operand_grf_entries the
+     * counter saturates and the table is never consulted again. On any large shape
+     * this gate contributes nothing, which is why W equals the MAC count exactly on
+     * the anchor (16,384 elements per bank against 272 entries). */
     if (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS &&
         g_operand_deliv_count[_ti][_gb] < (uint32_t)g_operand_grf_entries) {
       if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
@@ -1667,6 +1842,27 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
         return;
       }
       g_operand_deliv_count[_ti][_gb]++;
+    }
+    if (g_operand_bus_collapse && _gb >= 0 && _gb < MAX_BANKS &&
+        _ti >= 0 && _ti < MAX_TENSORS) {
+      /* Key the SOURCE DQ word, not (sa,row,col). map_element sends consecutive
+       * 512-value logical rows to different source BANKS at the same (sa,row,col),
+       * so the old key aliased distinct words and could collapse up to 32 of them.
+       * Inert today (0 fires on strided A; contiguous x induces the same partition,
+       * since a bank change there is also a column change). */
+      uint64_t _word = _elem / (uint64_t)(t->values_per_col > 0
+                                          ? t->values_per_col : 1);
+      stat_operand_word_tested++;
+      uint32_t _cap = (uint32_t)(t->values_per_col > 0 ? t->values_per_col : 1);
+      if (g_operand_last_word[_ti][_gb] == _word &&
+          g_operand_word_run[_ti][_gb] < _cap) {
+        g_operand_word_run[_ti][_gb]++;
+        stat_operand_word_skips++;
+        t->dedup_skips++;
+        return;
+      }
+      g_operand_last_word[_ti][_gb] = _word;
+      g_operand_word_run[_ti][_gb] = 1;
     }
   }
 
@@ -1737,7 +1933,13 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
    * (fimdram.cpp:44-50): the FIRST write of element e into receiving bank b within
    * a program-id costs a W; a repeat inside the same pid is already in that PE's
    * register and is free. Keyed per RECEIVING bank, so this is a fanout, never a
-   * broadcast, and it resets per pid so there is no cross-pid reuse. Without it we
+   * broadcast. SCOPE: it does NOT reset per pid. g_operand_deliv is reset only at a
+   * phase boundary (pim_set_phase), never in advance_program_epoch_if_needed, so
+   * reuse DOES cross program ids. That is DELIBERATE and OptiPIM-symmetric: their
+   * tensor_row_idx is declared outside the temporal loop (fimdram.cpp:246, comment
+   * "We only need to load input once") and never cleared, so they amortize across
+   * temporal steps too. Verified 2026-09-08. See the declaration at g_operand_deliv
+   * for the full argument. Without it we
    * charged every repeat access and over-paid conv operands 18-24x against
    * OptiPIM's own write count (2026-09-05). */
   if (is_operand_load_p && g_operand_deliv &&
@@ -1757,7 +1959,12 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
      * the free-path tested `<= cap`, so the bound never fired; and the table used to
      * be consulted past the bound, so it overflowed on any shape needing more than
      * active_banks*136 pairs and then failed safe to "never seen", silently
-     * disabling amortization on exactly the large shapes. */
+     * disabling amortization on exactly the large shapes.
+     * NOTE the bound is tested BEFORE the lookup and the counter increments on every
+     * miss, so once a bank's operand working set exceeds g_operand_grf_entries the
+     * counter saturates and the table is never consulted again. On any large shape
+     * this gate contributes nothing, which is why W equals the MAC count exactly on
+     * the anchor (16,384 elements per bank against 272 entries). */
     if (_gb >= 0 && _gb < MAX_BANKS && _ti >= 0 && _ti < MAX_TENSORS &&
         g_operand_deliv_count[_ti][_gb] < (uint32_t)g_operand_grf_entries) {
       if (!addr_dedup_check_and_mark(g_operand_deliv, _ns, _elem,
@@ -1767,6 +1974,27 @@ static void pim_trace_access_one_persistent(tensor_info_t *t, uint64_t addr,
         return;
       }
       g_operand_deliv_count[_ti][_gb]++;
+    }
+    if (g_operand_bus_collapse && _gb >= 0 && _gb < MAX_BANKS &&
+        _ti >= 0 && _ti < MAX_TENSORS) {
+      /* Key the SOURCE DQ word, not (sa,row,col). map_element sends consecutive
+       * 512-value logical rows to different source BANKS at the same (sa,row,col),
+       * so the old key aliased distinct words and could collapse up to 32 of them.
+       * Inert today (0 fires on strided A; contiguous x induces the same partition,
+       * since a bank change there is also a column change). */
+      uint64_t _word = _elem / (uint64_t)(t->values_per_col > 0
+                                          ? t->values_per_col : 1);
+      stat_operand_word_tested++;
+      uint32_t _cap = (uint32_t)(t->values_per_col > 0 ? t->values_per_col : 1);
+      if (g_operand_last_word[_ti][_gb] == _word &&
+          g_operand_word_run[_ti][_gb] < _cap) {
+        g_operand_word_run[_ti][_gb]++;
+        stat_operand_word_skips++;
+        t->dedup_skips++;
+        return;
+      }
+      g_operand_last_word[_ti][_gb] = _word;
+      g_operand_word_run[_ti][_gb] = 1;
     }
   }
 

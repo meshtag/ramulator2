@@ -165,6 +165,9 @@ void pim_set_kernel_scalars(const int32_t *vals, int n);
  * must be pow2 > 1 to take effect. ABI-additive; absent (older build) the
  * tensor stays unremapped. Correctness-invariant (pure trace-address remap). */
 void pim_set_tensor_redcol(int tensor_id, int redcol_stride, int redcol_extent);
+/* Charge an over-capacity accumulator: `overflow_per_pe` values spilled and reloaded
+ * once per K step. MODELLED from the tile geometry, not observed in the trace. */
+void pim_set_acc_spill(int tensor_id, int overflow_per_pe, int k_steps);
 
 #ifdef __cplusplus
 }

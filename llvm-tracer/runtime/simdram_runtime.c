@@ -1,6 +1,13 @@
 #include "simdram_runtime.h"
 #include "im_addr_dedup.h"
 #include "im_runtime.h"
+/* Shared with pim_runtime.c so the two runtimes cannot disagree about the record
+ * width. The two are never linked together (pass_ablation.py picks one by target), so
+ * this TU must supply the weak fallback definitions itself: on Mach-O a weak REFERENCE
+ * with no definition fails to link, which is the normal case whenever
+ * im-operand-residency-layout is skipped. */
+#define PIM_LAYOUT_TABLE_DEFINE
+#include "pim_layout_table.h"
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -880,6 +887,66 @@ void simdram_init(const char *trace_file) {
           cfg_num_cols, cfg_dq_bits, cfg_pe_bits);
 }
 
+/* Does the compiler's layout analysis agree with the host's role string?
+ *
+ * REPORTS, never overrides. On HBM the same word drives the role, because there a
+ * mislabel changes the charge (a replicated operand landed in the free role and
+ * measured 31x too fast). Here the mapping is different: SIMDRAM's OPERAND emits
+ * nothing by design and symmetrically with OptiPIM, whose simdram codegen also emits
+ * nothing for the weight. So overriding the role from bank_replicated would invent a
+ * cost the baseline does not charge. What SIMDRAM lacked was the ALARM, not the
+ * override, so this is the alarm on its own.
+ *
+ * PIM_STRICT_ROLES=1 turns a disagreement into an abort. It must stay silent on every
+ * benchmarked kernel; if it ever fires, the host tag and the layout have diverged and
+ * the SIMDRAM numbers for that shape are describing a mapping nobody chose.
+ */
+static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role) {
+  /* Same cross-submodule width check as the HBM runtime: this TU strides the table
+   * too, so it can misread it the same way. */
+  static int width_checked = 0;
+  if (!width_checked) {
+    width_checked = 1;
+    int emitted = (int)__pim_layout_rec_words;
+    if (emitted > 0 && emitted != PIM_LAYOUT_REC_WORDS) {
+      fprintf(stderr,
+              "[simdram] FATAL: layout record width mismatch, compiler emitted %d, "
+              "runtime strides %d. Submodules have drifted; rebuild both.\n",
+              emitted, PIM_LAYOUT_REC_WORDS);
+      abort();
+    }
+  }
+  int n = (int)__pim_layout_count;
+  if (n <= 0)
+    return; /* weak fallback: this kernel carries no descriptor */
+  for (int i = 0; i < n; i++) {
+    const int32_t *rec = __pim_layout_table + (size_t)i * PIM_LAYOUT_REC_WORDS;
+    if (rec[PIM_LW_OPERAND_ARG] != tensor_id)
+      continue;
+    int32_t br = rec[PIM_LW_BANK_REPLICATED];
+    if (br < 0 || host_role == SIMDRAM_ROLE_ACCUMULATOR)
+      return; /* pass said nothing, or a store whose role is what it is */
+    /* bank_replicated=1 means every bank sees the same elements, which is what
+     * OPERAND asserts here; 0 means bank-partitioned, which is STREAMED. */
+    simdram_role_t derived = br ? SIMDRAM_ROLE_OPERAND : SIMDRAM_ROLE_STREAMED;
+    if (derived == host_role)
+      return;
+    const char *hs = (host_role == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
+    const char *ds = (derived == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
+    fprintf(stderr,
+            "[simdram] ROLE DISAGREEMENT tensor %d: host says %s, compiler layout "
+            "says %s (bank_replicated=%d). SIMDRAM charges these differently "
+            "(OPERAND is free), so this shape's cost is suspect.\n",
+            tensor_id, hs, ds, (int)br);
+    const char *strict = getenv("PIM_STRICT_ROLES");
+    if (strict && strict[0] == '1') {
+      fprintf(stderr, "[simdram] PIM_STRICT_ROLES=1, aborting.\n");
+      abort();
+    }
+    return;
+  }
+}
+
 int simdram_register_tensor(void *ptr, const int *dims, int ndims,
                             int elem_size, simdram_role_t role) {
   if (num_tensors >= MAX_TENSORS) {
@@ -892,6 +959,7 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->base_addr = ptr;
   t->elem_size = elem_size;
   t->role = role;
+  simdram_check_compiler_role(num_tensors, role);
   t->emitted_R = t->emitted_W = 0;
   t->emitted_BR = t->emitted_BW = t->emitted_WB = 0;
   t->dedup_skips = t->persistent_skips = 0;
