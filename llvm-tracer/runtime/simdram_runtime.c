@@ -417,21 +417,32 @@ static int compute_global_bank(int ch, int pch, int bg, int bank) {
   return ch * banks_per_ch + pch * banks_per_pch + bg * cfg_num_banks + bank;
 }
 
-/* Emit one regular write per receiving bank in the (src_ch, src_pch): the input
- * bit-row has to land in every bank that will compute on it. See the note above
- * for why this is a fanout and not a broadcast. */
+/* Emit one regular write per receiving bank: the input bit-row has to land in every
+ * bank that will compute on it. See the note above for why this is a fanout and not
+ * a broadcast.
+ *
+ * ACROSS BOTH PSEUDOCHANNELS since 2026-09-10, because the address map now spreads a
+ * tile over all 32 banks and an operand in pch 0 is not visible to a consumer in
+ * pch 1. An all-bank PIM command reaches the banks of ONE pseudochannel, so this is
+ * two dispatches rather than one, and it costs twice the writes. That is the honest
+ * price of using the whole 32-bank machine we already grant the baseline, and
+ * pretending one dispatch covered both is exactly the BCAST_W mistake. src_pch is
+ * therefore ignored: every consuming bank is written, wherever the source sat. */
 static void emit_input_broadcast(tensor_info_t *t,
                                  int src_ch, int src_pch,
                                  int src_bg, int src_bank,
                                  int sa, int row, int col) {
+  (void)src_pch;
   (void)src_bg;
   (void)src_bank;
-  for (int bg = 0; bg < cfg_num_bg; bg++) {
-    for (int bk = 0; bk < cfg_num_banks; bk++) {
-      emit_trace("W", src_ch, src_pch, bg, bk, sa, row, col);
-      stat_writes++;
-      t->emitted_W++;
-      stat_input_replication_writes++;
+  for (int pch = 0; pch < cfg_num_pch; pch++) {
+    for (int bg = 0; bg < cfg_num_bg; bg++) {
+      for (int bk = 0; bk < cfg_num_banks; bk++) {
+        emit_trace("W", src_ch, pch, bg, bk, sa, row, col);
+        stat_writes++;
+        t->emitted_W++;
+        stat_input_replication_writes++;
+      }
     }
   }
 }
@@ -525,6 +536,16 @@ static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
   *bg = (int)(linear & ((1ULL << log2_bg) - 1));
   linear >>= log2_bg;
 
+  /* PSEUDOCHANNEL, added 2026-09-10. The map used to pin pch=0, so a tile spread
+   * over 16 banks while the kernel was compiled for 32 lanes and the occupancy
+   * divisor divided by 32. Three numbers that had to agree and did not, and we were
+   * granting OptiPIM 32 banks through the num_banks attribute while placing our own
+   * data in half that. Above bg and below col, so consecutive elements fill all 32
+   * banks before advancing a column. */
+  int log2_pch = ilog2_pow2(cfg_num_pch);
+  *pch = (int)(linear & ((1ULL << log2_pch) - 1));
+  linear >>= log2_pch;
+
   *col = (int)(linear & ((1ULL << log2_cols) - 1));
   linear >>= log2_cols;
 
@@ -535,11 +556,9 @@ static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
   *sa = (int)(linear_row / (uint64_t)cfg_data_rows_per_sa);
   *base_row = (int)(linear_row % (uint64_t)cfg_data_rows_per_sa);
 
-  /* Interleaved layout confines tensor data to one (ch, pch) so that
-   * input replication's per-pch fanout makes operand bits available
-   * at every consuming bank. */
+  /* One channel still. Spreading across channels would need the input fanout to
+   * cross a channel boundary, which no PIM command does. */
   *ch = 0;
-  *pch = 0;
 }
 
 /*
