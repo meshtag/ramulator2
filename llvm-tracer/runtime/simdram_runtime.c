@@ -382,8 +382,22 @@ static uint64_t stat_input_replication_writes = 0;
  * bank's row_col_accesses then breaks the spatial loop). Soundness
  * is the same uniformity argument both compilers rely on.
  *
- * PIM_LEADER_BANK_ONLY=0 disables the gate (every bank emits its own
- * trace; useful for ablation against the leader-bank model). */
+ * PIM_LANE_MODEL selects the LANE MODEL as a whole, and replaced the old standalone
+ * PIM_LEADER_BANK_ONLY on 2026-09-10. The gate and the occupancy denominator are two
+ * halves of one convention and must move together: the gate keeps 1 lane of 32 while
+ * the denominator divides the output tile by 32 banks, so setting either alone shifts
+ * the charge by exactly 32x and measures nothing. One knob, self-consistent values.
+ *
+ *   leader  (default) gate ON,  denominator = output tile / banks.  What ships.
+ *   paired            gate OFF, denominator = output tile.          Both /32 removed.
+ *
+ * `paired` is the diagnostic: if the gate really only drops replicas of lane 0's work
+ * then the two arms emit the SAME bank reads, and if they differ the gate is dropping
+ * distinct work. It keys on __pim_get_bank_id(), the harness replay lane, while every
+ * physical bank in the trace comes from map_element(), which reads the element index
+ * and never the lane, so the prediction is genuinely at risk. */
+typedef enum { SIMDRAM_LANE_LEADER = 0, SIMDRAM_LANE_PAIRED = 1 } simdram_lane_model_t;
+static simdram_lane_model_t g_lane_model = SIMDRAM_LANE_LEADER;
 static int g_leader_bank_only_enabled = 1;
 static uint64_t stat_leader_bank_skips = 0;
 
@@ -769,12 +783,23 @@ void simdram_init(const char *trace_file) {
           g_optipim_mul_formula ? "7n²+1 (OptiPIM)" : "11n²−5n−1 (Table 1)");
 
   /* Leader-bank-only emission. Defaults ON (matches OptiPIM
-   * single_bank_opt); PIM_LEADER_BANK_ONLY=0 disables for ablation. */
-  const char *leader_env = getenv("PIM_LEADER_BANK_ONLY");
-  g_leader_bank_only_enabled = (leader_env && leader_env[0] == '0') ? 0 : 1;
+   * single_bank_opt). See the PIM_LANE_MODEL note at the declaration: the gate and the
+   * occupancy denominator are one convention and this knob moves both. */
+  const char *lane_env = getenv("PIM_LANE_MODEL");
+  if (lane_env && strcmp(lane_env, "paired") == 0) {
+    g_lane_model = SIMDRAM_LANE_PAIRED;
+  } else if (lane_env && strcmp(lane_env, "leader") != 0) {
+    fprintf(stderr,
+            "[simdram] ERROR: PIM_LANE_MODEL=%s; expected 'leader' or 'paired'.\n",
+            lane_env);
+    exit(1);
+  }
+  g_leader_bank_only_enabled = (g_lane_model == SIMDRAM_LANE_LEADER) ? 1 : 0;
   stat_leader_bank_skips = 0;
   fprintf(stderr,
-          "[simdram] leader_bank_only=%d (set PIM_LEADER_BANK_ONLY=0 to disable)\n",
+          "[simdram] lane_model=%s (leader_bank_only=%d; set PIM_LANE_MODEL=paired to "
+          "drop the gate AND the matching /banks together)\n",
+          g_lane_model == SIMDRAM_LANE_PAIRED ? "paired" : "leader",
           g_leader_bank_only_enabled);
 
   if (g_dedup_enabled) {
@@ -881,11 +906,23 @@ static int64_t simdram_derived_k_amort_batch(void) {
   int emitted = (int)__pim_layout_rec_words;
   if (emitted > 0 && emitted != PIM_LAYOUT_REC_WORDS)
     return 0; /* width drift; the loud abort for that lives in the role check */
-  int banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
-  if (banks < 1) banks = 1;
+  /* The gate's half of the pair. Under `leader` one lane of `banks` survives and the
+   * tile is divided by `banks`; under `paired` every lane emits and the division comes
+   * off with it. Reading g_lane_model here is what keeps the two from drifting. */
+  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  if (all_banks < 1) all_banks = 1;
+  int banks = (g_lane_model == SIMDRAM_LANE_PAIRED) ? 1 : all_banks;
   int64_t row_values = __pim_row_values ? (int64_t)__pim_row_values
                                         : (int64_t)cfg_num_cols * cfg_dq_bits;
   if (row_values < 1) row_values = 1;
+  /* THE CAP SCALES WITH THE DIVISOR, and forgetting that made the first paired sweep
+   * lie. The row is a PER-BANK ceiling, so dropping the /banks has to raise it by the
+   * same factor or the cap binds in one arm and not the other. Measured before the
+   * fix: matmul 128x512x256 (tile 65,536) capped at 8,192 in paired against 2,048 in
+   * leader, a ratio of 4 where 32 was owed, and bank reads moved 8x. That 8x was the
+   * instrument, not the gate. Shapes under one row were unaffected either way. */
+  if (g_lane_model == SIMDRAM_LANE_PAIRED)
+    row_values *= all_banks;
   int64_t best = 0;
   for (int i = 0; i < (int)__pim_layout_count; i++) {
     const int32_t *rec = __pim_layout_table + (size_t)i * PIM_LAYOUT_REC_WORDS;
