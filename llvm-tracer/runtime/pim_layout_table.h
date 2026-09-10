@@ -64,6 +64,12 @@ __attribute__((weak)) extern const int32_t __pim_bg_interleave;
 __attribute__((weak)) extern const int32_t __pim_layout_scheme;
 __attribute__((weak)) extern const int32_t __pim_placement_align;
 
+/* 1 when the kernel loops over tiles inside one program instance. The trace
+ * runtime needs it to pick how it packs its dispatch id: a persistent kernel has
+ * few instances and many tiles, a gridded one has many instances and no tiles, and
+ * reserving tile bits unconditionally overflowed the field on a 128-instance grid. */
+__attribute__((weak)) extern const int32_t __pim_persistent;
+
 /* Data-bus width in bits AS THE COMPILER ASSUMED IT when it chose vector widths.
  * The runtime holds the same quantity as cfg_dq_bits. They were decided
  * independently until 2026-09-10, in two languages with no shared symbol; this
@@ -76,6 +82,7 @@ const int32_t __pim_layout_count = 0;
 const int32_t __pim_layout_rec_words = 0;
 const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
+const int32_t __pim_persistent = 0;
 const int32_t __pim_layout_scheme = 0;
 const int32_t __pim_placement_align = 0;
 #endif

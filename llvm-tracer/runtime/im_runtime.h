@@ -35,6 +35,14 @@ void __pim_set_bank_id(int32_t id);
  * order the host walks the grid. */
 extern uint64_t __pim_program_epoch;
 
+/* Signalled by a persistent kernel at each tile boundary; resets when the host picks
+ * a bank, so it is a tile index that matches across bank replays. */
+void __pim_tile_boundary(void);
+
+/* Tile index within the current bank replay; 0 for a gridded kernel. The trace
+ * runtime packs this with __pim_program_epoch into its collapse key. */
+uint64_t __pim_tile_index(void);
+
 
 int32_t __pim_get_program_id(void);
 void __pim_set_program_id(int32_t id);
