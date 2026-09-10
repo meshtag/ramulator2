@@ -3,7 +3,7 @@
  * emitPimLayoutTable (TritonIMToLLVM.cpp) puts these globals in the KERNEL object.
  * Kernel and runtime link into one dylib, so a runtime just reads them.
  *
- * Record: [operand_arg, bank_replicated, num_axes,
+ * Record: [operand_arg, bank_replicated, num_axes, is_store,
  * footprint...]. bank_replicated is the compiler-DERIVED role: 1 when every bank sees
  * the same elements (deliver to each PE), 0 when the tensor is bank-partitioned, -1
  * when the pass said nothing and the host's role stands. operand_arg == tensor id,
@@ -22,16 +22,20 @@
 #define PIM_MAX_FP_AXES 3
 #define PIM_MAX_STRIDE_ARGS 3
 #define PIM_FP_AXIS_WORDS (2 + PIM_MAX_STRIDE_ARGS)
-/* 3 fixed words then the footprint axes. Two words left on 2026-09-10:
- * reduction_col_axis with the reduction-to-column lever, and layout_kind, whose only
- * consumer (the ROW_DUP broadcast collapse) had been reverted on fairness grounds.
- * The drift check below catches a half-rebuilt pair loudly. */
-#define PIM_LAYOUT_REC_WORDS (3 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
+/* 4 fixed words then the footprint axes. Two words left on 2026-09-10
+ * (reduction_col_axis and layout_kind); is_store arrived 2026-09-10 because nothing
+ * else says which tensor is the output once reuse_class stopped travelling, and the
+ * SIMDRAM occupancy charge needs the OUTPUT footprint specifically. The drift check
+ * below catches a half-rebuilt pair loudly. */
+#define PIM_LAYOUT_REC_WORDS (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
-/* Word offsets within one record. */
+/* Word offsets within one record. Index through these, never a literal: a bare rec[3]
+ * survived a width change once and silently read num_axes as bank_replicated. */
 #define PIM_LW_OPERAND_ARG 0
 #define PIM_LW_BANK_REPLICATED 1
 #define PIM_LW_NUM_AXES 2
+#define PIM_LW_IS_STORE 3
+#define PIM_LW_AXES_BASE 4
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on Mach-O when
  * nothing defines the symbol, which is the normal case whenever
@@ -64,6 +68,11 @@ __attribute__((weak)) extern const int32_t __pim_bg_interleave;
 __attribute__((weak)) extern const int32_t __pim_layout_scheme;
 __attribute__((weak)) extern const int32_t __pim_placement_align;
 
+/* Values one DRAM row holds per bank, num_cols * dq_bits, AS THE COMPILER ASSUMED IT.
+ * The SIMDRAM occupancy charge divides by this, so a machine whose row is a different
+ * width would price passes the compiler never planned. 0 = the kernel did not say. */
+__attribute__((weak)) extern const int32_t __pim_row_values;
+
 /* 1 when the kernel loops over tiles inside one program instance. The trace
  * runtime needs it to pick how it packs its dispatch id: a persistent kernel has
  * few instances and many tiles, a gridded one has many instances and no tiles, and
@@ -83,6 +92,7 @@ const int32_t __pim_layout_rec_words = 0;
 const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
 const int32_t __pim_persistent = 0;
+const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;
 const int32_t __pim_placement_align = 0;
 #endif

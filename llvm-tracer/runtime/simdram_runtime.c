@@ -66,6 +66,7 @@ static int cfg_num_rows = 512; /* total physical rows per subarray  */
 static int cfg_num_cols = 64;
 static int cfg_dq_bits = 128;
 static void check_compiler_dq_bits(int cfg_bits);
+static int64_t simdram_derived_k_amort_batch(void);
 
 static int cfg_pe_bits = 16;
 
@@ -338,7 +339,7 @@ static uint64_t stat_k_amort_skips = 0;
  * triggers at the current (bank, row) of the triggering compute_trace,
  * so emissions spread naturally across (bank, row) tuples when present.
  *
- * Override via PIM_K_AMORT_BATCH; set to 1 for the no-amortization
+ * Set PIM_K_AMORT=0 for the no-amortization
  * baseline (every compute_trace emits its full maj_cost). */
 static int g_k_amort_batch = 0;
 static uint64_t g_compute_trace_count = 0;
@@ -802,20 +803,43 @@ void simdram_init(const char *trace_file) {
    * count[column]*dq (simdram.cpp:88-89), whose row_offset advances pe_bits rows
    * per 8192 values. (Was /cfg_pe_bits = 512 until 2026-09-05, a 16x
    * under-amortization that made us charge ~9x OptiPIM for the same conv.)
-   * PIM_K_AMORT_BATCH overrides; 1 = no amortization. */
+   * This is only the FALLBACK. The compiler's own figure overrides it below, and
+   * PIM_K_AMORT_BATCH was deleted 2026-09-10 with the rest of the caller's authority
+   * over the divisor: a knob on the denominator is a knob on the answer. PIM_K_AMORT
+   * still turns amortization off wholesale, which is a real ablation. */
   g_k_amort_batch = cfg_num_cols * cfg_dq_bits;
   if (g_k_amort_batch < 1) g_k_amort_batch = 1;
-  const char *kamort_env = getenv("PIM_K_AMORT_BATCH");
-  if (kamort_env) {
-    int v = atoi(kamort_env);
-    if (v >= 1) g_k_amort_batch = v;
-  }
   g_compute_trace_count = 0;
   memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   stat_k_amort_emissions = 0;
   fprintf(stderr,
-          "[simdram] k_amort_batch=%d (set PIM_K_AMORT_BATCH=N to override; 1 disables)\n",
+          "[simdram] k_amort_batch=%d (fallback; the artifact overrides it below)\n",
           g_k_amort_batch);
+  /* THE COMPILER'S VALUE WINS. Whatever the caller passed is an input to be checked,
+   * not the answer: the occupancy is a property of the kernel's own output tile, and
+   * a divisor the caller picks is a divisor on the cost of the thing being measured
+   * (forcing 4096 in place of 8 moved one conv's bank reads 2,214,144 -> 5,766).
+   * Agreed with the harness on 18 of 18 benchmarked shapes when this landed, so the
+   * override is silent on everything we report; where it is not silent it says so.
+   *
+   * No footprint is the one case still at the caller's mercy, so THAT warns and
+   * invariant 6 turns it into a failed run. */
+  {
+    int64_t derived = simdram_derived_k_amort_batch();
+    if (derived > 0) {
+      if (derived != (int64_t)g_k_amort_batch)
+        fprintf(stderr,
+                "[simdram] k_amort_batch %d -> %lld, taking the compiler's output "
+                "footprint over the value in force.\n",
+                g_k_amort_batch, (long long)derived);
+      g_k_amort_batch = (int)derived;
+    } else if ((int)__pim_layout_count > 0) {
+      fprintf(stderr,
+              "[simdram] WARN no store footprint in the artifact, so k_amort_batch=%d "
+              "is whatever the caller supplied and the occupancy charge is unverified.\n",
+              g_k_amort_batch);
+    }
+  }
 
   fprintf(stderr, "[simdram] Initialized. Trace: %s\n", trace_file);
   fprintf(stderr,
@@ -841,6 +865,47 @@ void simdram_init(const char *trace_file) {
  * benchmarked kernel; if it ever fires, the host tag and the layout have diverged and
  * the SIMDRAM numbers for that shape are describing a mapping nobody chose.
  */
+/* Occupancy the COMPILER planned for, read out of the artifact.
+ *
+ * The charge divides by the live output tile per bank, and until now that number was
+ * computed in Python and pushed in through PIM_K_AMORT_BATCH, which let the caller
+ * choose the divisor on the cost of the thing being measured. The same quantity is
+ * already in the kernel: a STORE's address footprint is one instance's output and
+ * excludes the reduction axis by construction, which a load's footprint would not.
+ *
+ * REPORTS ONLY. Returns 0 when the kernel carries no table, no store record or no
+ * footprint, and the caller then leaves the value in force alone. */
+static int64_t simdram_derived_k_amort_batch(void) {
+  if ((int)__pim_layout_count <= 0)
+    return 0;
+  int emitted = (int)__pim_layout_rec_words;
+  if (emitted > 0 && emitted != PIM_LAYOUT_REC_WORDS)
+    return 0; /* width drift; the loud abort for that lives in the role check */
+  int banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  if (banks < 1) banks = 1;
+  int64_t row_values = __pim_row_values ? (int64_t)__pim_row_values
+                                        : (int64_t)cfg_num_cols * cfg_dq_bits;
+  if (row_values < 1) row_values = 1;
+  int64_t best = 0;
+  for (int i = 0; i < (int)__pim_layout_count; i++) {
+    const int32_t *rec = __pim_layout_table + (size_t)i * PIM_LAYOUT_REC_WORDS;
+    if (rec[PIM_LW_IS_STORE] != 1)
+      continue;
+    int naxes = rec[PIM_LW_NUM_AXES];
+    if (naxes <= 0 || naxes > PIM_MAX_FP_AXES)
+      continue;
+    int64_t cells = 1;
+    for (int a = 0; a < naxes; a++)
+      cells *= (int64_t)rec[PIM_LW_AXES_BASE + a * PIM_FP_AXIS_WORDS];
+    int64_t occ = cells / banks;
+    if (occ < 1) occ = 1;
+    if (occ > row_values) occ = row_values;
+    /* Several stores: the widest owes the passes, since each is charged its own. */
+    if (occ > best) best = occ;
+  }
+  return best;
+}
+
 static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role) {
   /* Same cross-submodule width check as the HBM runtime: this TU strides the table
    * too, so it can misread it the same way. */
