@@ -20,6 +20,8 @@
  * trace-generation harnesses call the kernel sequentially.
  */
 
+#include <stdio.h>
+
 #include "im_runtime.h"
 
 /* File-scope state — one bank executes at a time on CPU. */
@@ -27,6 +29,14 @@ static int32_t current_bank_id = 0;
 static int32_t current_program_id = 0;
 static int32_t current_program_id_y = 0;
 static int32_t current_program_id_z = 0;
+
+/* Program-instance epoch. Bumped by every program-id setter, i.e. exactly when the
+ * host starts a new instance, and NOT by the bank setter, since the banks of one
+ * instance are one all-bank command. The trace runtimes reset their per-instance
+ * state when this changes, instead of diffing the three ids on the next access,
+ * which was only correct while the replay loop stayed program-major. */
+uint64_t __pim_program_epoch = 0;
+
 
 /* ---- Called from inside the compiled kernel ---- */
 
@@ -42,8 +52,18 @@ int32_t __pim_get_program_id_z(void) { return current_program_id_z; }
 
 void __pim_set_bank_id(int32_t id) { current_bank_id = id; }
 
-void __pim_set_program_id(int32_t id) { current_program_id = id; }
 
-void __pim_set_program_id_y(int32_t id) { current_program_id_y = id; }
+void __pim_set_program_id(int32_t id) {
+  current_program_id = id;
+  __pim_program_epoch++;
+}
 
-void __pim_set_program_id_z(int32_t id) { current_program_id_z = id; }
+void __pim_set_program_id_y(int32_t id) {
+  current_program_id_y = id;
+  __pim_program_epoch++;
+}
+
+void __pim_set_program_id_z(int32_t id) {
+  current_program_id_z = id;
+  __pim_program_epoch++;
+}

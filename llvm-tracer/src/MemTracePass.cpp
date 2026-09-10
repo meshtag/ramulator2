@@ -1,39 +1,18 @@
 /*
- * MemTracePass — instruments every LLVM IR load/store with a runtime trace
- * call, classifying each load by which program-id axes its pointer chain
- * depends on so the runtime can apply axis-aware deduplication.
+ * MemTracePass: instruments every LLVM IR load/store with a call into the trace
+ * runtime (__mem_trace_load / __mem_trace_store, carrying the pointer and the
+ * access size in bytes), and brackets main() with __mem_trace_init/_fini.
  *
- * Routing table for loads:
+ * Loads and stores in the scratchpad address space are on-chip reuse, not DRAM,
+ * and are not instrumented.
  *
- *                                        invariant in   reset when
- *   __pim_load_persistent       (mask 0) x, y, z        phase change only
- *   __pim_load_persistent_yz    (mask 1) y, z           pid_x changes
- *   __pim_load_persistent_xz    (mask 2) x, z           pid_y changes
- *   __pim_load_persistent_xy    (mask 4) x, y           pid_z changes
- *   __mem_trace_load          (mask 3+) (none)          per-program-id reset
+ * The call carries the LANE COUNT as well as the byte size, so the runtime can
+ * check its own idea of how many values one access moves against the width the
+ * compiler actually emitted, instead of inferring it and never finding out.
  *
- * Stores route to __mem_trace_store unconditionally; the runtime applies
- * its own dedup at write-once granularity (per-program-id, the natural
- * scope under Triton's program-id-as-unit-of-work model).
- *
- * Mask convention: bit 0 = depends on pid_x, bit 1 = pid_y, bit 2 = pid_z.
- *
- * Why the mask is per-axis rather than a single scalar:
- *   In a kernel whose launch grid has multiple program-id axes, a tensor
- *   may be invariant in some axes and dependent on others. Treating "depends
- *   on any pid axis" as a single bit collapses that distinction and forces
- *   conservative per-program-id dedup even when broader scope is correct.
- *   With the per-axis mask, each load gets the widest scope its dataflow
- *   can prove safe, and the runtime resets each scope only when one of the
- *   axes that scope depends on actually changes.
- *
- * Why the analysis lives in LLVM IR rather than MLIR:
- *   The classification is a SEMANTIC property of the kernel — does the load's
- *   pointer chain reach a call to __pim_get_program_id*. Triton's MLIR IM-
- *   backend lowering preserves these calls intact through to LLVM IR, so the
- *   analysis can be done at either layer with the same answer. The walker
- *   logic is a use-def reachability check; it ports unchanged if we later
- *   move it to a TTGIR pass.
+ * The pid-invariance classifier that used to route some loads to a separate
+ * __pim_load_persistent entry point was deleted 2026-09-10: it was runtime-
+ * inferred cross-pid residency, retired 2026-06-22 and byte-identical inert since.
  */
 
 #include "llvm/IR/Function.h"
@@ -45,64 +24,9 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 
-#include <cstdlib>
-
 using namespace llvm;
 
 namespace {
-
-/* Mask bit assigned to each program-id source.
- *
- * Bank-id (__pim_get_bank_id) is deliberately NOT a source: it's a lane
- * index within a kernel invocation. PE k computes a different physical
- * address than PE k+1 for the same program-id, but PE k on program-id 0
- * and PE k on program-id 1 compute the SAME physical address (provided the
- * pointer is otherwise pid-invariant). That is precisely the pattern
- * persistent dedup is meant to capture, so bank-id dependence must not
- * disqualify a load from the persistent classification. */
-static unsigned programIdSourceMask(const Function *F) {
-  if (!F)
-    return 0;
-  StringRef Name = F->getName();
-  if (Name == "__pim_get_program_id")
-    return 0x1; // bit 0 = pid_x
-  if (Name == "__pim_get_program_id_y")
-    return 0x2; // bit 1 = pid_y
-  if (Name == "__pim_get_program_id_z")
-    return 0x4; // bit 2 = pid_z
-  return 0;
-}
-
-/* Bounded DFS through the SSA use-def chain. Returns the OR of all
- * program-id source bits reachable from V. The bound (`MaxVisits`) caps
- * compile time on pathological IRs; under normal Triton lowering the chain
- * is a few dozen ops. */
-static unsigned programIdAxesMask(Value *V, SmallPtrSetImpl<Value *> &Visited,
-                                  int MaxVisits = 4096) {
-  if (!V)
-    return 0;
-  if (!Visited.insert(V).second)
-    return 0;
-  if ((int)Visited.size() > MaxVisits)
-    return 0;
-
-  if (auto *CI = dyn_cast<CallInst>(V)) {
-    unsigned mask = programIdSourceMask(CI->getCalledFunction());
-    for (Use &U : CI->args())
-      mask |= programIdAxesMask(U.get(), Visited, MaxVisits);
-    return mask;
-  }
-
-  if (auto *I = dyn_cast<Instruction>(V)) {
-    unsigned mask = 0;
-    for (Use &U : I->operands())
-      mask |= programIdAxesMask(U.get(), Visited, MaxVisits);
-    return mask;
-  }
-
-  // Constants, function arguments, globals: not program-id-dependent.
-  return 0;
-}
 
 // Scratchpad (on-chip PE register file / SRAM) address space. Memory ops in
 // this space are NOT DRAM: they model operand reuse the im-operand-residency-
@@ -119,27 +43,32 @@ static bool isScratchpadAccess(const Value *Ptr) {
          T->getPointerAddressSpace() == IM_SCRATCHPAD_ADDRSPACE;
 }
 
+/// Lane count of one access: the vector width, or 1 for a scalar.
+static uint64_t laneCount(Type *T) {
+  if (auto *VT = dyn_cast<FixedVectorType>(T))
+    return VT->getNumElements();
+  return 1;
+}
+
 struct MemTracePass : public PassInfoMixin<MemTracePass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     LLVMContext &Ctx = M.getContext();
 
-    // All trace entry points share the same (ptr, i64) signature.
+    // (ptr, bytes, lanes). The lane count is the vector width the COMPILER chose;
+    // without it the runtime reconstructs lanes as bytes / host-registered element
+    // size and can never notice it meant something else. The two disagree whenever
+    // the modelled element width differs from the array dtype, which is every
+    // non-16-bit tensor today. Passing it lets the runtime say so.
     FunctionType *TraceFnTy = FunctionType::get(
         Type::getVoidTy(Ctx),
-        {PointerType::getUnqual(Ctx), Type::getInt64Ty(Ctx)},
+        {PointerType::getUnqual(Ctx), Type::getInt64Ty(Ctx),
+         Type::getInt64Ty(Ctx)},
         false);
 
     FunctionCallee LoadFn =
         M.getOrInsertFunction("__mem_trace_load", TraceFnTy);
     FunctionCallee StoreFn =
         M.getOrInsertFunction("__mem_trace_store", TraceFnTy);
-    // Single persistent entry point. The per-axis variants (_yz/_xz/_xy) were
-    // consolidated 2026-06-22: the runtime no longer distinguishes the
-    // invariant axis (the blank axis-scope reuse dedups were removed; all
-    // pid-invariant loads route through the faithful per-bank LRU + lockstep),
-    // so one symbol suffices for every invariant mask.
-    FunctionCallee LoadPersistentFn =
-        M.getOrInsertFunction("__pim_load_persistent", TraceFnTy);
 
     FunctionType *VoidFnTy =
         FunctionType::get(Type::getVoidTy(Ctx), false);
@@ -147,11 +76,6 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
         M.getOrInsertFunction("__mem_trace_init", VoidFnTy);
     FunctionCallee FiniFn =
         M.getOrInsertFunction("__mem_trace_fini", VoidFnTy);
-
-    // IM_PERSISTENT=0 disables axis-wise classification entirely: all loads
-    // route to __mem_trace_load (per-program-id reset). Useful for ablation.
-    const char *PersistEnv = std::getenv("IM_PERSISTENT");
-    bool PersistentEnabled = !(PersistEnv && PersistEnv[0] == '0');
 
     bool Modified = false;
 
@@ -198,40 +122,21 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
         IRBuilder<> Builder(LI);
         Value *Ptr = LI->getPointerOperand();
         uint64_t Size = M.getDataLayout().getTypeStoreSize(LI->getType());
-
-        // Classify by axis-mask. A load whose pointer is invariant in at least
-        // two pid axes (mask 0x0/0x1/0x2/0x4 — zero or single-axis dependence)
-        // has cross-pid reuse and routes to the single persistent entry point;
-        // multi-axis-dependent loads (mask with ≥2 bits) route to the
-        // per-program-id path. The walker is conservative.
-        FunctionCallee Routed = LoadFn;
-        if (PersistentEnabled) {
-          SmallPtrSet<Value *, 32> Visited;
-          unsigned mask = programIdAxesMask(Ptr, Visited);
-          switch (mask) {
-          case 0x0: // invariant in xyz
-          case 0x1: // depends on x only
-          case 0x2: // depends on y only
-          case 0x4: // depends on z only
-            Routed = LoadPersistentFn;
-            break;
-          default:
-            Routed = LoadFn;
-            break; // multi-axis dep
-          }
-        }
         Builder.CreateCall(
-            Routed, {Ptr, ConstantInt::get(Type::getInt64Ty(Ctx), Size)});
+            LoadFn, {Ptr, ConstantInt::get(Type::getInt64Ty(Ctx), Size),
+                     ConstantInt::get(Type::getInt64Ty(Ctx),
+                                      laneCount(LI->getType()))});
         Modified = true;
       }
 
       for (auto *SI : Stores) {
         IRBuilder<> Builder(SI);
         Value *Ptr = SI->getPointerOperand();
-        uint64_t Size = M.getDataLayout().getTypeStoreSize(
-            SI->getValueOperand()->getType());
-        Builder.CreateCall(StoreFn,
-                           {Ptr, ConstantInt::get(Type::getInt64Ty(Ctx), Size)});
+        Type *VT = SI->getValueOperand()->getType();
+        uint64_t Size = M.getDataLayout().getTypeStoreSize(VT);
+        Builder.CreateCall(
+            StoreFn, {Ptr, ConstantInt::get(Type::getInt64Ty(Ctx), Size),
+                      ConstantInt::get(Type::getInt64Ty(Ctx), laneCount(VT))});
         Modified = true;
       }
     }

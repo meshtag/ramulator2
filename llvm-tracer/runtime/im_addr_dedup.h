@@ -27,16 +27,18 @@ extern "C" {
 
 typedef struct addr_dedup_state addr_dedup_state_t;
 
-/* Returns NULL on alloc failure. `max_entries` is a soft hint; the actual
- * capacity is the next power of two that gives <= 50% load factor. */
+/* Returns NULL on alloc failure. `max_entries` only sizes the INITIAL table; it is
+ * not a bound. The table doubles whenever the live entries at the current epoch
+ * would pass 50% load, so a low hint costs a few rehashes, never dedup accuracy. */
 addr_dedup_state_t *addr_dedup_create(int max_entries);
 
 /* Returns 1 if the (k1, k2, k3) tuple is new in the current epoch (caller
  * should emit), 0 if already seen this epoch (caller should skip).
  *
- * If the table fills up at the current epoch, falls back to returning 1
- * (treat as new). This is conservative — we may over-emit but never under-
- * emit (correctness preserved at the cost of dedup effectiveness). */
+ * Only if growth fails (allocation refused) does a full table fall back to
+ * returning 1 (treat as new): over-emit, never under-emit. That case is counted by
+ * addr_dedup_saturations and both runtimes print it, because it silently degrades
+ * every collapse built on this table. */
 int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
                               uint64_t k3);
 
@@ -45,6 +47,13 @@ void addr_dedup_reset(addr_dedup_state_t *s);
 
 /* Number of times check_and_mark returned 0 since creation. */
 uint64_t addr_dedup_hits(const addr_dedup_state_t *s);
+
+/* Claims that found no room and no growth. Must be 0; nonzero means the collapse
+ * built on this table stopped collapsing partway through and the trace over-emits. */
+uint64_t addr_dedup_saturations(const addr_dedup_state_t *s);
+
+/* Current slot count, after any growth. */
+int addr_dedup_capacity(const addr_dedup_state_t *s);
 
 void addr_dedup_destroy(addr_dedup_state_t *s);
 

@@ -71,8 +71,8 @@ void simdram_finalize(void);
 /* Called by MemTracePass instrumentation (same ABI as pim_runtime) */
 void __mem_trace_init(void);
 void __mem_trace_fini(void);
-void __mem_trace_load(void *addr, uint64_t size);
-void __mem_trace_store(void *addr, uint64_t size);
+void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes);
+void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes);
 
 /* Called by ComputeTracePass instrumentation. dest_addr is the
  * destination memory address that the BinaryOperator's result flows
@@ -81,28 +81,6 @@ void __mem_trace_store(void *addr, uint64_t size);
  * back to the current accumulator tracker (current_acc) for
  * backwards compatibility. */
 void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr);
-
-/* Axis-wise persistent-scope load entry points — same shape as in
- * pim_runtime.h. Invariance class names indicate which program-id axes
- * the LOAD is invariant in (the complementary axes drive the dedup
- * scope's reset cadence):
- *
- *   __pim_load_persistent     — invariant in {x,y,z}; resets only on phase.
- *   __pim_load_persistent_yz  — invariant in {y,z}, depends on x; resets on x.
- *   __pim_load_persistent_xz  — invariant in {x,z}, depends on y; resets on y.
- *   __pim_load_persistent_xy  — invariant in {x,y}, depends on z; resets on z.
- *
- * The SIMDRAM runtime now applies the same operand-load dedup as the
- * HBM-PIM runtime: a load whose physical (bank, sa·rows+row, col) tuple
- * was already emitted within the persistent scope is suppressed. This
- * is sound for OPERAND/STREAMED loads (idempotent re-reads of the same
- * row buffer) and is *not* applied to the bit-serial gate ops emitted
- * by __compute_trace — those represent distinct MAJ-3 computations and
- * must each be counted by the simulator. */
-void __pim_load_persistent(void *addr, uint64_t size);
-void __pim_load_persistent_yz(void *addr, uint64_t size);
-void __pim_load_persistent_xz(void *addr, uint64_t size);
-void __pim_load_persistent_xy(void *addr, uint64_t size);
 
 #ifdef __cplusplus
 }

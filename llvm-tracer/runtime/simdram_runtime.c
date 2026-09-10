@@ -57,10 +57,16 @@ static int cfg_num_channels = 16;
 static int cfg_num_pch = 2; /* rank: 2 */
 static int cfg_num_bg = 4;
 static int cfg_num_banks = 4; /* per bank group */
-static int cfg_num_sa = 16;
+/* HAND-COPY of the SIMULATOR's organization, same as pim_runtime.c and with the same
+ * absence of a check. The shared SIMDRAM spec names HBM3_8Gb, whose preset has 64
+ * subarrays; 16 is the HBM3_2Gb figure and was wrong here too (2026-09-10). Used only
+ * for the capacity ceiling and the banner, never in the address slicing. */
+static int cfg_num_sa = 64;
 static int cfg_num_rows = 512; /* total physical rows per subarray  */
 static int cfg_num_cols = 64;
 static int cfg_dq_bits = 128;
+static void check_compiler_dq_bits(int cfg_bits);
+
 static int cfg_pe_bits = 16;
 
 /* Placement scheme. Selectable via PIM_SIMDRAM_LAYOUT env var:
@@ -202,9 +208,7 @@ typedef struct {
   uint64_t emitted_W;      /* regular DRAM write (W)  */
   uint64_t emitted_BR;     /* bank-read MAJ-3 op (BR) */
   uint64_t emitted_BW;     /* bank-write         (BW) — reserved, currently unused on SIMDRAM */
-  uint64_t emitted_WB;     /* broadcast write    (WB) — input replication */
   uint64_t dedup_skips;    /* (bank, sa·rows+row+bit, col) coalesced */
-  uint64_t persistent_skips;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -269,43 +273,49 @@ static uint64_t stat_ignored = 0;
  *   key2 = sa * cfg_num_rows + base_row + bit
  *   key3 = col
  *
- * Reset cadence (mirrors HBM-PIM):
- *   g_dedup                — reset on any pid axis change
- *   g_dedup_persistent     — reset on phase change
- *   g_dedup_invariant_yz   — reset on pid_x change
- *   g_dedup_invariant_xz   — reset on pid_y change
- *   g_dedup_invariant_xy   — reset on pid_z change
+ * Reset cadence: PHASE change only, i.e. the collapse spans the whole kernel.
+ *
+ * That scope is chosen to match the baseline rather than by preference. OptiPIM's
+ * simdram codegen declares its equivalent table before the temporal loop, under the
+ * comment "We only need to load input once", and never clears it
+ * (simulator/src/pim_codegen/impl/simdram.cpp:110). Resetting per program instance,
+ * as this did until 2026-09-10, charged an input element once per instance where the
+ * baseline charges it once per kernel. Measured cost of the asymmetry: matmul
+ * 128x512x256 STREAMED writes 1,048,576 -> 65,536 and cycles -1.8%, conv 16x16 3x3
+ * 65,536 -> 4,096 and cycles -0.2%, single-instance shapes unchanged. The table grows
+ * on demand, so the wider scope needs no capacity hint.
  */
 static addr_dedup_state_t *g_dedup = NULL;
-/* (blank cross-pid persistent/invariant reuse dedups removed 2026-06-22 —
- * verified inert on SIMDRAM; all loads route to g_dedup, the faithful per-pid
- * host-replay collapse. Mirrors the HBM pim_runtime.c cleanup.) */
 static int g_dedup_enabled = 1;
 
-/* Compute-row residency (corrected Lever 2).
+/* K-AMORTIZATION BATCHING: one MAJ block emitted every g_k_amort_batch compute traces.
+ * RENAMED 2026-09-09 from g_compute_row_dedup_enabled / PIM_ROW_COMPUTE_DEDUP.
+ * benchmarks/run_runtime_ablation.py was updated with it. It was named after an addr_dedup table
+ * that was created, reset, destroyed and printed but NEVER QUERIED, and that dead table
+ * has been deleted. The old name cost real time: it reads as a second, separate
+ * amortization stacked on this one, and the 128x/8x ablation ratios were briefly taken
+ * as evidence of exactly that. They are just BATCH. What runs is the per-opcode
+ * modulo counter below: one MAJ block emitted every g_k_amort_batch compute traces.
  *
- * Models SIMDRAM's column-parallel TRA: one row activation triggers
- * MAJ-3 simultaneously across all DQ-bits columns in that row. Cost
- * is paid ONCE per unique (bank, data-row) per COMPUTE phase. K-iter
- * accumulations into a cell in the same row collapse on the row's
- * single MAJ-3 sequence; sibling cells in the same row's other
- * columns ride that activation for free.
+ * PIM_K_AMORT=0 therefore disables k-amortization entirely (every arithmetic
+ * op fires its full maj_cost), which is why turning it off costs 128x on matmul
+ * 64x64x64 and 8x on conv 3x3 -- those ratios are exactly BATCH, not evidence of a
+ * separate mechanism.
  *
- * This matches OptiPIM's SimDRAMCodeGen emission rule (simdram.cpp:55-67):
- * emit `7n²+1` BRs per unique (row, col) entry in row_col_accesses,
- * but where row_col_accesses keys on row only (cols accumulate into
- * the same row activation). Their per-row cost is what we model here.
+ * CROSS-PID PERSISTENCE IS WORTH ZERO, contrary to the comment that used to sit here.
+ * The counter resets only on a phase change so it does span the grid, but BATCH is the
+ * per-pid per-pass lane count, so every batch boundary lands on a pid boundary and
+ * persistent equals per-pid-reset exactly. VERIFIED by arithmetic on two shapes:
+ * matmul 64x64x64 emits 123,008/1922 = 64 blocks = K with grid 1x1 (pids=1, so
+ * persistence cannot fire at all), and conv 16x16x16x16 3x3 emits 4,428,288/1922 =
+ * 2,304 = 16 pids x 144 reduction steps, i.e. NO cross-pid collapse occurred. The
+ * runtime sits in the pids x depth x maj_cost branch its old comment claimed to avoid.
  *
- * Reset cadence: phase change only. Persists across pid axes — analogous
- * to g_dedup_persistent. Cross-pid persistence is what makes the model
- * match OptiPIM's `temporal_steps × 7n²+1` cost rather than
- * `pids × temporal_steps × 7n²+1`.
- *
- * PIM_ROW_COMPUTE_DEDUP=0 disables (every compute_trace fires its full
- * maj_cost — useful as the honest-per-arithmetic-op ablation baseline). */
-static addr_dedup_state_t *g_compute_row_dedup = NULL;
-static int g_compute_row_dedup_enabled = 1;
-static uint64_t stat_compute_row_skips = 0;
+ * NO DOUBLE-COUNTING with the leader-bank gate: that gate fires BEFORE this counter
+ * increments, so the counter sees bank 0 only, and BATCH is denominated in cells PER
+ * BANK. Numerator and denominator each divide by 32 once. */
+static int g_k_amort_enabled = 1;
+static uint64_t stat_k_amort_skips = 0;
 
 /* K-axis batch amortization (corrected A2).
  *
@@ -337,39 +347,19 @@ static uint64_t g_compute_trace_count = 0;
 static uint64_t g_compute_trace_count_by_op[SIMDRAM_OP_COUNT] = {0};
 static uint64_t stat_k_amort_emissions = 0;
 
-
-/* SIMDRAM broadcast-write input distribution.
+/* Count of per-bank input-replication writes.
  *
- * SIMDRAM compute (TRA / MAJ-3) requires operand bits to be physically
- * resident in the same subarray as the accumulator. For an input value
- * needed by N consuming banks, its bit-rows have to be written into
- * each bank's subarray.
+ * SIMDRAM compute needs an input's bit-rows physically resident in each consuming
+ * bank's subarray, so one input bit-row costs one regular write per receiving bank.
+ * That matches OptiPIM's simdram codegen, which pays a full write per receiving bank
+ * (simdram.cpp:46-49).
  *
- * Modeling choice: emit ONE broadcast-write (WB / BCAST_W) per unique
- * STREAMED bit-row instead of N per-bank Ws. The BCAST_W command is a
- * SIMDRAM extension to HBM3-PIM (see third_party/ramulator2/src/dram/
- * impl/HBM3_PIM.cpp) that occupies the pseudochannel bus for nBL
- * cycles and delivers the value to all banks of the (ch, pch) in one
- * channel dispatch. Per-bank execution overlaps in parallel.
- *
- * Rationale: the SIMDRAM paper (Hajinazar et al., ASPLOS '21, §3)
- * claims cross-bank parallelism for SIMDRAM operations, which by
- * implication includes input setup via Ambit-style broadcast. Modeling
- * this as a single channel dispatch with bank-parallel execution is
- * consistent with the paper's hardware claim and with how the model
- * already extends HBM3 (PIMOp, SARD, SAWR, BKRD, BKWR are all
- * SIMDRAM-specific extensions in the HBM3_PIM model).
- *
- * Comparison fairness vs OptiPIM: their codegen emits per-consuming-
- * bank standard W events (input_load_banks fanout). Their cycles
- * reflect that cost. We emit broadcast-writes — their cycle counts
- * remain unchanged. The simulator processes each stack's chosen
- * command stream honestly. */
+ * The SIMDRAM paper's BCAST_W extension would make this one pseudochannel dispatch
+ * instead. It was implemented behind PIM_BCAST_W, defaulted off on 2026-05-27 for
+ * symmetry with the baseline, never turned on, and deleted 2026-09-10. Turning it on
+ * would have collapsed the fanout to a single event and taken us below a cost the
+ * baseline pays. */
 static uint64_t stat_input_replication_writes = 0;
-
-static int last_program_id = -1;
-static int last_program_id_y = -1;
-static int last_program_id_z = -1;
 
 /* Leader-bank-only emission gate (mirrors OptiPIM `single_bank_opt`).
  *
@@ -396,27 +386,6 @@ static int last_program_id_z = -1;
 static int g_leader_bank_only_enabled = 1;
 static uint64_t stat_leader_bank_skips = 0;
 
-/* PIM_BCAST_W: select the input-replication emission mode.
- *
- * Default 0 (per-bank fanout): emit cfg_num_bg * cfg_num_banks regular
- *   WR events per STREAMED bit-row. Mirrors OptiPIM SimDRAMCodeGen
- *   (simdram.cpp:46-49) which pays the per-bank WR cost. Hardware
- *   target: plain SIMDRAM, no BCAST_W extension.
- *
- * Set to 1: emit a single BCAST_W ("WB") per STREAMED bit-row.
- *   Models the SIMDRAM paper's BCAST_W extension (MICRO 2021); one
- *   pseudochannel-bus dispatch hits all banks in the (ch, pch) with
- *   per-bank execution latency overlapped in parallel. Hardware
- *   target: SIMDRAM + BCAST_W extension.
- *
- * Default flipped from 1 to 0 on 2026-05-27 for fairness symmetry
- * with OptiPIM's input-replication cost model. */
-static int g_bcast_w_enabled = 0;
-
-/* (pim_load_class_t / cur_load_class removed 2026-06-22: the axis-scope reuse
- * dedups are gone, so the persistent load classification no longer selects a
- * dedup state — every load routes to the faithful per-pid g_dedup collapse.) */
-
 /* ================================================================
  *  Helpers
  * ================================================================ */
@@ -433,37 +402,15 @@ static int compute_global_bank(int ch, int pch, int bg, int bank) {
   return ch * banks_per_ch + pch * banks_per_pch + bg * cfg_num_banks + bank;
 }
 
-/* STREAMED bit-row input broadcast. Two modes, selected by
- * PIM_BCAST_W:
- *
- * Default (PIM_BCAST_W=0): per-bank fanout. Emits one regular WR
- *   (opcode "W") per receiving bank in the (src_ch, src_pch) — i.e.
- *   cfg_num_bg * cfg_num_banks separate events per bit-row. Matches
- *   OptiPIM SimDRAMCodeGen's per-bank input replication
- *   (simdram.cpp:46-49), which pays a full WR cycle per receiving
- *   bank. Hardware target: plain SIMDRAM, no BCAST_W extension.
- *
- * PIM_BCAST_W=1: single broadcast-write event ("WB" → BCAST_W
- *   opcode in HBM3_PIM.cpp:43). One pseudochannel-bus dispatch
- *   covers all banks in the (ch, pch); per-bank execution latency
- *   overlaps in parallel. Hardware target: SIMDRAM + BCAST_W
- *   extension (Hajinazar et al., MICRO 2021).
- *
- * Default flipped to per-bank fanout on 2026-05-27 for symmetry
- * with OptiPIM's input-replication cost model. */
+/* Emit one regular write per receiving bank in the (src_ch, src_pch): the input
+ * bit-row has to land in every bank that will compute on it. See the note above
+ * for why this is a fanout and not a broadcast. */
 static void emit_input_broadcast(tensor_info_t *t,
                                  int src_ch, int src_pch,
                                  int src_bg, int src_bank,
                                  int sa, int row, int col) {
   (void)src_bg;
   (void)src_bank;
-  if (g_bcast_w_enabled) {
-    emit_trace("WB", src_ch, src_pch, /*bg=*/0, /*bank=*/0, sa, row, col);
-    stat_writes++;
-    t->emitted_WB++;
-    stat_input_replication_writes++;
-    return;
-  }
   for (int bg = 0; bg < cfg_num_bg; bg++) {
     for (int bk = 0; bk < cfg_num_banks; bk++) {
       emit_trace("W", src_ch, src_pch, bg, bk, sa, row, col);
@@ -474,60 +421,31 @@ static void emit_input_broadcast(tensor_info_t *t,
   }
 }
 
+/* The compiler bakes a bus width into every vector width it picks. Ours must match,
+ * or the artifact was tuned for a machine this run is not modelling. */
+static void check_compiler_dq_bits(int cfg_bits) {
+  if (__pim_dq_bits && __pim_dq_bits != cfg_bits)
+    fprintf(stderr,
+            "[%s] WARN: bus-width disagreement. The compiler chose vector widths for "
+            "a %d-bit bus; this run models %d-bit. Vector accesses are priced against "
+            "a width the artifact never assumed.\n",
+            "simdram", (int)__pim_dq_bits, cfg_bits);
+}
+
 static void destroy_dedup_state(void) {
   if (g_dedup)               { addr_dedup_destroy(g_dedup);              g_dedup = NULL; }
-  if (g_compute_row_dedup)   { addr_dedup_destroy(g_compute_row_dedup);  g_compute_row_dedup = NULL; }
 }
 
-/* Track program-id transitions on each access entry. Resets the dedup
- * states whose scope just closed:
- *   - g_dedup                reset on ANY pid axis change
- *   - g_dedup_invariant_yz   reset on pid_x change
- *   - g_dedup_invariant_xz   reset on pid_y change
- *   - g_dedup_invariant_xy   reset on pid_z change
- *
- * g_dedup_persistent is xyz-invariant — it never resets on pid changes
- * (only on phase change in simdram_set_phase). */
-static void advance_program_epoch_if_needed(void) {
-  int pid = __pim_get_program_id();
-  int pid_y = __pim_get_program_id_y();
-  int pid_z = __pim_get_program_id_z();
-
-  int x_changed = (pid != last_program_id);
-  int y_changed = (pid_y != last_program_id_y);
-  int z_changed = (pid_z != last_program_id_z);
-
-  if (!(x_changed || y_changed || z_changed))
-    return;
-
-  last_program_id = pid;
-  last_program_id_y = pid_y;
-  last_program_id_z = pid_z;
-
-  if (g_dedup)              addr_dedup_reset(g_dedup);
-  (void)x_changed; (void)y_changed; (void)z_changed;
-}
-
-/* Resolve the dedup state to consult based on the current load
- * classification (set by __pim_load_persistent[_*]). Returns NULL when
- * no dedup applies (dedup disabled, or ACCUMULATOR-side ops we
- * deliberately don't dedup across the per-pid scope). */
+/* NULL when dedup is disabled (PIM_DEDUP=0 ablation). */
 static addr_dedup_state_t *pick_load_dedup_state(const tensor_info_t *t) {
   (void)t;
-  if (!g_dedup_enabled)
-    return NULL;
-  /* Every load routes through g_dedup (the faithful per-pid host-replay
-   * collapse). The blank cross-pid persistent reuse dedups were removed
-   * 2026-06-22 — verified inert on SIMDRAM (matmul/matvec/conv cycles + ops
-   * byte-identical; compute-bound, and the persistent skips were redundant
-   * with the per-pid / leader-bank / compute-row collapses). */
-  return g_dedup;
+  return g_dedup_enabled ? g_dedup : NULL;
 }
 
 static void account_load_dedup_skip(tensor_info_t *t,
                                     const addr_dedup_state_t *which) {
   (void)which;
-  t->dedup_skips++;  /* all skips are now the per-pid g_dedup host-replay collapse */
+  t->dedup_skips++;
 }
 
 /*
@@ -675,14 +593,30 @@ static int g_optipim_mul_formula = 1;
  * on raw bits via MAJ-3 gates).  Any float opcode receives cost 0 and
  * produces no trace output.
  */
+static int g_warned_unpriced_op = 0;
+
 static int maj_cost(int opcode) {
   int n = cfg_pe_bits;
   switch (opcode) {
+  /* FLOAT OPS SHARE THE FIXED-POINT POLYNOMIALS. SIMDRAM is bit-serial
+   * processing-using-memory: a MAJ-3 gate count over n bit-planes, with no
+   * mantissa or exponent hardware anywhere in this model. An fp16 kernel is
+   * therefore priced as 16-bit FIXED POINT, which is what OptiPIM does too (one
+   * dataWidth field, no float path, m_pe_bits used for every tensor). Charging
+   * them identically is the symmetric choice.
+   * They used to fall to the default and cost ZERO. That silently deleted the
+   * entire arithmetic charge the moment kernels moved to fp16: matmul_64x64x64 on
+   * SIMDRAM read 3,476,951 cycles at int32 and 32,783 at fp16, a 106x free
+   * speedup that was pure metering loss. Caught by the invariants golden
+   * 2026-09-09. */
   case SIMDRAM_OP_MUL:
+  case SIMDRAM_OP_FMUL:
     return g_optipim_mul_formula ? (7 * n * n + 1)
                                  : (11 * n * n - 5 * n - 1);
   case SIMDRAM_OP_ADD:
   case SIMDRAM_OP_SUB:
+  case SIMDRAM_OP_FADD:
+  case SIMDRAM_OP_FSUB:
     return 8 * n + 1;
   case SIMDRAM_OP_AND:
   case SIMDRAM_OP_OR:
@@ -695,9 +629,18 @@ static int maj_cost(int opcode) {
     return n;
   case SIMDRAM_OP_DIV:
   case SIMDRAM_OP_REM:
+  case SIMDRAM_OP_FDIV:
+  case SIMDRAM_OP_FREM:
     return 8 * n * n + 12 * n;
   default:
-    /* Float ops and anything else: not supported, skip silently */
+    /* Genuinely unmodelled opcode. Returning 0 here is how the float ops silently
+     * went free, so make it LOUD rather than silent. */
+    if (!g_warned_unpriced_op) {
+      g_warned_unpriced_op = 1;
+      fprintf(stderr, "[simdram] WARNING: opcode %d has no MAJ cost and is being "
+                      "charged ZERO. Any cycle count including it understates the "
+                      "arithmetic.\n", opcode);
+    }
     return 0;
   }
 }
@@ -739,6 +682,7 @@ void simdram_init(const char *trace_file) {
     cfg_num_cols = atoi(v);
   if ((v = getenv("SIMDRAM_DQ_BITS")))
     cfg_dq_bits = atoi(v);
+  check_compiler_dq_bits(cfg_dq_bits);
   if ((v = getenv("SIMDRAM_PE_BITS")))
     cfg_pe_bits = atoi(v);
 
@@ -766,11 +710,24 @@ void simdram_init(const char *trace_file) {
   /* Placement scheme. PIM_SIMDRAM_LAYOUT=pinned reverts to legacy
    * one-tensor-per-bank placement; default is "interleaved" (bit-walk
    * distribution within one (ch=0, pch=0)). */
-  const char *layout_env = getenv("PIM_SIMDRAM_LAYOUT");
-  if (layout_env && layout_env[0] == 'p') {
+  /* Compiler decision first, env second and announced. Mirrors pim_runtime.c: the
+   * scheme used to be a runtime default with only an env var to change it, so the
+   * artifact had no say in its own placement. 1 = the legacy pinned scheme here,
+   * 2 = interleaved, 0 = the kernel said nothing. */
+  cfg_layout_scheme = SIMDRAM_LAYOUT_INTERLEAVED;
+  if (__pim_layout_scheme == 1)
     cfg_layout_scheme = SIMDRAM_LAYOUT_PINNED;
-  } else {
-    cfg_layout_scheme = SIMDRAM_LAYOUT_INTERLEAVED;
+  const char *layout_env = getenv("PIM_SIMDRAM_LAYOUT");
+  if (layout_env) {
+    simdram_layout_scheme_t want = (layout_env[0] == 'p')
+                                       ? SIMDRAM_LAYOUT_PINNED
+                                       : SIMDRAM_LAYOUT_INTERLEAVED;
+    if (__pim_layout_scheme && want != cfg_layout_scheme)
+      fprintf(stderr,
+              "[simdram] WARN: PIM_SIMDRAM_LAYOUT=%s overrides the compiler's "
+              "placement scheme. Addresses no longer follow the artifact.\n",
+              layout_env);
+    cfg_layout_scheme = want;
   }
   g_interleaved_next_linear = 0;
   fprintf(stderr,
@@ -797,7 +754,6 @@ void simdram_init(const char *trace_file) {
   const char *dedup_env = getenv("PIM_DEDUP");
   g_dedup_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
 
-
   /* Per-consuming-bank input replication is always on; disabling it
    * would model a non-existent infinite cross-bank broadcast cache. */
   stat_input_replication_writes = 0;
@@ -820,37 +776,21 @@ void simdram_init(const char *trace_file) {
           "[simdram] leader_bank_only=%d (set PIM_LEADER_BANK_ONLY=0 to disable)\n",
           g_leader_bank_only_enabled);
 
-  /* BCAST_W input-replication shortcut. Defaults OFF (per-bank WR
-   * fanout — symmetric with OptiPIM). Set PIM_BCAST_W=1 to enable the
-   * SIMDRAM-paper BCAST_W extension (single broadcast event). */
-  const char *bcast_env = getenv("PIM_BCAST_W");
-  g_bcast_w_enabled = (bcast_env && bcast_env[0] == '1') ? 1 : 0;
-  fprintf(stderr,
-          "[simdram] bcast_w=%d (set PIM_BCAST_W=1 to use SIMDRAM BCAST_W extension)\n",
-          g_bcast_w_enabled);
-
-  last_program_id = last_program_id_y = last_program_id_z = -1;
   if (g_dedup_enabled) {
-    /* Capacity hints: per-pid state sees one tile's worth of accesses
-     * (small); persistent states accumulate across all pids in the
-     * COMPUTE phase (big). 256k slots cover the largest workloads we
-     * model with comfortable load factor. */
     const int perpid_cap = 4096;
-    const int persistent_cap = 262144;
     g_dedup              = addr_dedup_create(perpid_cap);
-    g_compute_row_dedup  = addr_dedup_create(persistent_cap);
   }
 
   /* Compute-row residency (corrected Lever 2). Defaults ON — models
    * SIMDRAM's column-parallel TRA so per-row compute cost matches
-   * OptiPIM's per-temporal-step emission. PIM_ROW_COMPUTE_DEDUP=0
+   * OptiPIM's per-temporal-step emission. PIM_K_AMORT=0
    * disables (ablation: every arithmetic op fires its full maj_cost). */
-  const char *row_dedup_env = getenv("PIM_ROW_COMPUTE_DEDUP");
-  g_compute_row_dedup_enabled = (row_dedup_env && row_dedup_env[0] == '0') ? 0 : 1;
-  stat_compute_row_skips = 0;
+  const char *k_amort_env = getenv("PIM_K_AMORT");
+  g_k_amort_enabled = (k_amort_env && k_amort_env[0] == '0') ? 0 : 1;
+  stat_k_amort_skips = 0;
   fprintf(stderr,
-          "[simdram] row_compute_dedup=%d (set PIM_ROW_COMPUTE_DEDUP=0 to disable)\n",
-          g_compute_row_dedup_enabled);
+          "[simdram] k_amort=%d (set PIM_K_AMORT=0 to charge every arithmetic op in full)\n",
+          g_k_amort_enabled);
 
   /* K-axis batch amortization: emit one MAJ-3 cost block every BATCH
    * compute_traces of the same opcode.
@@ -931,11 +871,18 @@ static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role)
     simdram_role_t derived = br ? SIMDRAM_ROLE_OPERAND : SIMDRAM_ROLE_STREAMED;
     if (derived == host_role)
       return;
+    /* REPORTS, never overrides, and that asymmetry with pim_runtime.c is deliberate:
+     * see the rationale above. Considered making both targets override on 2026-09-10
+     * and reverted, because SIMDRAM's OPERAND emits nothing by design, symmetrically
+     * with OptiPIM's simdram codegen, so taking the derived role here could invent a
+     * cost the baseline never charges. Same word, different meaning per target.
+     * The line is a WARN so invariant 6 turns it into a failure rather than a note
+     * nobody reads. */
     const char *hs = (host_role == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
     const char *ds = (derived == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
     fprintf(stderr,
-            "[simdram] ROLE DISAGREEMENT tensor %d: host says %s, compiler layout "
-            "says %s (bank_replicated=%d). SIMDRAM charges these differently "
+            "[simdram] WARN ROLE DISAGREEMENT tensor %d: host says %s, compiler "
+            "layout says %s (bank_replicated=%d). SIMDRAM charges these differently "
             "(OPERAND is free), so this shape's cost is suspect.\n",
             tensor_id, hs, ds, (int)br);
     const char *strict = getenv("PIM_STRICT_ROLES");
@@ -961,8 +908,8 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->role = role;
   simdram_check_compiler_role(num_tensors, role);
   t->emitted_R = t->emitted_W = 0;
-  t->emitted_BR = t->emitted_BW = t->emitted_WB = 0;
-  t->dedup_skips = t->persistent_skips = 0;
+  t->emitted_BR = t->emitted_BW = 0;
+  t->dedup_skips = 0;
 
   int total = 1;
   for (int i = 0; i < ndims && i < 4; i++) {
@@ -1105,12 +1052,9 @@ void simdram_set_phase(simdram_phase_t phase) {
   const char *names[] = {"IDLE", "COMPUTE", "HOST"};
   if (phase <= SIMDRAM_PHASE_HOST)
     fprintf(stderr, "[simdram] Phase -> %s\n", names[phase]);
-  /* Phase change resets all dedup states, including the xyz-invariant
-   * persistent one. The PE-register-cache model is bounded to a
-   * single COMPUTE phase. */
+  /* Phase change resets the dedup state. */
   if (cur_phase != phase) {
     if (g_dedup)              addr_dedup_reset(g_dedup);
-    if (g_compute_row_dedup)  addr_dedup_reset(g_compute_row_dedup);
     g_compute_trace_count = 0;
     memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   }
@@ -1141,19 +1085,24 @@ void simdram_finalize(void) {
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
   fprintf(stderr, "[simdram]   Dedup hits     : %" PRIu64 " (enabled=%d)\n",
           addr_dedup_hits(g_dedup), g_dedup_enabled);
+  if (addr_dedup_saturations(g_dedup))
+    fprintf(stderr,
+            "[simdram]   WARN dedup table saturated      : %" PRIu64
+            " (collapse stopped; trace over-emits)\n",
+            addr_dedup_saturations(g_dedup));
   fprintf(stderr, "[simdram]   Input replication writes        : %" PRIu64 "\n",
           stat_input_replication_writes);
   fprintf(stderr, "[simdram]   Leader-bank skips               : %" PRIu64 " (enabled=%d)\n",
           stat_leader_bank_skips, g_leader_bank_only_enabled);
-  fprintf(stderr, "[simdram]   Compute-row dedup skips         : %" PRIu64 " (enabled=%d)\n",
-          stat_compute_row_skips, g_compute_row_dedup_enabled);
+  fprintf(stderr, "[simdram]   K-amort skips                   : %" PRIu64 " (enabled=%d)\n",
+          stat_k_amort_skips, g_k_amort_enabled);
   fprintf(stderr, "[simdram]   K-amort emissions               : %" PRIu64 " (batch=%d)\n",
           stat_k_amort_emissions, g_k_amort_batch);
 
   fprintf(stderr,
           "\n[simdram] === Per-tensor breakdown ===\n"
-          "[simdram]   tid  role             R          W         BR         BW         WB  "
-          "dedup_skips  pers_skips\n");
+          "[simdram]   tid  role             R          W         BR         BW  "
+          "dedup_skips\n");
   for (int i = 0; i < num_tensors; i++) {
     tensor_info_t *t = &tensors[i];
     const char *role_str = (t->role == SIMDRAM_ROLE_STREAMED)  ? "STREAMED"
@@ -1161,11 +1110,11 @@ void simdram_finalize(void) {
                                                                : "ACCUMUL.";
     fprintf(stderr,
             "[simdram]   %3d  %-9s  %10" PRIu64 " %10" PRIu64 " %10" PRIu64
-            " %10" PRIu64 " %10" PRIu64 "  %11" PRIu64 "  %10" PRIu64 "\n",
+            " %10" PRIu64 "  %11" PRIu64 "\n",
             i, role_str,
             t->emitted_R, t->emitted_W,
-            t->emitted_BR, t->emitted_BW, t->emitted_WB,
-            t->dedup_skips, t->persistent_skips);
+            t->emitted_BR, t->emitted_BW,
+            t->dedup_skips);
   }
 
   destroy_dedup_state();
@@ -1198,11 +1147,6 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
     stat_ignored++;
     return;
   }
-
-  /* Track program-id transitions so per-pid dedup states reset at the
-   * right cadence. The runtime calls __pim_get_program_id* (set by the
-   * harness around each kernel launch). */
-  advance_program_epoch_if_needed();
 
   int tidx = find_tensor(addr);
   if (tidx < 0) {
@@ -1316,35 +1260,22 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
   }
 }
 
-void __mem_trace_load(void *addr, uint64_t size) {
+/* SIMDRAM prices one bit-serial expansion per ELEMENT and discards both the byte
+ * size and the lane count: a vector access is the same expansion repeated, and the
+ * host replay hands us one element per call. Accepted so the ABI matches the pass
+ * and the HBM runtime. */
+void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes) {
+  (void)size; (void)lanes;
   if (!trace_fp)
     return;
   simdram_trace_access((uint64_t)addr, 0);
 }
 
-void __mem_trace_store(void *addr, uint64_t size) {
+void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes) {
+  (void)size; (void)lanes;
   if (!trace_fp)
     return;
   simdram_trace_access((uint64_t)addr, 1);
-}
-
-/* MemTracePass classifies pointer-chain provenance and routes loads with
- * program-id-invariance to these dedicated entry points. The
- * classification ID lives in cur_load_class for the duration of the
- * single trace_access call below; pick_load_dedup_state consumes it
- * to choose the right dedup scope, then we reset to NORMAL.
- *
- * Caveat documented for future readers: the bit-serial column-lockstep
- * note that previously stubbed these out applies only to MAJ-3 GATE
- * ops (the cost-loop in __compute_trace), NOT to operand-load bit-row
- * reads. Operand re-reads of the same row buffer ARE idempotent and
- * dedup-safe; we route them through the dedup states like HBM-PIM. */
-/* Single persistent load entry point (the _yz/_xz/_xy variants were
- * consolidated away 2026-06-22 with the blank axis-scope reuse dedups). All
- * pid-invariant loads route to the faithful per-pid g_dedup collapse, same as
- * a normal load — so this is just __mem_trace_load. */
-void __pim_load_persistent(void *addr, uint64_t size) {
-  __mem_trace_load(addr, size);
 }
 
 /* ================================================================
@@ -1482,16 +1413,16 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
    * (half the instrumented sites) by ~14x. */
   int op_slot = (opcode >= 0 && opcode < SIMDRAM_OP_COUNT) ? opcode
                                                            : SIMDRAM_OP_OTHER;
-  if (g_compute_row_dedup_enabled && g_k_amort_batch > 1) {
+  if (g_k_amort_enabled && g_k_amort_batch > 1) {
     g_compute_trace_count_by_op[op_slot]++;
     if ((g_compute_trace_count_by_op[op_slot] % (uint64_t)g_k_amort_batch) != 1) {
-      stat_compute_row_skips++;
+      stat_k_amort_skips++;
       return;
     }
     g_compute_trace_count++;
     stat_k_amort_emissions++;
     cost = maj_cost(opcode);
-  } else if (g_compute_row_dedup_enabled) {
+  } else if (g_k_amort_enabled) {
     /* BATCH=1 → emit this opcode's MAJ-3 every compute_trace (no
      * amortization). The honest per-arithmetic-op baseline. */
     cost = maj_cost(opcode);

@@ -15,6 +15,9 @@ struct addr_dedup_state {
   int mask;           /* capacity - 1 */
   uint32_t cur_epoch; /* 0 reserved as "empty"/uninitialized */
   uint64_t hits;
+  int live;           /* slots claimed at cur_epoch */
+  uint64_t grows;     /* doublings; a nonzero value means the create() hint was low */
+  uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
 
 /* Pack three keys into one uint64. Layout (LSB→MSB):
@@ -57,7 +60,45 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
   s->mask = capacity - 1;
   s->cur_epoch = 1; /* epoch 0 reserved as "empty" */
   s->hits = 0;
+  s->live = 0;
+  s->grows = 0;
+  s->saturations = 0;
   return s;
+}
+
+/* Double the table, rehashing only the entries live at cur_epoch (older epochs are
+ * logically empty). Returns 0 if the allocation fails, leaving the table untouched.
+ *
+ * WHY THIS EXISTS: the capacity used to be fixed at create() from a caller hint, and
+ * a full table falls back to "treat as new". The lockstep hint was sized to the PE
+ * register file, which has nothing to do with how many distinct addresses one
+ * program-id touches, so on large tiles the table filled partway through and the
+ * collapse silently stopped collapsing. On matmul 128x3072x768 that inflated bank
+ * reads 1,769,472 -> 2,668,032 and cycles 14,545,807 -> 21,150,357 (2026-09-10). */
+static int addr_dedup_grow(addr_dedup_state_t *s) {
+  int newcap = s->capacity * 2;
+  if (newcap <= s->capacity)
+    return 0; /* int overflow */
+  dedup_slot_t *ns = (dedup_slot_t *)calloc((size_t)newcap, sizeof(dedup_slot_t));
+  if (!ns)
+    return 0;
+  int newmask = newcap - 1;
+  for (int i = 0; i < s->capacity; i++) {
+    if (s->slots[i].epoch != s->cur_epoch)
+      continue;
+    uint64_t k = s->slots[i].key;
+    int idx = (int)(mix64(k) & (uint64_t)newmask);
+    while (ns[idx].epoch == s->cur_epoch)
+      idx = (idx + 1) & newmask;
+    ns[idx].key = k;
+    ns[idx].epoch = s->cur_epoch;
+  }
+  free(s->slots);
+  s->slots = ns;
+  s->capacity = newcap;
+  s->mask = newmask;
+  s->grows++;
+  return 1;
 }
 
 int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
@@ -78,17 +119,37 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
       }
       /* live collision — keep probing */
     } else {
-      /* empty or stale slot — claim it for this epoch */
+      /* empty or stale slot — claim it, growing first if we are at the load target */
+      if (s->live + 1 > s->capacity / 2 && addr_dedup_grow(s)) {
+        idx = (int)(h & (uint64_t)s->mask);
+        for (;;) {
+          dedup_slot_t *g = &s->slots[idx];
+          if (g->epoch == s->cur_epoch) {
+            if (g->key == key) { /* cannot happen: we probed to a free slot */
+              s->hits++;
+              return 0;
+            }
+            idx = (idx + 1) & s->mask;
+            continue;
+          }
+          g->key = key;
+          g->epoch = s->cur_epoch;
+          s->live++;
+          return 1;
+        }
+      }
       slot->key = key;
       slot->epoch = s->cur_epoch;
+      s->live++;
       return 1;
     }
     idx = (idx + 1) & s->mask;
   }
 
-  /* Table fully occupied at current epoch — fall back to "new" (over-emit
-   * but never under-emit). In practice the 50% load target keeps us far
-   * from this case for any realistic per-program-id access count. */
+  /* No room and growth failed (allocation refused). Fall back to "new": over-emit,
+   * never under-emit. Counted, and both runtimes print the count, because a silent
+   * fallback here reads as a faithful trace while the collapse has stopped working. */
+  s->saturations++;
   return 1;
 }
 
@@ -101,10 +162,19 @@ void addr_dedup_reset(addr_dedup_state_t *s) {
     memset(s->slots, 0, (size_t)s->capacity * sizeof(dedup_slot_t));
     s->cur_epoch = 1;
   }
+  s->live = 0;
 }
 
 uint64_t addr_dedup_hits(const addr_dedup_state_t *s) {
   return s ? s->hits : 0;
+}
+
+uint64_t addr_dedup_saturations(const addr_dedup_state_t *s) {
+  return s ? s->saturations : 0;
+}
+
+int addr_dedup_capacity(const addr_dedup_state_t *s) {
+  return s ? s->capacity : 0;
 }
 
 void addr_dedup_destroy(addr_dedup_state_t *s) {
