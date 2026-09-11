@@ -27,7 +27,7 @@
  * else says which tensor is the output once reuse_class stopped travelling, and the
  * SIMDRAM occupancy charge needs the OUTPUT footprint specifically. The drift check
  * below catches a half-rebuilt pair loudly. */
-#define PIM_LAYOUT_REC_WORDS (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
+#define PIM_LAYOUT_REC_WORDS (5 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Word offsets within one record. Index through these, never a literal: a bare rec[3]
  * survived a width change once and silently read num_axes as bank_replicated. */
@@ -36,6 +36,11 @@
 #define PIM_LW_NUM_AXES 2
 #define PIM_LW_IS_STORE 3
 #define PIM_LW_AXES_BASE 4
+/* TAIL word, after the padded axis block, so every index above keeps its value.
+ * The factor a rank-collapsing reduce hid from the store's footprint. It MULTIPLIES
+ * the derived occupancy, and is 1 unless a reduce sits between the loop-carried
+ * accumulator and the store, so it is the identity on every kernel but split-K. */
+#define PIM_LW_LIVE_SPLIT (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on Mach-O when
  * nothing defines the symbol, which is the normal case whenever

@@ -391,6 +391,13 @@ static uint64_t stat_input_replication_writes = 0;
  *   leader  (default) gate ON,  denominator = output tile / banks.  What ships.
  *   paired            gate OFF, denominator = output tile.          Both /32 removed.
  *
+ * A third model keyed on the PHYSICAL bank (simdram.cpp's own rule: keep the elements
+ * whose local_bank_id is 0, break) was built and REFUTED on 2026-09-11. Their key
+ * discounts only because they never replay; ours replays the kernel once per lane, so
+ * swapping the key without also fixing the replay left all 32 lanes alive (+30.5x bank
+ * reads, W=0, geomean over 6 shapes) -- for these tile widths every lane's elements
+ * land in bank 0. Their gate needs their walk; see MECHANISM_CHECKLIST.
+ *
  * `paired` is the diagnostic: if the gate really only drops replicas of lane 0's work
  * then the two arms emit the SAME bank reads, and if they differ the gate is dropping
  * distinct work. It keys on __pim_get_bank_id(), the harness replay lane, while every
@@ -953,6 +960,16 @@ static int64_t simdram_derived_k_amort_batch(void) {
     int64_t cells = 1;
     for (int a = 0; a < naxes; a++)
       cells *= (int64_t)rec[PIM_LW_AXES_BASE + a * PIM_FP_AXIS_WORDS];
+    /* Scale by whatever a rank-collapsing reduce hid from the store. A split-K
+     * kernel keeps SPLIT_K partial sums live per output and sums them once at the
+     * end, so the store sees BLOCK while the row holds BLOCK*SPLIT_K. Without this
+     * the occupancy is frozen at the output width and the lever measures nothing:
+     * on matvec 512x64 the derived batch read 16 at every SPLIT_K from 1 to 64.
+     * 1 on every kernel whose stored value IS its accumulator, so this multiply is
+     * the identity everywhere else. */
+    int64_t split = rec[PIM_LW_LIVE_SPLIT];
+    if (split < 1) split = 1;   /* absent or malformed reads as no collapse */
+    cells *= split;
     int64_t occ = cells / banks;
     if (occ < 1) occ = 1;
     if (occ > row_values) occ = row_values;
