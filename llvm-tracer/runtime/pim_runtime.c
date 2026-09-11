@@ -319,11 +319,12 @@ static uint64_t stat_coalesce_overflow = 0;
  *      Collapses the bank-replicas the host-replay over-emits (`for pid: for
  *      bank: kernel()` runs each kernel ~32x/phase) into one SIMD dispatch ==
  *      OptiPIM single_bank_opt. Faithful HW model; keep.
- *   2. BROADCAST COLLAPSE  (is_broadcast_operand, ROW_DUP)  — a broadcast operand
- *      (matvec x, conv weight) is one WB bus-broadcast per element per program-id;
- *      the 32 bank-replicas collapse via the lockstep set keyed on the logical
- *      element. (The old per-bank LRU register-residency was retired 2026-09-04:
- *      operand reuse is now the kernel tile, not a runtime cache.)
+ *   (A BROADCAST COLLAPSE keyed on the logical element used to sit here. Its
+ *      ROW_DUP layout_kind was deleted in 36a995c and the residual dead branch in
+ *      2026-09-11, so a broadcast operand is now indistinguishable from any other
+ *      operand load and pays per receiving bank. Reason is baseline symmetry, not
+ *      hardware: see the note at the collapse site. Do not re-add without a
+ *      matching change on OptiPIM's side, which is not ours to make.)
  *   (The per-pid accumulator store dedup that used to sit here was DELETED
  *      2026-09-09: it was subsumed by the lockstep collapse, whose gate is a
  *      superset and whose key is strictly coarser, so it could never fold anything
@@ -1556,15 +1557,12 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * STREAMED tensors (each PE reads its own bank-local slice via BR)
    * still collapse — those are genuine SIMD-bank-parallel bank-reads,
    * not bus broadcasts. */
-  /* A ROW_DUP operand is a BROADCAST (same value to every bank, e.g. matvec x).
-   * Physically that is ONE bus broadcast, not 32 per-bank writes, so let lockstep
-   * collapse the 32 replicas and emit a single WB (below). Only a BANK_SPREAD
-   * operand (distinct value per PE) bypasses collapse and pays per-bank W. This
-   * replaces the residency LRU that used to dedup the broadcast. */
-  /* EVERY operand load bypasses the collapse and pays its per-bank write: that is
-   * the per-PE register-load bus cost OptiPIM also charges. (The ROW_DUP broadcast
-   * exception added 2026-09-04 is reverted; see emit_access_by_role_phase.) */
-  int is_broadcast_operand = 0;
+  /* EVERY operand load bypasses the collapse and pays its per-bank write, broadcasts
+   * included. Real HBM-PIM does have an all-bank GRF broadcast (Lee et al. ISCA'21
+   * III-A/III-B), so this is a SYMMETRY choice, not a hardware limit: OptiPIM prices
+   * input loading per PU inside its MILP objective, and taking the broadcast without
+   * re-solving their optimizer would charge us for a dispatch the baseline never
+   * gets. Both stacks now charge one write per receiving bank. */
   int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
@@ -1574,21 +1572,11 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
      * OUT of the key: collapsing those IS the all-bank SIMD model. */
     uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write);
-    uint64_t key_row, key_col;
     /* The dispatch id rides in k2 above the linear row, so two dispatches touching
      * the same physical tuple stay distinct while the 32 bank replays of ONE
      * dispatch still collapse. Replaces resetting the table per program instance. */
-    if (is_broadcast_operand) {
-      /* A broadcast replicates the SAME logical element across all banks, so its
-       * physical loc differs per bank (ROW_DUP puts each copy in its own row) and
-       * would defeat the collapse. Key on the logical element index instead, which
-       * is bank-independent, so the 32 bank-replicas dedup to one WB. */
-      key_row = (uint64_t)((addr - (uint64_t)t->base_addr) / t->elem_size);
-      key_col = 0;
-    } else {
-      key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-      key_col = (uint64_t)loc.col;
-    }
+    uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+    uint64_t key_col = (uint64_t)loc.col;
     key_row |= cur_dispatch << g_dispatch_shift;
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key, key_row,
                                    key_col)) {
