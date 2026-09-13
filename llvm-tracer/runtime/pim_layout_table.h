@@ -27,7 +27,7 @@
  * else says which tensor is the output once reuse_class stopped travelling, and the
  * SIMDRAM occupancy charge needs the OUTPUT footprint specifically. The drift check
  * below catches a half-rebuilt pair loudly. */
-#define PIM_LAYOUT_REC_WORDS (5 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
+#define PIM_LAYOUT_REC_WORDS (6 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Word offsets within one record. Index through these, never a literal: a bare rec[3]
  * survived a width change once and silently read num_axes as bank_replicated. */
@@ -41,6 +41,10 @@
  * the derived occupancy, and is 1 unless a reduce sits between the loop-carried
  * accumulator and the store, so it is the identity on every kernel but split-K. */
 #define PIM_LW_LIVE_SPLIT (4 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
+/* SECOND TAIL word. Output cells in ONE LANE that consume a single loaded value, so a
+ * bit-serial machine has to write the value into that many columns. 1 on every tensor
+ * whose value feeds exactly one cell, which is every matvec and every accumulator. */
+#define PIM_LW_CELL_FANOUT (5 + PIM_MAX_FP_AXES * PIM_FP_AXIS_WORDS)
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on Mach-O when
  * nothing defines the symbol, which is the normal case whenever
@@ -90,12 +94,18 @@ __attribute__((weak)) extern const int32_t __pim_persistent;
  * makes a disagreement sayable. 0 means the kernel predates the emission. */
 __attribute__((weak)) extern const int32_t __pim_dq_bits;
 
+/* Lanes the kernel was compiled for (threadsPerWarp = num_banks). The SIMDRAM occupancy
+ * divisor and the leader gate assume one lane per bank; if this disagrees with the
+ * configured bank count the charge shifts by their ratio. 0 = the kernel did not say. */
+__attribute__((weak)) extern const int32_t __pim_lanes;
+
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
 const int32_t __pim_layout_rec_words = 0;
 const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
+const int32_t __pim_lanes = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;

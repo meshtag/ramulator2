@@ -3,6 +3,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Argument.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
@@ -146,8 +147,8 @@ static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
             break;
           case Intrinsic::masked_scatter:
             if (II->getArgOperand(0) == cur) {   // (value, <vec ptr>, align, mask)
-              DestAddr = nullptr;                 // vector of ptrs → current_acc
-              return II;
+              DestAddr = II->getArgOperand(1);    // vector of ptrs; emission strips it
+              return II;                          // to the tensor argument
             }
             break;
           case Intrinsic::fmuladd:
@@ -190,6 +191,58 @@ static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
     }
   }
 
+  return nullptr;
+}
+
+/* The kernel pointer ARGUMENT a destination derives from, or nullptr. Strips GEPs,
+ * casts, and the splat (insertelement / shufflevector) a vector-of-pointers GEP is
+ * built on. An Argument dominates every instruction, and under lane placement its base
+ * address resolves to the executing lane's bank, so passing it when the exact element
+ * pointer cannot be passed keeps the compute charge in the right bank instead of
+ * leaving the runtime to guess from the most recently touched accumulator. */
+/* Pointer-chasing half, no vector merging: used to decide whether two edges of a vector
+ * build agree on their base argument. */
+static Value *argumentBaseOfSingle(Value *V) {
+  SmallSet<Value *, 16> seen;
+  while (V && seen.insert(V).second) {
+    if (isa<Argument>(V))
+      return V;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) { V = GEP->getPointerOperand(); continue; }
+    if (auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
+    if (auto *CE = dyn_cast<ConstantExpr>(V)) { V = CE->getOperand(0); continue; }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+static Value *argumentBaseOf(Value *V) {
+  SmallSet<Value *, 16> seen;
+  while (V && seen.insert(V).second) {
+    if (isa<Argument>(V))
+      return V;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) { V = GEP->getPointerOperand(); continue; }
+    if (auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
+    /* Only when every lane of the vector comes from ONE base. Following operand 1 of a
+     * chain, or operand 0 of a two-source shuffle, otherwise names whichever argument
+     * happens to be on that edge and charges the compute to the wrong tensor. */
+    if (auto *IE = dyn_cast<InsertElementInst>(V)) {
+      Value *base = argumentBaseOfSingle(IE->getOperand(0));
+      Value *ins = argumentBaseOfSingle(IE->getOperand(1));
+      if (base && ins && base != ins)
+        return nullptr;
+      V = ins ? IE->getOperand(1) : IE->getOperand(0);
+      continue;
+    }
+    if (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
+      if (!isa<UndefValue, PoisonValue>(SV->getOperand(1)) &&
+          argumentBaseOfSingle(SV->getOperand(0)) != argumentBaseOfSingle(SV->getOperand(1)))
+        return nullptr;
+      V = SV->getOperand(0);
+      continue;
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(V)) { V = CE->getOperand(0); continue; }
+    return nullptr;
+  }
   return nullptr;
 }
 
@@ -266,8 +319,13 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
         Value *Dest = NullPtr;
         if (DestAddr) {
           auto *DestI = dyn_cast<Instruction>(DestAddr);
-          if (!DestI || DT.dominates(DestI, BO)) {
+          bool scalarPtr = !DestAddr->getType()->isVectorTy();
+          if (scalarPtr && (!DestI || DT.dominates(DestI, BO))) {
             Dest = DestAddr;
+            if (Dest->getType() != PtrTy)
+              Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
+          } else if (Value *Base = argumentBaseOf(DestAddr)) {
+            Dest = Base; // the tensor, when the element cannot be named
             if (Dest->getType() != PtrTy)
               Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
           }

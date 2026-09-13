@@ -183,3 +183,94 @@ void addr_dedup_destroy(addr_dedup_state_t *s) {
   free(s->slots);
   free(s);
 }
+
+/* ---- slot map --------------------------------------------------------------- */
+struct slot_map {
+  uint64_t *keys; /* stored key+1 so 0 marks empty */
+  int32_t *vals;
+  size_t cap, n;
+};
+
+static inline uint64_t slot_hash(uint64_t k) {
+  k ^= k >> 33; k *= 0xFF51AFD7ED558CCDULL; k ^= k >> 33;
+  k *= 0xC4CEB9FE1A85EC53ULL; k ^= k >> 33; return k;
+}
+
+slot_map_t *slot_map_create(size_t hint) {
+  slot_map_t *m = (slot_map_t *)calloc(1, sizeof(*m));
+  if (!m) return NULL;
+  size_t cap = 1024;
+  while (cap < hint * 2) cap <<= 1;
+  m->cap = cap;
+  m->keys = (uint64_t *)calloc(cap, sizeof(uint64_t));
+  m->vals = (int32_t *)calloc(cap, sizeof(int32_t));
+  if (!m->keys || !m->vals) { free(m->keys); free(m->vals); free(m); return NULL; }
+  return m;
+}
+
+void slot_map_clear(slot_map_t *m) {
+  if (!m)
+    return;
+  memset(m->keys, 0, m->cap * sizeof(*m->keys));
+  memset(m->vals, 0, m->cap * sizeof(*m->vals));
+  m->n = 0;
+}
+
+void slot_map_destroy(slot_map_t *m) {
+  if (!m) return;
+  free(m->keys); free(m->vals); free(m);
+}
+
+static int slot_map_grow(slot_map_t *m) {
+  size_t ncap = m->cap << 1;
+  uint64_t *nk = (uint64_t *)calloc(ncap, sizeof(uint64_t));
+  int32_t *nv = (int32_t *)calloc(ncap, sizeof(int32_t));
+  if (!nk || !nv) { free(nk); free(nv); return 0; }
+  for (size_t i = 0; i < m->cap; i++) {
+    if (!m->keys[i]) continue;
+    size_t j = slot_hash(m->keys[i]) & (ncap - 1);
+    while (nk[j]) j = (j + 1) & (ncap - 1);
+    nk[j] = m->keys[i]; nv[j] = m->vals[i];
+  }
+  free(m->keys); free(m->vals);
+  m->keys = nk; m->vals = nv; m->cap = ncap;
+  return 1;
+}
+
+int32_t slot_map_get_or_put(slot_map_t *m, int lane, int elem, int32_t fresh,
+                            int *inserted) {
+  *inserted = 0;
+  if (m->n * 2 >= m->cap && !slot_map_grow(m)) return -1;
+  uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
+  size_t i = slot_hash(key) & (m->cap - 1);
+  for (;;) {
+    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* below the flag bits */
+    if (m->keys[i] == 0) { m->keys[i] = key; m->vals[i] = fresh; m->n++; *inserted = 1; return fresh; }
+    i = (i + 1) & (m->cap - 1);
+  }
+}
+
+int slot_map_test_and_set(slot_map_t *m, int lane, int elem, int bit) {
+  uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
+  size_t i = slot_hash(key) & (m->cap - 1);
+  for (;;) {
+    if (m->keys[i] == key) {
+      int32_t mask = (int32_t)1 << bit;
+      int prev = (m->vals[i] & mask) ? 1 : 0;
+      m->vals[i] |= mask;
+      return prev;
+    }
+    if (m->keys[i] == 0) return -1;
+    i = (i + 1) & (m->cap - 1);
+  }
+}
+
+int32_t slot_map_peek(const slot_map_t *m, int lane, int elem) {
+  uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
+  size_t i = slot_hash(key) & (m->cap - 1);
+  for (;;) {
+    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF;
+    if (m->keys[i] == 0) return -1;
+    i = (i + 1) & (m->cap - 1);
+  }
+}

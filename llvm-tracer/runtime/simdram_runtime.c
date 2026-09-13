@@ -34,11 +34,9 @@
  * polynomials in pe_bits). Every instruction pays its full bit-serial
  * cost — no K-collapse, no per-tensor amortization.
  *
- * Operand R loads (accumulator reads in particular) DO go through the
- * standard load dedup states; this approximates DRAM row-buffer
- * locality, which Ramulator2 also models at the controller level for
- * both stacks. This is a defensible idempotent re-read collapse, not
- * a compute amortization.
+ * Accumulator read-out is emitted once per (lane, cell): a loop-carried value is
+ * resident in its own bank after the first touch, and the slot's marker bit says so.
+ * That is residency the compiler states, not an address-collapse heuristic.
  *
  * Note: this differs from OptiPIM's SimDRAMCodeGen, which emits a
  * single fixed-length block of 7*pe_bits^2+1 BR ops per output cell
@@ -67,72 +65,16 @@ static int cfg_num_cols = 64;
 static int cfg_dq_bits = 128;
 static void check_compiler_dq_bits(int cfg_bits);
 static int64_t simdram_derived_k_amort_batch(void);
+static void flush_all_lanes(void);
 
 static int cfg_pe_bits = 16;
 
-/* Placement scheme. Selectable via PIM_SIMDRAM_LAYOUT env var:
- *
- *   "pinned"      — legacy. Each tensor lives entirely at one
- *                  (ch, pch, bg, bank), packed into row_groups inside
- *                  that one bank's subarrays. Compute fires at the
- *                  accumulator's pinned bank → only ~3 banks (one per
- *                  tensor) ever see commands → no bank-level
- *                  parallelism for SIMDRAM compute, even though we pay
- *                  the cost of replicating inputs to 16 banks via the
- *                  always-on input-replication fanout.
- *
- *   "interleaved" (default) — bit-interleaved placement within ONE
- *                  (ch, pch=0) pair. All tensors share the 16-bank
- *                  window of pch 0. Sequential elements walk
- *                  DQ → bank-in-BG → BG → col → row_group, so adjacent
- *                  element ranges land at different banks. The
- *                  accumulator's elements distribute across many banks,
- *                  so per-cell MAJ-3 sequences fire on different banks
- *                  in parallel. Mirrors OptiPIM's m_spatial_banks
- *                  distribution of output cells, with input replication
- *                  already handling per-consumer-bank operand presence.
- *
- *                  Constraint: cfg_num_banks, cfg_num_bg, cfg_num_cols,
- *                  cfg_dq_bits MUST all be powers of two. simdram_init
- *                  enforces this when interleaved mode is selected.
- *
- *                  Atomic placement unit: one element's pe_bits-row
- *                  bit-serial layout. Multiple values (= dq_bits per
- *                  col_slot) share a col_slot in one bank — those
- *                  cannot be split, which is why DQ is the LSB of the
- *                  bit-walk. Tensors smaller than dq_bits elements
- *                  (e.g. y vector for matvec_64x64 with M=64) fit in
- *                  one col_slot of one bank and don't benefit from
- *                  spreading; tensors >= dq_bits × num_banks_per_pch
- *                  (= 2048 in default config) distribute across all
- *                  16 banks. */
-typedef enum {
-  SIMDRAM_LAYOUT_PINNED = 0,
-  SIMDRAM_LAYOUT_INTERLEAVED = 1,
-} simdram_layout_scheme_t;
+/* Placement is lane placement, nothing else: a tensor the compiler stamped partitioned
+ * or an accumulator lives in the executing lane's own bank, in row groups claimed as
+ * its slab grows; an OPERAND is pre-stored and emits nothing. The interleaved and
+ * pinned address maps that used to decide banks from element bits were deleted on
+ * 2026-09-12 once no measured path read them. */
 
-static simdram_layout_scheme_t cfg_layout_scheme = SIMDRAM_LAYOUT_INTERLEAVED;
-
-/* In interleaved mode, the next free linear-element position. Tensors
- * are appended consecutively in the global linear-element address space
- * within (ch=0, pch=0) and aligned to a dq_bits boundary so a new
- * tensor doesn't share a packed col_slot with the previous one. */
-static uint64_t g_interleaved_next_linear = 0;
-
-/* Compute log2(n) where n is a power of two. Returns -1 for n<=0 or
- * non-power-of-2. Used by map_element_interleaved to derive bit field
- * widths from the runtime cfg_* values. */
-static int ilog2_pow2(int n) {
-  if (n <= 0)
-    return -1;
-  /* Reject non-powers-of-2: a power of 2 has exactly one set bit. */
-  if ((n & (n - 1)) != 0)
-    return -1;
-  int k = 0;
-  while ((1 << k) < n)
-    k++;
-  return k;
-}
 
 /*
  * SIMDRAM subarray row groups (paper §3.1, Fig. 2).
@@ -170,6 +112,7 @@ static int cfg_data_rows_per_sa;
  *  Tensor registry
  * ================================================================ */
 #define MAX_TENSORS 16
+#define SIMDRAM_MAX_LANES 64
 
 typedef struct {
   void *base_addr;
@@ -179,27 +122,25 @@ typedef struct {
   int num_elements;
   simdram_role_t role;
 
-  /* Physical placement in HBM */
-  int assigned_ch;
-  int assigned_pch;
-  int assigned_bg;
-  int assigned_bank;
-  int base_row;            /* linear row across all subarrays */
-  int elems_per_col_slot;  /* complete values sharing one column
-                              slot across a row group (= dq_bits) */
-  int elems_per_row_group; /* complete values in one row group
-                              (pe_bits rows × num_cols cols)
-                              = num_cols × dq_bits              */
   int acc_tracker_idx;     /* index into acc_trackers[] or -1   */
-
-  /* Placement scheme this tensor was registered under. For PINNED, the
-   * tensor's data lives in (assigned_ch, assigned_pch, assigned_bg,
-   * assigned_bank) starting at base_row. For INTERLEAVED, the
-   * layout_linear_base offsets the element index into the global
-   * bit-interleaved address space within (ch=0, pch=0); the per-tensor
-   * assigned_* fields are unused for placement (kept = 0). */
-  simdram_layout_scheme_t layout_scheme;
-  uint64_t layout_linear_base;
+  /* Compiler's partition bit from the layout table: 1 replicated, 0 bank-partitioned,
+   * -1 not stated. Only 0 changes anything: that tensor is delivered to the executing
+   * lane's own bank instead of fanned out, see note_lane_consumption. */
+  int bank_replicated;
+  /* Row groups of this tensor's per-lane slab, the same in every bank, CLAIMED AS THE
+   * SLAB GROWS from a per-bank pool at the top of the row space. No size is guessed:
+   * how much a lane touches depends on the launch grid, which no compile-time number
+   * knows, and the old "twice the even share" overflowed on conv halos. */
+  int *lane_rg;
+  int lane_rg_n, lane_rg_cap;
+  int lane_ord[SIMDRAM_MAX_LANES]; /* next free value slot per lane */
+  int lane_flushed[SIMDRAM_MAX_LANES]; /* VALUES already written out, per lane */
+  slot_map_t *lane_slot;   /* (lane, elem) -> slot; partitioned STREAMED and ACCUMULATOR */
+  /* Cells in this lane that one CONSUMED value feeds through a tile broadcast, from the
+   * compiler. Sharing that shows up as repeated loads is counted by the loads themselves;
+   * this covers only the sharing that never reaches memory, such as matmul's b[k,n] being
+   * multiplied into every row of the tile. 1 until the artifact says otherwise. */
+  int cell_fanout;
 
   /* Per-tensor DRAM-opcode counters. Each emission in the trace file is
    * attributed to exactly one tensor by the call site (compute_trace BRs
@@ -209,7 +150,7 @@ typedef struct {
   uint64_t emitted_W;      /* regular DRAM write (W)  */
   uint64_t emitted_BR;     /* bank-read MAJ-3 op (BR) */
   uint64_t emitted_BW;     /* bank-write         (BW) — reserved, currently unused on SIMDRAM */
-  uint64_t dedup_skips;    /* (bank, sa·rows+row+bit, col) coalesced */
+  uint64_t dedup_skips;    /* re-touches of a resident (lane, cell): read out once */
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -225,7 +166,6 @@ static int finalized = 0;
 
 /* Per-bank linear row allocation, indexed by flat bank id */
 #define MAX_BANKS 4096
-static int next_free_row[MAX_BANKS];
 
 /* Per-accumulator-tensor location tracking.
  * Each registered ACCUMULATOR tensor gets its own tracker entry so that
@@ -251,43 +191,9 @@ static uint64_t stat_writes = 0;
 static uint64_t stat_compute_ops = 0;
 static uint64_t stat_ignored = 0;
 
-/* ================================================================
- *  Dedup state — operand-load coalescing
- *
- * Mirrors pim_runtime.c's dedup design but applies only to
- * operand-load trace ops (STREAMED W ops, ACCUMULATOR R ops, HOST
- * R/W ops). The bit-serial gate ops emitted by __compute_trace are
- * NOT routed through this — each MAJ-3 gate is a distinct
- * computation that the simulator must count.
- *
- * For the bit-serial bit-row reads of an operand: the runtime emits
- * `pe_bits` ops at coords (..., base_row + bit, col) for bit in
- * [0, pe_bits). Two distinct kernel loads of the *same* operand
- * element resolve to the same `(bank, sa·rows+base_row+bit, col)`
- * tuple at every bit, and dedup collapses them on the second load.
- * Different operand elements resolve to different physical tuples
- * (different base_row, or different col, or different bank) and
- * are not collapsed.
- *
- * Scope keys:
- *   key1 = global_bank
- *   key2 = sa * cfg_num_rows + base_row + bit
- *   key3 = col
- *
- * Reset cadence: PHASE change only, i.e. the collapse spans the whole kernel.
- *
- * That scope is chosen to match the baseline rather than by preference. OptiPIM's
- * simdram codegen declares its equivalent table before the temporal loop, under the
- * comment "We only need to load input once", and never clears it
- * (simulator/src/pim_codegen/impl/simdram.cpp:110). Resetting per program instance,
- * as this did until 2026-09-10, charged an input element once per instance where the
- * baseline charges it once per kernel. Measured cost of the asymmetry: matmul
- * 128x512x256 STREAMED writes 1,048,576 -> 65,536 and cycles -1.8%, conv 16x16 3x3
- * 65,536 -> 4,096 and cycles -0.2%, single-instance shapes unchanged. The table grows
- * on demand, so the wider scope needs no capacity hint.
- */
-static addr_dedup_state_t *g_dedup = NULL;
-static int g_dedup_enabled = 1;
+/* The whole-kernel load dedup that lived here is gone (2026-09-12): delivery and
+ * read-out are per (lane, element) slot, which is residency the compiler states
+ * (partitioned load, loop-carried accumulator), not an address heuristic. */
 
 /* K-AMORTIZATION BATCHING: one MAJ block emitted every g_k_amort_batch compute traces.
  * RENAMED 2026-09-09 from g_compute_row_dedup_enabled / PIM_ROW_COMPUTE_DEDUP.
@@ -360,7 +266,6 @@ static uint64_t stat_k_amort_emissions = 0;
  * symmetry with the baseline, never turned on, and deleted 2026-09-10. Turning it on
  * would have collapsed the fanout to a single event and taken us below a cost the
  * baseline pays. */
-static uint64_t stat_input_replication_writes = 0;
 
 /* Leader-bank-only emission gate (mirrors OptiPIM `single_bank_opt`).
  *
@@ -374,9 +279,9 @@ static uint64_t stat_input_replication_writes = 0;
  * 32 banks emitted in parallel.
  *
  * Concretely: the host harness iterates (pid × bank_id) calling the
- * kernel. With the gate on, only the bank_id == 0 iteration emits
- * COMPUTE-phase ops; bank_id 1..N skip. HOST-phase setup ops are
- * unaffected (per-bank input placement is not uniform across banks).
+ * kernel. With the gate on, only the bank_id == 0 iteration emits the
+ * gated COMPUTE-phase ops; bank_id 1..N skip. HOST-phase accesses have
+ * no placement model since 2026-09-12 and are ignored with a WARN.
  *
  * Matches OptiPIM SimDRAMCodeGen at simdram.cpp:136-142 (emits first
  * bank's row_col_accesses then breaks the spatial loop). Soundness
@@ -391,6 +296,12 @@ static uint64_t stat_input_replication_writes = 0;
  *   leader  (default) gate ON,  denominator = output tile / banks.  What ships.
  *   paired            gate OFF, denominator = output tile.          Both /32 removed.
  *
+ * The gate covers compute, partial-sum readout and the delivery of REPLICATED or
+ * unstated inputs. A bank-PARTITIONED input (compiler bank_replicated == 0) bypasses it
+ * since 2026-09-12: every lane places its own elements in its own bank, see
+ * note_lane_consumption and flush_all_lanes, so there is nothing for the gate to
+ * sample there and no fanout to cancel against it.
+ *
  * A third model keyed on the PHYSICAL bank (simdram.cpp's own rule: keep the elements
  * whose local_bank_id is 0, break) was built and REFUTED on 2026-09-11. Their key
  * discounts only because they never replay; ours replays the kernel once per lane, so
@@ -401,8 +312,8 @@ static uint64_t stat_input_replication_writes = 0;
  * `paired` is the diagnostic: if the gate really only drops replicas of lane 0's work
  * then the two arms emit the SAME bank reads, and if they differ the gate is dropping
  * distinct work. It keys on __pim_get_bank_id(), the harness replay lane, while every
- * physical bank in the trace comes from map_element(), which reads the element index
- * and never the lane, so the prediction is genuinely at risk. */
+ * physical bank in the trace now comes from lane placement, so the two arms differ
+ * only by the gate and the divisor. */
 typedef enum { SIMDRAM_LANE_LEADER = 0, SIMDRAM_LANE_PAIRED = 1 } simdram_lane_model_t;
 static simdram_lane_model_t g_lane_model = SIMDRAM_LANE_LEADER;
 static int g_leader_bank_only_enabled = 1;
@@ -418,40 +329,49 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
           col);
 }
 
-static int compute_global_bank(int ch, int pch, int bg, int bank) {
-  int banks_per_pch = cfg_num_bg * cfg_num_banks;
-  int banks_per_ch = cfg_num_pch * banks_per_pch;
-  return ch * banks_per_ch + pch * banks_per_pch + bg * cfg_num_banks + bank;
-}
+static uint64_t stat_lane_placed_writes = 0;
+/* Per-bank pool of row groups for lane slabs, claimed downward from the top of the row
+ * space. Nothing else places rows on SIMDRAM any more (OPERAND emits nothing, STREAMED
+ * and ACCUMULATOR are lane-placed), so there is no allocator below to collide with. */
+static int g_lane_rg_top = -1;
+static uint64_t stat_lane_rg_claimed = 0;
 
-/* Emit one regular write per receiving bank: the input bit-row has to land in every
- * bank that will compute on it. See the note above for why this is a fanout and not
- * a broadcast.
- *
- * ACROSS BOTH PSEUDOCHANNELS since 2026-09-10, because the address map now spreads a
- * tile over all 32 banks and an operand in pch 0 is not visible to a consumer in
- * pch 1. An all-bank PIM command reaches the banks of ONE pseudochannel, so this is
- * two dispatches rather than one, and it costs twice the writes. That is the honest
- * price of using the whole 32-bank machine we already grant the baseline, and
- * pretending one dispatch covered both is exactly the BCAST_W mistake. src_pch is
- * therefore ignored: every consuming bank is written, wherever the source sat. */
-static void emit_input_broadcast(tensor_info_t *t,
-                                 int src_ch, int src_pch,
-                                 int src_bg, int src_bank,
-                                 int sa, int row, int col) {
-  (void)src_pch;
-  (void)src_bg;
-  (void)src_bank;
-  for (int pch = 0; pch < cfg_num_pch; pch++) {
-    for (int bg = 0; bg < cfg_num_bg; bg++) {
-      for (int bk = 0; bk < cfg_num_banks; bk++) {
-        emit_trace("W", src_ch, pch, bg, bk, sa, row, col);
-        stat_writes++;
-        t->emitted_W++;
-        stat_input_replication_writes++;
-      }
+/* Physical row group for slab row group `idx` of tensor t, claiming from the top of the
+ * row space on first use. Returns -1 once the pool is exhausted (WARNs once). */
+static int lane_rg_for(tensor_info_t *t, int idx) {
+  static int warned = 0;
+  while (idx >= t->lane_rg_n) {
+    if (t->lane_rg_n == t->lane_rg_cap) {
+      int ncap = t->lane_rg_cap ? t->lane_rg_cap * 2 : 8;
+      int *n = (int *)realloc(t->lane_rg, (size_t)ncap * sizeof(int));
+      if (!n) return -1;
+      t->lane_rg = n; t->lane_rg_cap = ncap;
     }
+    if (g_lane_rg_top < 0)
+      g_lane_rg_top = (cfg_num_sa * cfg_data_rows_per_sa) / cfg_pe_bits;
+    if (g_lane_rg_top <= 0) {
+      if (!warned++)
+        fprintf(stderr, "[simdram] WARN row space exhausted while growing a lane slab; "
+                        "placement beyond this point aliases row group 0.\n");
+      t->lane_rg[t->lane_rg_n++] = 0;
+      continue;
+    }
+    t->lane_rg[t->lane_rg_n++] = --g_lane_rg_top;
+    stat_lane_rg_claimed++;
   }
+  return t->lane_rg[idx];
+}
+extern uint64_t __pim_program_epoch; /* im_runtime.c, bumped per set_program_id */
+static uint64_t g_last_epoch = 0;
+
+
+/* Flat bank id -> (ch, pch, bg, bank), bank innermost. A replay lane in 0..31 is a
+ * flat bank id, so this is how "lane b" becomes "bank b". */
+static void decompose_global_bank(int g, int *ch, int *pch, int *bg, int *bank) {
+  *bank = g % cfg_num_banks; g /= cfg_num_banks;
+  *bg = g % cfg_num_bg;      g /= cfg_num_bg;
+  *pch = g % cfg_num_pch;    g /= cfg_num_pch;
+  *ch = g;
 }
 
 /* The compiler bakes a bus width into every vector width it picks. Ours must match,
@@ -465,22 +385,6 @@ static void check_compiler_dq_bits(int cfg_bits) {
             "simdram", (int)__pim_dq_bits, cfg_bits);
 }
 
-static void destroy_dedup_state(void) {
-  if (g_dedup)               { addr_dedup_destroy(g_dedup);              g_dedup = NULL; }
-}
-
-/* NULL when dedup is disabled (PIM_DEDUP=0 ablation). */
-static addr_dedup_state_t *pick_load_dedup_state(const tensor_info_t *t) {
-  (void)t;
-  return g_dedup_enabled ? g_dedup : NULL;
-}
-
-static void account_load_dedup_skip(tensor_info_t *t,
-                                    const addr_dedup_state_t *which) {
-  (void)which;
-  t->dedup_skips++;
-}
-
 /*
  * Find which registered tensor contains 'addr'.
  * Returns tensor index or -1 if not found.
@@ -492,111 +396,6 @@ static int find_tensor(uint64_t addr) {
       return i;
   }
   return -1;
-}
-
-/*
- * Bit-interleaved element-to-physical mapping for SIMDRAM.
- *
- * Address bit layout (LSB → MSB):
- *   [ DQ | bank-within-BG | BG | col | row_group_idx ]
- *
- * Sequential element indices first fill the DQ slot (dq_bits values
- * share one col_slot bit-serially), then advance through banks within a
- * BG, then BGs, then cols, then row_groups. All tensors live in
- * (ch=0, pch=0) so the 16-bank within-pch fanout of input replication
- * naturally covers every consumer bank.
- *
- * Atomic unit: one element's pe_bits-row bit-serial layout — the bits
- * of one value cannot be split across banks. DQ is therefore the LSB
- * (dq_bits values pack into one bank's col_slot at the same bit
- * position) and bank increments only after a col_slot is full.
- *
- * Field widths are derived from log2 of cfg_dq_bits, cfg_num_banks,
- * cfg_num_bg, cfg_num_cols at runtime — all four must be powers of
- * two, which simdram_init enforces when interleaved mode is selected.
- *
- * Worked example for the default 4-banks/BG × 4 BG config:
- *   bits 0..6   DQ (128 values per col_slot)
- *   bits 7..8   bank within BG (4)
- *   bits 9..10  BG (4)
- *   bits 11..16 col (64 cols)
- *   bits 17+    row_group_idx (each row_group = pe_bits rows in the SA)
- * Under that config: elements 0..127 share col_slot 0 of bank 0 of
- * BG 0; 128..255 advance to bank 1 of BG 0; after 4 banks (512 elements)
- * advance to BG 1; after 4 BGs (2048 elements) advance to col 1; etc. */
-static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
-                                    int *ch, int *pch, int *bg, int *bank,
-                                    int *sa, int *base_row, int *col) {
-  uint64_t linear = t->layout_linear_base + (uint64_t)elem_idx;
-
-  int log2_dq    = ilog2_pow2(cfg_dq_bits);
-  int log2_banks = ilog2_pow2(cfg_num_banks);
-  int log2_bg    = ilog2_pow2(cfg_num_bg);
-  int log2_cols  = ilog2_pow2(cfg_num_cols);
-
-  /* Strip the DQ bits — dq_bits values pack into one col_slot. */
-  linear >>= log2_dq;
-
-  *bank = (int)(linear & ((1ULL << log2_banks) - 1));
-  linear >>= log2_banks;
-
-  *bg = (int)(linear & ((1ULL << log2_bg) - 1));
-  linear >>= log2_bg;
-
-  /* PSEUDOCHANNEL, added 2026-09-10. The map used to pin pch=0, so a tile spread
-   * over 16 banks while the kernel was compiled for 32 lanes and the occupancy
-   * divisor divided by 32. Three numbers that had to agree and did not, and we were
-   * granting OptiPIM 32 banks through the num_banks attribute while placing our own
-   * data in half that. Above bg and below col, so consecutive elements fill all 32
-   * banks before advancing a column. */
-  int log2_pch = ilog2_pow2(cfg_num_pch);
-  *pch = (int)(linear & ((1ULL << log2_pch) - 1));
-  linear >>= log2_pch;
-
-  *col = (int)(linear & ((1ULL << log2_cols) - 1));
-  linear >>= log2_cols;
-
-  /* Remaining bits = row_group index within the bank's SAs. Each
-   * row_group occupies pe_bits consecutive rows; advance the linear
-   * row counter accordingly. */
-  uint64_t linear_row = linear * (uint64_t)cfg_pe_bits;
-  *sa = (int)(linear_row / (uint64_t)cfg_data_rows_per_sa);
-  *base_row = (int)(linear_row % (uint64_t)cfg_data_rows_per_sa);
-
-  /* One channel still. Spreading across channels would need the input fanout to
-   * cross a channel boundary, which no PIM command does. */
-  *ch = 0;
-}
-
-/*
- * Map a tensor element to physical HBM coordinates for SIMDRAM.
- *
- * Dispatches between the legacy pinned layout (one tensor → one bank,
- * compute serialized through that bank) and the bit-interleaved
- * layout (elements distributed across all banks in one (ch, pch)).
- *
- * Bit-serial layout: each element occupies pe_bits consecutive rows.
- * Within a row_group (pe_bits rows), each column stores dq_bits values.
- * Returns the base row of the pe_bits-row group containing this element.
- */
-static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
-                        int *bg, int *bank, int *sa, int *base_row, int *col) {
-  if (t->layout_scheme == SIMDRAM_LAYOUT_INTERLEAVED) {
-    map_element_interleaved(t, elem_idx, ch, pch, bg, bank, sa, base_row, col);
-    return;
-  }
-
-  *ch = t->assigned_ch;
-  *pch = t->assigned_pch;
-  *bg = t->assigned_bg;
-  *bank = t->assigned_bank;
-
-  int row_group_idx = elem_idx / t->elems_per_row_group;
-  *col = (elem_idx % t->elems_per_row_group) / t->elems_per_col_slot;
-
-  int linear_base = t->base_row + row_group_idx * cfg_pe_bits;
-  *sa = linear_base / cfg_data_rows_per_sa;
-  *base_row = linear_base % cfg_data_rows_per_sa;
 }
 
 /* PIM_MUL_OPTIPIM (default ON) selects the multiplication MAJ-3 cost.
@@ -740,64 +539,12 @@ void simdram_init(const char *trace_file) {
 
   num_tensors = 0;
   cur_phase = SIMDRAM_PHASE_IDLE;
-  memset(next_free_row, 0, sizeof(next_free_row));
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = 0;
   stat_compute_ops = stat_ignored = 0;
   num_acc_trackers = 0;
   current_acc = -1;
   initialized = 1;
   finalized = 0;
-
-  /* Placement scheme. PIM_SIMDRAM_LAYOUT=pinned reverts to legacy
-   * one-tensor-per-bank placement; default is "interleaved" (bit-walk
-   * distribution within one (ch=0, pch=0)). */
-  /* Compiler decision first, env second and announced. Mirrors pim_runtime.c: the
-   * scheme used to be a runtime default with only an env var to change it, so the
-   * artifact had no say in its own placement. 1 = the legacy pinned scheme here,
-   * 2 = interleaved, 0 = the kernel said nothing. */
-  cfg_layout_scheme = SIMDRAM_LAYOUT_INTERLEAVED;
-  if (__pim_layout_scheme == 1)
-    cfg_layout_scheme = SIMDRAM_LAYOUT_PINNED;
-  const char *layout_env = getenv("PIM_SIMDRAM_LAYOUT");
-  if (layout_env) {
-    simdram_layout_scheme_t want = (layout_env[0] == 'p')
-                                       ? SIMDRAM_LAYOUT_PINNED
-                                       : SIMDRAM_LAYOUT_INTERLEAVED;
-    if (__pim_layout_scheme && want != cfg_layout_scheme)
-      fprintf(stderr,
-              "[simdram] WARN: PIM_SIMDRAM_LAYOUT=%s overrides the compiler's "
-              "placement scheme. Addresses no longer follow the artifact.\n",
-              layout_env);
-    cfg_layout_scheme = want;
-  }
-  g_interleaved_next_linear = 0;
-  fprintf(stderr,
-          "[simdram] layout=%s (set PIM_SIMDRAM_LAYOUT=pinned to revert)\n",
-          cfg_layout_scheme == SIMDRAM_LAYOUT_INTERLEAVED ? "interleaved"
-                                                          : "pinned");
-
-  /* Power-of-2 guard for interleaved bit walk. */
-  if (cfg_layout_scheme == SIMDRAM_LAYOUT_INTERLEAVED) {
-    if (ilog2_pow2(cfg_num_banks) < 0 || ilog2_pow2(cfg_num_bg) < 0 ||
-        ilog2_pow2(cfg_num_cols) < 0 || ilog2_pow2(cfg_dq_bits) < 0) {
-      fprintf(stderr,
-              "[simdram] ERROR: interleaved layout requires power-of-2 "
-              "cfg_num_banks (%d), cfg_num_bg (%d), cfg_num_cols (%d), "
-              "cfg_dq_bits (%d). Set PIM_SIMDRAM_LAYOUT=pinned for "
-              "non-power-of-2 configs.\n",
-              cfg_num_banks, cfg_num_bg, cfg_num_cols, cfg_dq_bits);
-      exit(1);
-    }
-  }
-
-  /* Dedup state setup. PIM_DEDUP=0 disables (for ablation). */
-  destroy_dedup_state();
-  const char *dedup_env = getenv("PIM_DEDUP");
-  g_dedup_enabled = (dedup_env && dedup_env[0] == '0') ? 0 : 1;
-
-  /* Per-consuming-bank input replication is always on; disabling it
-   * would model a non-existent infinite cross-bank broadcast cache. */
-  stat_input_replication_writes = 0;
 
   /* MUL-formula override. Defaults OFF (paper Table 1: 11n²−5n−1).
    * Default ON (uses OptiPIM-symmetric 7n²+1); set PIM_MUL_OPTIPIM=0
@@ -821,17 +568,21 @@ void simdram_init(const char *trace_file) {
     exit(1);
   }
   g_leader_bank_only_enabled = (g_lane_model == SIMDRAM_LANE_LEADER) ? 1 : 0;
+  if (__pim_lanes > 0 && (int)__pim_lanes != cfg_num_pch * cfg_num_bg * cfg_num_banks)
+    fprintf(stderr, "[simdram] WARN kernel compiled for %d lanes, machine has %d banks; "
+                    "the occupancy divisor follows the kernel.\n",
+            (int)__pim_lanes, cfg_num_pch * cfg_num_bg * cfg_num_banks);
   stat_leader_bank_skips = 0;
+  stat_lane_placed_writes = 0;
+  stat_lane_rg_claimed = 0;
+  g_lane_rg_top = -1; /* fresh row space per run */
+  g_last_epoch = __pim_program_epoch;
   fprintf(stderr,
           "[simdram] lane_model=%s (leader_bank_only=%d; set PIM_LANE_MODEL=paired to "
           "drop the gate AND the matching /banks together)\n",
           g_lane_model == SIMDRAM_LANE_PAIRED ? "paired" : "leader",
           g_leader_bank_only_enabled);
 
-  if (g_dedup_enabled) {
-    const int perpid_cap = 4096;
-    g_dedup              = addr_dedup_create(perpid_cap);
-  }
 
   /* Compute-row residency (corrected Lever 2). Defaults ON — models
    * SIMDRAM's column-parallel TRA so per-row compute cost matches
@@ -884,10 +635,15 @@ void simdram_init(const char *trace_file) {
                 "footprint over the value in force.\n",
                 g_k_amort_batch, (long long)derived);
       g_k_amort_batch = (int)derived;
-    } else if ((int)__pim_layout_count > 0) {
+    } else {
+      /* Gating this on layout_count > 0 made the NO-TABLE case the quiet one, where the
+       * 8192 fallback stands and the occupancy charge is 64x too cheap (matmul 64x64x64
+       * BR 123,008 -> 1,922). A pass ablation that skips the residency pass then reads
+       * that as the pass's own win. Review 2026-09-12. */
       fprintf(stderr,
-              "[simdram] WARN no store footprint in the artifact, so k_amort_batch=%d "
-              "is whatever the caller supplied and the occupancy charge is unverified.\n",
+              "[simdram] WARN no store footprint in the artifact%s, so k_amort_batch=%d "
+              "is the fallback and the occupancy charge is unverified.\n",
+              (int)__pim_layout_count > 0 ? "" : " (no layout table at all)",
               g_k_amort_batch);
     }
   }
@@ -935,7 +691,11 @@ static int64_t simdram_derived_k_amort_batch(void) {
   /* The gate's half of the pair. Under `leader` one lane of `banks` survives and the
    * tile is divided by `banks`; under `paired` every lane emits and the division comes
    * off with it. Reading g_lane_model here is what keeps the two from drifting. */
-  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  /* The divisor is the COMPILER'S lane count when it travels: the gate keeps one lane
+   * of that many, so the same number must divide the tile. The configured bank count
+   * is checked against it at init, not silently substituted for it. */
+  int all_banks = __pim_lanes > 0 ? (int)__pim_lanes
+                                  : cfg_num_pch * cfg_num_bg * cfg_num_banks;
   if (all_banks < 1) all_banks = 1;
   int banks = (g_lane_model == SIMDRAM_LANE_PAIRED) ? 1 : all_banks;
   int64_t row_values = __pim_row_values ? (int64_t)__pim_row_values
@@ -979,6 +739,19 @@ static int64_t simdram_derived_k_amort_batch(void) {
   return best;
 }
 
+/* The map is the ACCUMULATOR's alone: it maps a cell to its slab slot and carries the
+ * read-out bit. STREAMED counts consumptions and never looks an element up. */
+static void simdram_ensure_lane_slot(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  if (t->role != SIMDRAM_ROLE_ACCUMULATOR || t->lane_slot)
+    return;
+  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  t->lane_slot = slot_map_create((size_t)(t->num_elements / all_banks) + 1);
+  if (!t->lane_slot)
+    fprintf(stderr, "[simdram] WARN tensor %d: slot map allocation failed; nothing will "
+                    "be placed for it.\n", tensor_id);
+}
+
 static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role) {
   /* Same cross-submodule width check as the HBM runtime: this TU strides the table
    * too, so it can misread it the same way. */
@@ -995,41 +768,53 @@ static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role)
     }
   }
   int n = (int)__pim_layout_count;
-  if (n <= 0)
-    return; /* weak fallback: this kernel carries no descriptor */
+  if (n <= 0) {
+    /* No descriptor at all (the residency pass was skipped). The host role is all we
+     * have, so placement follows it, and the WARN turns the run into an invariant-6
+     * failure. Returning silently here charged ZERO delivery for STREAMED tensors,
+     * a 64x under-charge that the review of 2026-09-12 measured. */
+    if (host_role != SIMDRAM_ROLE_OPERAND)
+      fprintf(stderr, "[simdram] WARN tensor %d (%s): kernel carries no layout table; "
+                      "placement follows the host role.\n", tensor_id,
+              host_role == SIMDRAM_ROLE_ACCUMULATOR ? "ACCUMULATOR" : "STREAMED");
+    simdram_ensure_lane_slot(tensor_id);
+    return;
+  }
   for (int i = 0; i < n; i++) {
     const int32_t *rec = __pim_layout_table + (size_t)i * PIM_LAYOUT_REC_WORDS;
     if (rec[PIM_LW_OPERAND_ARG] != tensor_id)
       continue;
     int32_t br = rec[PIM_LW_BANK_REPLICATED];
-    if (br < 0 || host_role == SIMDRAM_ROLE_ACCUMULATOR)
-      return; /* pass said nothing, or a store whose role is what it is */
-    /* bank_replicated=1 means every bank sees the same elements, which is what
-     * OPERAND asserts here; 0 means bank-partitioned, which is STREAMED. */
-    simdram_role_t derived = br ? SIMDRAM_ROLE_OPERAND : SIMDRAM_ROLE_STREAMED;
-    if (derived == host_role)
-      return;
-    /* REPORTS, never overrides, and that asymmetry with pim_runtime.c is deliberate:
-     * see the rationale above. Considered making both targets override on 2026-09-10
-     * and reverted, because SIMDRAM's OPERAND emits nothing by design, symmetrically
-     * with OptiPIM's simdram codegen, so taking the derived role here could invent a
-     * cost the baseline never charges. Same word, different meaning per target.
-     * The line is a WARN so invariant 6 turns it into a failure rather than a note
-     * nobody reads. */
-    const char *hs = (host_role == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
-    const char *ds = (derived == SIMDRAM_ROLE_OPERAND) ? "OPERAND" : "STREAMED";
-    fprintf(stderr,
-            "[simdram] WARN ROLE DISAGREEMENT tensor %d: host says %s, compiler "
-            "layout says %s (bank_replicated=%d). SIMDRAM charges these differently "
-            "(OPERAND is free), so this shape's cost is suspect.\n",
-            tensor_id, hs, ds, (int)br);
-    const char *strict = getenv("PIM_STRICT_ROLES");
-    if (strict && strict[0] == '1') {
-      fprintf(stderr, "[simdram] PIM_STRICT_ROLES=1, aborting.\n");
-      abort();
+    tensors[tensor_id].bank_replicated = (int)br;
+    int32_t cf = rec[PIM_LW_CELL_FANOUT];
+    tensors[tensor_id].cell_fanout = cf > 0 ? (int)cf : 1;
+    /* THE ROLE IS THE COMPILER'S, same rule as pim_runtime.c: is_store -> ACCUMULATOR,
+     * replicated -> OPERAND (pre-stored, free, symmetric with simdram.cpp's weight),
+     * partitioned -> STREAMED. The host string is checked, not obeyed. This used to
+     * only report, from when the derivation missed six of nine fixture tensors; it is
+     * complete now (invariant 8) and the compiler reads the layout it produced. */
+    simdram_role_t role = host_role;
+    if (rec[PIM_LW_IS_STORE] == 1)
+      role = SIMDRAM_ROLE_ACCUMULATOR;
+    else if (br >= 0)
+      role = br ? SIMDRAM_ROLE_OPERAND : SIMDRAM_ROLE_STREAMED;
+    if (role != host_role) {
+      static const char *names[] = {"STREAMED", "OPERAND", "ACCUMULATOR"};
+      fprintf(stderr, "[simdram] WARN tensor %d: host role %s, compiler layout says %s; "
+                      "taking the compiler's.\n", tensor_id,
+              (host_role >= 0 && host_role < 3) ? names[host_role] : "?", names[role]);
+      tensors[tensor_id].role = role;
     }
+    if (br < 0 && role != SIMDRAM_ROLE_OPERAND)
+      fprintf(stderr, "[simdram] WARN tensor %d (%s): compiler stated no partition bit; "
+                      "placement stays on the interleaved map.\n", tensor_id,
+              role == SIMDRAM_ROLE_ACCUMULATOR ? "ACCUMULATOR" : "STREAMED");
+    simdram_ensure_lane_slot(tensor_id);
     return;
   }
+  if (host_role != SIMDRAM_ROLE_OPERAND)
+    fprintf(stderr, "[simdram] WARN tensor %d: no layout record; placement stays on the "
+                    "interleaved map.\n", tensor_id);
 }
 
 int simdram_register_tensor(void *ptr, const int *dims, int ndims,
@@ -1044,7 +829,7 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->base_addr = ptr;
   t->elem_size = elem_size;
   t->role = role;
-  simdram_check_compiler_role(num_tensors, role);
+  t->cell_fanout = 1;
   t->emitted_R = t->emitted_W = 0;
   t->emitted_BR = t->emitted_BW = 0;
   t->dedup_skips = 0;
@@ -1057,132 +842,37 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->num_elements = total;
   t->total_bytes = (size_t)total * elem_size;
 
-  /*
-   * Bit-serial layout:
-   *
-   * One row group = pe_bits consecutive rows.  Within a row group:
-   *   - Each column slot is dq_bits bit-cells wide.
-   *   - One column slot across pe_bits rows stores dq_bits complete values
-   *     (one bit per value per row, dq_bits values per slot).
-   *   - A full row group stores num_cols × dq_bits complete values.
-   *
-   * A single TRA (triple-row activation) operates on the entire row width,
-   * so all num_cols × dq_bits values are computed in parallel.
-   */
-  t->elems_per_col_slot = cfg_dq_bits;
-  t->elems_per_row_group = cfg_num_cols * t->elems_per_col_slot;
-  t->layout_scheme = cfg_layout_scheme;
-  t->layout_linear_base = 0;
 
-  const char *role_str = (role == SIMDRAM_ROLE_STREAMED)  ? "STREAMED"
-                         : (role == SIMDRAM_ROLE_OPERAND) ? "OPERAND"
-                                                          : "ACCUMULATOR";
 
-  if (cfg_layout_scheme == SIMDRAM_LAYOUT_INTERLEAVED) {
-    /* Align tensor base to a dq_bits boundary so a new tensor doesn't
-     * partially share a packed col_slot with the previous one. */
-    g_interleaved_next_linear =
-        ((g_interleaved_next_linear + (uint64_t)cfg_dq_bits - 1) /
-         (uint64_t)cfg_dq_bits) *
-        (uint64_t)cfg_dq_bits;
-    t->layout_linear_base = g_interleaved_next_linear;
-    g_interleaved_next_linear += (uint64_t)total;
+  t->bank_replicated = -1;
+  if (t->lane_rg) { free(t->lane_rg); t->lane_rg = NULL; }
+  t->lane_rg_n = 0;
+  t->lane_rg_cap = 0;
+  memset(t->lane_ord, 0, sizeof(t->lane_ord));
+  memset(t->lane_flushed, 0, sizeof(t->lane_flushed));
+  if (t->lane_slot) { slot_map_destroy(t->lane_slot); t->lane_slot = NULL; }
+  /* After num_elements and the fields above: the check stores the compiler's
+   * partition bit and sizes the per-lane slab from the element count. */
+  simdram_check_compiler_role(num_tensors, role);
 
-    /* All interleaved tensors live in (ch=0, pch=0). assigned_bg/bank
-     * are placeholders; the actual physical placement is computed
-     * per-access via map_element_interleaved. */
-    t->assigned_ch = 0;
-    t->assigned_pch = 0;
-    t->assigned_bg = 0;
-    t->assigned_bank = 0;
-    t->base_row = 0;
-
-    /* Per-tensor accumulator tracker. In interleaved mode the tracker's
-     * (ch, pch, bg, bank, sa, row) is updated dynamically on every
-     * accumulator access (each cell lives at a different bank). The
-     * initial values are placeholders. */
-    t->acc_tracker_idx = -1;
-    if (role == SIMDRAM_ROLE_ACCUMULATOR && num_acc_trackers < MAX_ACC_TRACKERS) {
-      int idx = num_acc_trackers++;
-      t->acc_tracker_idx = idx;
-      acc_trackers[idx].tensor_idx = num_tensors;
-      acc_trackers[idx].ch = 0;
-      acc_trackers[idx].pch = 0;
-      acc_trackers[idx].bg = 0;
-      acc_trackers[idx].bank = 0;
-      acc_trackers[idx].sa = 0;
-      acc_trackers[idx].row = 0;
-      if (current_acc < 0)
-        current_acc = idx;
-    }
-
-    fprintf(stderr,
-            "[simdram] Tensor %d: %s, %d elems (%zu bytes), interleaved "
-            "in (ch=0, pch=0), linear_base=%" PRIu64 "\n",
-            num_tensors, role_str, total, t->total_bytes,
-            t->layout_linear_base);
-    return num_tensors++;
-  }
-
-  /* PINNED layout: each tensor lives at one assigned bank. */
-  int total_flat_banks =
-      cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-  int global_bank = num_tensors % total_flat_banks;
-
-  int banks_per_pch = cfg_num_bg * cfg_num_banks;
-  int banks_per_ch = cfg_num_pch * banks_per_pch;
-
-  t->assigned_ch = global_bank / banks_per_ch;
-  t->assigned_pch = (global_bank / banks_per_pch) % cfg_num_pch;
-  t->assigned_bg = (global_bank / cfg_num_banks) % cfg_num_bg;
-  t->assigned_bank = global_bank % cfg_num_banks;
-
-  /* Linear rows needed: ceil(total / elems_per_row_group) × pe_bits.
-   * Only D-group rows are usable for data (cfg_data_rows_per_sa per SA). */
-  int row_groups =
-      (total + t->elems_per_row_group - 1) / t->elems_per_row_group;
-  int rows_needed = row_groups * cfg_pe_bits;
-  int rows_capacity = cfg_num_sa * cfg_data_rows_per_sa;
-
-  if (next_free_row[global_bank] + rows_needed > rows_capacity) {
-    fprintf(stderr,
-            "[simdram] ERROR: tensor %d needs %d rows but bank "
-            "(ch=%d pch=%d bg=%d bank=%d) only has %d free of %d\n",
-            num_tensors, rows_needed, t->assigned_ch, t->assigned_pch,
-            t->assigned_bg, t->assigned_bank,
-            rows_capacity - next_free_row[global_bank], rows_capacity);
-    return -1;
-  }
-
-  t->base_row = next_free_row[global_bank];
-  next_free_row[global_bank] += rows_needed;
-
-  /* Initialize per-tensor accumulator tracker */
+  /* The tracker names the accumulator's most recent cell for compute traces the pass
+   * could not resolve; placement fills it on first touch. */
   t->acc_tracker_idx = -1;
-  if (role == SIMDRAM_ROLE_ACCUMULATOR && num_acc_trackers < MAX_ACC_TRACKERS) {
+  if (t->role == SIMDRAM_ROLE_ACCUMULATOR && num_acc_trackers < MAX_ACC_TRACKERS) {
     int idx = num_acc_trackers++;
     t->acc_tracker_idx = idx;
-    acc_trackers[idx].tensor_idx = num_tensors; /* not yet incremented */
-    acc_trackers[idx].ch = t->assigned_ch;
-    acc_trackers[idx].pch = t->assigned_pch;
-    acc_trackers[idx].bg = t->assigned_bg;
-    acc_trackers[idx].bank = t->assigned_bank;
-    acc_trackers[idx].sa = t->base_row / cfg_data_rows_per_sa;
-    acc_trackers[idx].row = t->base_row % cfg_data_rows_per_sa;
+    acc_trackers[idx].tensor_idx = num_tensors;
+    acc_trackers[idx].ch = 0; acc_trackers[idx].pch = 0;
+    acc_trackers[idx].bg = 0; acc_trackers[idx].bank = 0;
+    acc_trackers[idx].sa = 0; acc_trackers[idx].row = 0;
     if (current_acc < 0)
-      current_acc = idx; /* default to first registered accumulator */
+      current_acc = idx;
   }
-
-  int first_sa = t->base_row / cfg_data_rows_per_sa;
-  int last_sa = (t->base_row + rows_needed - 1) / cfg_data_rows_per_sa;
-
-  fprintf(stderr,
-          "[simdram] Tensor %d: %s, %d elems (%zu bytes), "
-          "ch=%d pch=%d bg=%d bank=%d sa=[%d..%d] rows=[%d..%d]\n",
-          num_tensors, role_str, total, t->total_bytes, t->assigned_ch,
-          t->assigned_pch, t->assigned_bg, t->assigned_bank, first_sa, last_sa,
-          t->base_row, t->base_row + rows_needed - 1);
-
+  fprintf(stderr, "[simdram] Tensor %d: %s, %d elems (%zu bytes), lane-placed\n",
+          num_tensors,
+          t->role == SIMDRAM_ROLE_OPERAND ? "OPERAND"
+          : t->role == SIMDRAM_ROLE_STREAMED ? "STREAMED" : "ACCUMULATOR",
+          total, t->total_bytes);
   return num_tensors++;
 }
 
@@ -1190,9 +880,10 @@ void simdram_set_phase(simdram_phase_t phase) {
   const char *names[] = {"IDLE", "COMPUTE", "HOST"};
   if (phase <= SIMDRAM_PHASE_HOST)
     fprintf(stderr, "[simdram] Phase -> %s\n", names[phase]);
-  /* Phase change resets the dedup state. */
+  /* Phase change: flush pending slabs, reset the k-amort counters. */
   if (cur_phase != phase) {
-    if (g_dedup)              addr_dedup_reset(g_dedup);
+    if (cur_phase == SIMDRAM_PHASE_COMPUTE)
+      flush_all_lanes(); /* the last lane has no successor to flush it */
     g_compute_trace_count = 0;
     memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   }
@@ -1204,6 +895,7 @@ void simdram_finalize(void) {
     return;
   finalized = 1;
 
+  flush_all_lanes(); /* a harness that never leaves COMPUTE still gets its slabs */
   if (trace_fp) {
     fclose(trace_fp);
     trace_fp = NULL;
@@ -1221,15 +913,10 @@ void simdram_finalize(void) {
   fprintf(stderr, "[simdram]   Ignored         : %" PRIu64 "\n", stat_ignored);
   fprintf(stderr, "[simdram]   Total SIMDRAM ops: %" PRIu64 "\n",
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
-  fprintf(stderr, "[simdram]   Dedup hits     : %" PRIu64 " (enabled=%d)\n",
-          addr_dedup_hits(g_dedup), g_dedup_enabled);
-  if (addr_dedup_saturations(g_dedup))
-    fprintf(stderr,
-            "[simdram]   WARN dedup table saturated      : %" PRIu64
-            " (collapse stopped; trace over-emits)\n",
-            addr_dedup_saturations(g_dedup));
-  fprintf(stderr, "[simdram]   Input replication writes        : %" PRIu64 "\n",
-          stat_input_replication_writes);
+  fprintf(stderr, "[simdram]   Lane row groups claimed         : %" PRIu64 "\n",
+          stat_lane_rg_claimed);
+  fprintf(stderr, "[simdram]   Lane-placed input writes        : %" PRIu64 "\n",
+          stat_lane_placed_writes);
   fprintf(stderr, "[simdram]   Leader-bank skips               : %" PRIu64 " (enabled=%d)\n",
           stat_leader_bank_skips, g_leader_bank_only_enabled);
   fprintf(stderr, "[simdram]   K-amort skips                   : %" PRIu64 " (enabled=%d)\n",
@@ -1240,7 +927,7 @@ void simdram_finalize(void) {
   fprintf(stderr,
           "\n[simdram] === Per-tensor breakdown ===\n"
           "[simdram]   tid  role             R          W         BR         BW  "
-          "dedup_skips\n");
+          "res_skips\n");
   for (int i = 0; i < num_tensors; i++) {
     tensor_info_t *t = &tensors[i];
     const char *role_str = (t->role == SIMDRAM_ROLE_STREAMED)  ? "STREAMED"
@@ -1255,7 +942,6 @@ void simdram_finalize(void) {
             t->dedup_skips);
   }
 
-  destroy_dedup_state();
   initialized = 0;
 }
 
@@ -1280,6 +966,168 @@ void __mem_trace_fini(void) { simdram_finalize(); }
  *
  * HOST phase: load → R, store → W
  */
+/* Delivery for a bank-PARTITIONED input. Lane b is bank b's PE (threads_per_warp ==
+ * num_banks, gpu.thread_id lowers to __pim_get_bank_id), so the element it loads
+ * belongs in bank b, in the next slot of that lane's slab (OptiPIM's alloc_col++ made
+ * explicit). Nothing is emitted here: slabs are written out at the program-instance
+ * boundary by flush_all_lanes, banks innermost. Emitting each slot's 16 bit-rows back
+ * to back at access time was 16 row misses per column and +40% on matvec, an ordering
+ * artifact not a cost.
+ * The (lane, elem) slot map is the only dedup: a re-load finds its slot and adds
+ * nothing. There is no fanout path any more; -1 WARNs at registration. */
+/* One column slot per CONSUMPTION, which is what OptiPIM allocates (simdram.cpp,
+ * alloc_col++ per output cell per tensor). Deduplicating by element instead forgave every
+ * value a lane reads more than once for different cells; on conv that is the R-by-S halo
+ * and it measured a 2.21x under-charge (review 2026-09-13). A separate load op is a
+ * separate consumption too, so unrolled channel chains need no multiplier of their own. */
+static void note_lane_consumption(tensor_info_t *t) {
+  static int warned_lane = 0, warned_wide = 0;
+  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int lane = __pim_get_bank_id();
+  if (lane < 0 || lane >= all_banks || lane >= SIMDRAM_MAX_LANES) {
+    if (!warned_lane++)
+      fprintf(stderr, "[simdram] WARN replay lane %d outside the %d banks; "
+                      "lane-placed delivery dropped.\n", lane, all_banks);
+    return;
+  }
+  t->lane_ord[lane]++;
+  if (t->lane_ord[lane] >= (1 << 24) && !warned_wide++)
+    fprintf(stderr, "[simdram] WARN lane slab exceeds 2^24 slots.\n");
+}
+
+/* Accumulator twin of the above, but the address is needed NOW: the partial sum is
+ * read and written every K step and every touch must land on the same slot. Bank is
+ * the executing lane's; (sa, row, col) from the slot. Overrides the tuple in place. */
+static int simdram_place_acc(tensor_info_t *t, int elem_idx, int peek, int *ch, int *pch,
+                             int *bg, int *bank, int *sa, int *base_row, int *col) {
+  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int lane = __pim_get_bank_id();
+  if (!t->lane_slot || lane < 0 || lane >= all_banks || lane >= SIMDRAM_MAX_LANES)
+    return 0;
+  int32_t slot;
+  if (peek) {
+    /* A compute trace names the tensor, not necessarily a cell it has touched; an
+     * absent cell is charged at the slab's first slot and no slot is created. */
+    slot = slot_map_peek(t->lane_slot, lane, elem_idx);
+    if (slot < 0)
+      slot = 0;
+  } else {
+    int inserted = 0;
+    slot = slot_map_get_or_put(t->lane_slot, lane, elem_idx, t->lane_ord[lane], &inserted);
+    if (slot < 0)
+      return 0;
+    if (inserted)
+      t->lane_ord[lane]++;
+  }
+  int col_slot = slot / cfg_dq_bits;
+  int rgp = lane_rg_for(t, col_slot / cfg_num_cols);
+  if (rgp < 0)
+    return 0;
+  int linear_row = rgp * cfg_pe_bits;
+  *sa = linear_row / cfg_data_rows_per_sa;
+  *base_row = linear_row % cfg_data_rows_per_sa;
+  *col = col_slot % cfg_num_cols;
+  decompose_global_bank(lane, ch, pch, bg, bank);
+  return 1;
+}
+
+/* Write every partitioned slab pending since the last flush, banks INNERMOST: for each
+ * (row group, bit-row, column) the lanes' banks are written round-robin, so the row
+ * misses of different banks overlap instead of adding. That is simdram.cpp's order,
+ * replica loop inside row and column. One lane's whole slab at a time was 32 serial
+ * banks and +17.8% on matvec; the old fanout was bank-parallel by accident and this
+ * makes it so on purpose, on the right addresses. Runs at the program-instance
+ * boundary, at phase end and at finalize. */
+static void flush_all_lanes(void) {
+  if (!trace_fp)
+    return;
+  int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int nl = all_banks < SIMDRAM_MAX_LANES ? all_banks : SIMDRAM_MAX_LANES;
+  for (int i = 0; i < num_tensors; i++) {
+    tensor_info_t *t = &tensors[i];
+    if (t->role != SIMDRAM_ROLE_STREAMED)
+      continue;
+    /* lane_flushed counts VALUES, not columns. A column that was written while
+     * partly full and has since gained values is written again: physically the
+     * 128-bit word of every bit-row is rewritten, which is what OptiPIM's per-step
+     * first_time_in_col charges too. Column-granular bookkeeping here delivered every
+     * value added after its column's first flush for free (review 2026-09-12: matmul
+     * 64x128x32 grid (1,2) wrote 512 where 1,024 were owed). */
+    /* Each consumed value occupies cell_fanout column slots, one per output cell in
+     * this lane that reads it. OptiPIM allocates the same way (simdram.cpp, alloc_col++
+     * per output cell per tensor, memo keyed by cell), and charging one slot per bank
+     * instead was a 64x discount on matmul. */
+    long long F = t->cell_fanout > 0 ? t->cell_fanout : 1;
+    long long slots[SIMDRAM_MAX_LANES], first[SIMDRAM_MAX_LANES];
+    long long lo = -1, hi = -1;
+    for (int l = 0; l < nl; l++) {
+      long long used = (long long)t->lane_ord[l] * F;
+      long long done = (long long)t->lane_flushed[l] * F;
+      slots[l] = (used + cfg_dq_bits - 1) / cfg_dq_bits;
+      first[l] = done / cfg_dq_bits;
+      if (used > done) {
+        if (lo < 0 || first[l] < lo) lo = first[l];
+        if (slots[l] - 1 > hi) hi = slots[l] - 1;
+      } else {
+        first[l] = slots[l]; /* nothing pending: exclude this lane below */
+      }
+    }
+    if (hi < 0)
+      continue;
+    for (long long rg = lo / cfg_num_cols; rg <= hi / cfg_num_cols; rg++) {
+      int rgp = lane_rg_for(t, (int)rg);
+      if (rgp < 0)
+        break;
+      int linear_row = rgp * cfg_pe_bits;
+      int sa = linear_row / cfg_data_rows_per_sa;
+      int base_row = linear_row % cfg_data_rows_per_sa;
+      for (int bit = 0; bit < cfg_pe_bits; bit++)
+        for (int col = 0; col < cfg_num_cols; col++) {
+          long long slot = rg * cfg_num_cols + col;
+          for (int l = 0; l < nl; l++) {
+            if (slot < first[l] || slot >= slots[l])
+              continue;
+            int ch, pch, bg, bank;
+            decompose_global_bank(l, &ch, &pch, &bg, &bank);
+            emit_trace("W", ch, pch, bg, bank, sa, base_row + bit, col);
+            stat_writes++;
+            t->emitted_W++;
+            stat_lane_placed_writes++;
+          }
+        }
+    }
+    for (int l = 0; l < nl; l++)
+      t->lane_flushed[l] = t->lane_ord[l];
+  }
+}
+
+/* A new program instance means every lane of the previous one has finished. */
+/* A program instance owns its own output cells, so the cells of the next instance are
+ * different cells and owe their own copy of whatever they read. OptiPIM has no instances
+ * at all: its spatial loop covers every output cell and re-allocates a column per cell,
+ * so keeping the slabs across the boundary made a re-read free that the baseline charges
+ * (worth ceil(M/BLOCK_M) on matmul's B). HBM dropped the same reuse on 2026-09-10.
+ * The row groups are kept: the next instance rewrites the same rows, it does not need new
+ * ones. */
+static void reset_streamed_slabs(void) {
+  for (int i = 0; i < num_tensors; i++) {
+    tensor_info_t *t = &tensors[i];
+    if (t->role != SIMDRAM_ROLE_STREAMED)
+      continue;
+    memset(t->lane_ord, 0, sizeof(t->lane_ord));
+    memset(t->lane_flushed, 0, sizeof(t->lane_flushed));
+  }
+}
+
+static void note_epoch_change(void) {
+  uint64_t e = __pim_program_epoch;
+  if (e == g_last_epoch)
+    return;
+  flush_all_lanes();
+  reset_streamed_slabs();
+  g_last_epoch = e;
+}
+
 static void simdram_trace_access(uint64_t addr, int is_write) {
   if (cur_phase == SIMDRAM_PHASE_IDLE) {
     stat_ignored++;
@@ -1299,60 +1147,56 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
     return;
   }
 
-  int ch, pch, bg, bank, sa, base_row, col;
-  map_element(t, elem_idx, &ch, &pch, &bg, &bank, &sa, &base_row, &col);
-  int global_bank = compute_global_bank(ch, pch, bg, bank);
+  if (cur_phase == SIMDRAM_PHASE_HOST) {
+    static int warned = 0;
+    if (!warned++)
+      fprintf(stderr, "[simdram] WARN HOST phase has no placement model; its accesses "
+                      "are ignored.\n");
+    stat_ignored++;
+    return;
+  }
+  /* Only an accumulator needs a tuple here: STREAMED is noted into its slab and written
+   * at the instance boundary, OPERAND emits nothing. Placed before the gate so the
+   * read-out, the tracker and the compute BR all agree on the lane's bank. */
+  int ch = 0, pch = 0, bg = 0, bank = 0, sa = 0, base_row = 0, col = 0;
+  if (cur_phase == SIMDRAM_PHASE_COMPUTE && t->role == SIMDRAM_ROLE_ACCUMULATOR &&
+      !(t->lane_slot &&
+        simdram_place_acc(t, elem_idx, 0, &ch, &pch, &bg, &bank, &sa, &base_row, &col))) {
+    stat_ignored++; /* no slab: allocation failed and WARNed at registration */
+    return;
+  }
 
   if (cur_phase == SIMDRAM_PHASE_COMPUTE) {
-    /* Leader-bank-only gate. COMPUTE-phase operand R/W happen in
-     * lockstep with compute_trace; gate them on the same bank.
-     * HOST phase (per-bank input setup) intentionally NOT gated. */
+    note_epoch_change();
+    if (!is_write && t->role == SIMDRAM_ROLE_STREAMED) {
+      note_lane_consumption(t); /* before the gate: every lane */
+      return;
+    }
+    /* Leader-bank-only gate for what is left: accumulator read-out, in lockstep with
+     * compute_trace. HOST phase not gated. */
     if (g_leader_bank_only_enabled && __pim_get_bank_id() != 0) {
       stat_leader_bank_skips++;
       return;
     }
     if (!is_write) {
-      addr_dedup_state_t *state = pick_load_dedup_state(t);
       switch (t->role) {
-      case SIMDRAM_ROLE_STREAMED:
       case SIMDRAM_ROLE_ACCUMULATOR: {
-        /* STREAMED: input → write bit-rows.
-         * ACCUMULATOR (load): output → read bit-rows.
-         *
-         * Both are bit-serial expansions over pe_bits row offsets at
-         * the same (bank, sa, col). Dedup is keyed by the per-bit
-         * physical tuple; the first load of an operand emits all
-         * pe_bits ops, a redundant load of the same operand collapses
-         * at every bit (each bit's tuple is already in the state).
-         *
-         * Soundness: STREAMED/ACCUMULATOR loads represent operand
-         * ingestion / partial-sum read. They are idempotent re-reads
-         * from the same physical row buffer — collapsing them is
-         * exactly the row-buffer-locality model PimCodeGen applies
-         * via single_bank_opt + first_time_in_col. */
-        const int is_acc = (t->role == SIMDRAM_ROLE_ACCUMULATOR);
-        for (int bit = 0; bit < cfg_pe_bits; bit++) {
-          int row = base_row + bit;
-          uint64_t linear_row = (uint64_t)sa * (uint64_t)cfg_num_rows
-                                + (uint64_t)row;
-          if (state &&
-              !addr_dedup_check_and_mark(state, (uint64_t)global_bank,
-                                         linear_row, (uint64_t)col)) {
-            account_load_dedup_skip(t, state);
-            continue;
-          }
-          if (is_acc) {
-            emit_trace("R", ch, pch, bg, bank, sa, row, col);
-            stat_reads++; t->emitted_R++;
-          } else {
-            /* STREAMED input bit-row: emit one SIMDRAM broadcast-write
-             * that delivers this bit-row's value to all banks in the
-             * (ch, pch) via one channel dispatch. No separate primary
-             * W — the broadcast covers the source bank too. */
-            emit_input_broadcast(t, ch, pch, bg, bank, sa, row, col);
-          }
+        /* Partial-sum read-out: pe_bits bit-rows, once per (lane, cell). The accumulator
+         * is loop-carried, so after the first touch it is resident in its own bank and a
+         * later load reads nothing from DRAM. The marker is the slot's flag bit, not an
+         * address set: a compute trace naming this tensor may have created the slot
+         * already, and that must not count as the read-out. */
+        int lane = __pim_get_bank_id();
+        int done = t->lane_slot ? slot_map_test_and_set(t->lane_slot, lane, elem_idx, 30) : 0;
+        if (done == 1) {
+          t->dedup_skips++;
+          break;
         }
-        if (is_acc && t->acc_tracker_idx >= 0) {
+        for (int bit = 0; bit < cfg_pe_bits; bit++) {
+          emit_trace("R", ch, pch, bg, bank, sa, base_row + bit, col);
+          stat_reads++; t->emitted_R++;
+        }
+        if (t->acc_tracker_idx >= 0) {
           acc_tracker_t *at = &acc_trackers[t->acc_tracker_idx];
           at->ch = ch; at->pch = pch; at->bg = bg; at->bank = bank;
           at->sa = sa; at->row = base_row;
@@ -1360,6 +1204,8 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
         }
         break;
       }
+      case SIMDRAM_ROLE_STREAMED:
+        break; /* diverted above */
       case SIMDRAM_ROLE_OPERAND:
         /* Weight: pre-stored in DRAM, nothing to emit. */
         break;
@@ -1375,26 +1221,6 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
         current_acc = t->acc_tracker_idx;
       }
     }
-  } else if (cur_phase == SIMDRAM_PHASE_HOST) {
-    /* HOST phase: dedup-eligible too. Same scoping as COMPUTE — no
-     * special-casing for host R/W (the kernel that issued them runs
-     * inside the same pid as its compute counterparts). */
-    addr_dedup_state_t *state = pick_load_dedup_state(t);
-    uint64_t linear_row = (uint64_t)sa * (uint64_t)cfg_num_rows
-                          + (uint64_t)base_row;
-    if (state && !is_write &&
-        !addr_dedup_check_and_mark(state, (uint64_t)global_bank,
-                                   linear_row, (uint64_t)col)) {
-      account_load_dedup_skip(t, state);
-      return;
-    }
-    if (!is_write) {
-      emit_trace("R", ch, pch, bg, bank, sa, base_row, col);
-      stat_reads++; t->emitted_R++;
-    } else {
-      emit_trace("W", ch, pch, bg, bank, sa, base_row, col);
-      stat_writes++; t->emitted_W++;
-    }
   }
 }
 
@@ -1402,18 +1228,41 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
  * size and the lane count: a vector access is the same expansion repeated, and the
  * host replay hands us one element per call. Accepted so the ABI matches the pass
  * and the HBM runtime. */
+/* One call is one machine instruction, which on a vector access moves `lanes` values.
+ * Discarding the width priced a <8 x half> load as a single element and under-charged
+ * delivery up to 8x (review 2026-09-12); the HBM twin has always expanded. The column
+ * packing in flush_all_lanes is what collapses word-mates, so expanding here does not
+ * double-charge a bus transaction: 128 values still cost one column of bit-row writes. */
+static void simdram_trace_access_range(uint64_t base_addr, uint64_t size, int is_write,
+                                       uint64_t compiler_lanes) {
+  int tidx = find_tensor(base_addr);
+  int elem_size = (tidx >= 0 && tensors[tidx].elem_size > 0) ? tensors[tidx].elem_size : 1;
+  uint64_t n = size / (uint64_t)elem_size;
+  if (n == 0)
+    n = 1;
+  if (compiler_lanes && compiler_lanes != n) {
+    static int warned = 0;
+    if (!warned++)
+      fprintf(stderr, "[simdram] WARN lane-count disagreement: the compiler emitted %llu "
+                      "lanes for a %llu-byte access, elem_size=%d makes that %llu. "
+                      "Pricing the runtime's count.\n",
+              (unsigned long long)compiler_lanes, (unsigned long long)size, elem_size,
+              (unsigned long long)n);
+  }
+  for (uint64_t i = 0; i < n; i++)
+    simdram_trace_access(base_addr + i * (uint64_t)elem_size, is_write);
+}
+
 void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes) {
-  (void)size; (void)lanes;
   if (!trace_fp)
     return;
-  simdram_trace_access((uint64_t)addr, 0);
+  simdram_trace_access_range((uint64_t)addr, size, 0, lanes);
 }
 
 void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes) {
-  (void)size; (void)lanes;
   if (!trace_fp)
     return;
-  simdram_trace_access((uint64_t)addr, 1);
+  simdram_trace_access_range((uint64_t)addr, size, 1, lanes);
 }
 
 /* ================================================================
@@ -1470,7 +1319,7 @@ void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes) {
  * address through LLVM's def-use chains — for each BinaryOperator, walk
  * the use chain forward to find the eventual StoreInst and pass that
  * store address to __compute_trace as a third argument.  The runtime can
- * then call find_tensor() + map_element() to determine the exact physical
+ * then call find_tensor() + simdram_place_acc() to determine the exact physical
  * coordinates, fully decoupling compute tracing from the load/store order.
  * This requires non-trivial LLVM analysis (phi nodes, select instructions,
  * multi-level GEPs) and is left as future work.
@@ -1479,6 +1328,7 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
   (void)bit_width;
   if (!trace_fp || cur_phase != SIMDRAM_PHASE_COMPUTE)
     return;
+  note_epoch_change();
 
   /* Leader-bank-only gate: SIMDRAM compute fires in channel-wide
    * lockstep; emit one bank's stream as the wallclock proxy. */
@@ -1500,8 +1350,9 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
       int elem_idx = (int)(((uint64_t)(uintptr_t)dest_addr -
                             (uint64_t)(uintptr_t)t->base_addr) /
                            (uint64_t)t->elem_size);
-      if (elem_idx >= 0 && elem_idx < t->num_elements) {
-        map_element(t, elem_idx, &ch, &pch, &bg, &bank, &sa, &base_row, &col);
+      if (elem_idx >= 0 && elem_idx < t->num_elements &&
+          t->role == SIMDRAM_ROLE_ACCUMULATOR && t->lane_slot &&
+          simdram_place_acc(t, elem_idx, 1, &ch, &pch, &bg, &bank, &sa, &base_row, &col)) {
         /* Update the per-tensor accumulator tracker so future
          * fall-back calls (dest_addr==NULL) attribute to the most
          * recently seen cell of this tensor. */
@@ -1524,6 +1375,13 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
   if (!resolved) {
     if (current_acc < 0)
       return;
+    /* Last resort. The pass names the destination tensor even when it cannot name the
+     * element, so reaching here means arithmetic whose result never reaches any
+     * argument. The bank is then a guess from trace order; say so once. */
+    static int warned_guess = 0;
+    if (!warned_guess++)
+      fprintf(stderr, "[simdram] WARN compute trace with no destination; charged at the "
+                      "most recently touched accumulator's bank.\n");
     const acc_tracker_t *at = &acc_trackers[current_acc];
     ch = at->ch; pch = at->pch; bg = at->bg; bank = at->bank;
     sa = at->sa; base_row = at->row; col = 0;
@@ -1565,7 +1423,7 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
      * amortization). The honest per-arithmetic-op baseline. */
     cost = maj_cost(opcode);
   } else {
-    /* row-dedup disabled → emit per the opcode that fired. */
+    /* k-amortization off (PIM_K_AMORT=0): every op pays in full. */
     cost = maj_cost(opcode);
   }
 

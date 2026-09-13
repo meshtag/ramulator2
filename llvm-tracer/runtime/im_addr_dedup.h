@@ -1,6 +1,7 @@
 #ifndef IM_ADDR_DEDUP_H
 #define IM_ADDR_DEDUP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -56,6 +57,28 @@ uint64_t addr_dedup_saturations(const addr_dedup_state_t *s);
 int addr_dedup_capacity(const addr_dedup_state_t *s);
 
 void addr_dedup_destroy(addr_dedup_state_t *s);
+
+/* (lane, elem) -> slab slot for lane-placed tensors. Keyed on BOTH because a
+ * partitioned tensor's elements are not disjoint per lane: a conv halo element is
+ * consumed by two lanes and must be resident in both banks, so it owns a slot in each
+ * slab. Keyed on the element alone it reused lane 0's slot numbers in lane 1 and
+ * aliased two elements to one address. Open addressing, doubles on load; a dense
+ * [lane][elem] table is 2 GB on the large matmul B. */
+typedef struct slot_map slot_map_t;
+slot_map_t *slot_map_create(size_t hint);
+void slot_map_destroy(slot_map_t *m);
+/* Slot for (lane, elem); inserts `fresh` when absent and sets *inserted to 1. Returns
+ * -1 only when growth fails, and the caller must then leave the tuple as mapped. */
+int32_t slot_map_get_or_put(slot_map_t *m, int lane, int elem, int32_t fresh,
+                            int *inserted);
+/* Test-and-set one marker bit (0..30) on an EXISTING (lane, elem) entry. Returns the
+ * previous state, or -1 if the entry is absent. Used for "already read out": the
+ * accumulator is loop-carried, so its partial sum is resident after the first touch. */
+int slot_map_test_and_set(slot_map_t *m, int lane, int elem, int bit);
+/* Forget every entry, keeping the allocation. */
+void slot_map_clear(slot_map_t *m);
+/* Slot for (lane, elem) if present, else -1. Never inserts. */
+int32_t slot_map_peek(const slot_map_t *m, int lane, int elem);
 
 #ifdef __cplusplus
 }

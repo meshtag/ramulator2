@@ -131,6 +131,10 @@ extern int32_t __pim_get_bank_id(void);
  * conv2d_1x8x16x16x3x3 by 3.2x. The current sequential-with-vpc-only
  * alignment is the version that produced the measured wins. */
 static uint64_t g_interleaved_next_linear = 0;
+/* Lane slabs take rows from the TOP of the per-bank row space; interleaved placement
+ * grows from the bottom, and the two must never meet. */
+static int g_lane_row_top = -1;
+static uint64_t stat_lane_placed = 0;
 
 /* Compute log2(n) where n is a power of two. Returns -1 for n<=0. */
 static int ilog2_pow2(int n) {
@@ -175,6 +179,15 @@ typedef struct {
    * physical mapping uses bit-shifts on (layout_linear_base + elem_idx). */
   pim_layout_scheme_t layout_scheme;
   uint64_t layout_linear_base;
+  /* Compiler's partition bit: 1 replicated, 0 bank-partitioned, -1 not stated. Only 0
+   * changes anything: that tensor's accesses go to the executing lane's own bank at a
+   * per-lane slab address instead of the element's interleaved home, see
+   * place_in_lane_slab. The lockstep key drops bank, so counts do not move; addresses do. */
+  int bank_replicated;
+  int lane_row_base;        /* first row of this tensor's per-lane slab, or -1 */
+  int lane_row_count;
+  int lane_ord[MAX_BANKS];  /* next free value slot per lane */
+  slot_map_t *lane_slot;    /* (lane, elem) -> slot, partitioned tensors only */
 
   /* (bcast_scalar / duplicated / dup_row_base fields removed 2026-06-22 with
    * the broadcast-scalar / row-duplicate blank-dedup machinery.) */
@@ -675,12 +688,60 @@ typedef struct {
   int col;
 } pim_phys_loc_t;
 
+/* Banks are threads here: lane b is bank b's PE and may only touch bank b. The
+ * interleaved map changes bank every 512 elements while a lane's slab is 1024, so
+ * lane 0's data sat in banks 0 and 1. Put the element in the executing lane's bank at
+ * the next slot of that lane's slab (OptiPIM's alloc_col++ made explicit); the slot is
+ * remembered so a re-read lands on the same address. A replicated tensor gets the same
+ * treatment: its copy in bank b is a full slab, not the source word's (sa,row,col)
+ * with the bank bits dropped, which aliased 4-8 words onto one address. */
+static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
+  static int warned = 0;
+  int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int lane = __pim_get_bank_id();
+  if (lane < 0 || lane >= all_banks || lane >= MAX_BANKS) {
+    if (!warned++)
+      fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d banks; kept "
+                      "the interleaved home.\n", lane, all_banks);
+    return;
+  }
+  /* Every lane loads a replicated tensor in the same order, so one numbering serves
+   * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x. */
+  int key_lane = (t->bank_replicated == 1) ? 0 : lane;
+  int inserted = 0;
+  int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
+                                     t->lane_ord[key_lane], &inserted);
+  if (slot < 0) {
+    if (!warned++)
+      fprintf(stderr, "[pim-runtime] WARN slab slot map allocation failed; kept the "
+                      "interleaved home.\n");
+    return;
+  }
+  if (inserted)
+    t->lane_ord[key_lane]++;
+  int vpc = t->values_per_col > 0 ? t->values_per_col : 8;
+  int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
+  int r = slot / vpr;
+  if (r >= t->lane_row_count) {
+    if (!warned++)
+      fprintf(stderr, "[pim-runtime] WARN tensor lane %d overflowed its %d-row slab; "
+                      "rows now alias.\n", lane, t->lane_row_count);
+    r = t->lane_row_count - 1;
+  }
+  int linear_row = t->lane_row_base + r;
+  decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
+  loc->sa = linear_row / cfg_num_rows;
+  loc->row = linear_row % cfg_num_rows;
+  loc->col = (slot % vpr) / vpc;
+  stat_lane_placed++;
+}
+
 /* Resolve one logical element access to its physical HBM tuple.
  *
  * Returns 1 on success and fills `loc`. Returns 0 when the current phase
  * should not emit anything or the address falls outside the tensor. In both
  * failure cases, stat_ignored is updated here so callers can simply return. */
-static int resolve_access_location(const tensor_info_t *t, uint64_t addr,
+static int resolve_access_location(tensor_info_t *t, uint64_t addr,
                                    pim_phys_loc_t *loc) {
   if (cur_phase == PIM_PHASE_IDLE) {
     stat_ignored++;
@@ -696,6 +757,9 @@ static int resolve_access_location(const tensor_info_t *t, uint64_t addr,
   loc->elem_idx = elem_idx;
   map_element(t, elem_idx, &loc->ch, &loc->pch, &loc->bg, &loc->bank, &loc->sa,
               &loc->row, &loc->col);
+  if (cur_phase == PIM_PHASE_COMPUTE && t->bank_replicated >= 0 && t->lane_slot &&
+      t->lane_row_base >= 0)
+    place_in_lane_slab(t, loc);
   return 1;
 }
 
@@ -890,6 +954,8 @@ void pim_init(const char *trace_file) {
           cfg_place_align == PIM_ALIGN_GLOBAL_ROW ? "global-row" : "dq",
           (int)__pim_layout_scheme, (int)__pim_placement_align);
   g_interleaved_next_linear = 0;
+  g_lane_row_top = -1;
+  stat_lane_placed = 0;
 
   /* Power-of-2 guard for interleaved mode. The bit-interleaved address
    * decomposition shifts by log2(cfg_*) at every level; non-power-of-2
@@ -984,6 +1050,11 @@ void pim_init(const char *trace_file) {
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
+  if (__pim_lanes > 0 &&
+      (int)__pim_lanes != cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks)
+    fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, machine has %d "
+                    "banks; lane placement puts lane b in bank b and assumes they agree.\n",
+            (int)__pim_lanes, cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks);
   stat_lockstep_skips = 0;
   stat_coalesce_overflow = 0;
   fprintf(stderr,
@@ -1130,8 +1201,16 @@ static void check_layout_rec_words(void) {
 static void apply_compiler_layout(int tensor_id) {
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
-  if (n <= 0)
-    return; /* weak fallback in force: no table in this kernel */
+  if (n <= 0) {
+    /* The SIMDRAM twin of this silent return was a 64x under-charge (review 2026-09-12);
+     * here the tensor merely stays on the interleaved map, but a placement decision made
+     * by default rather than by the compiler must still be audible. */
+    static int warned = 0;
+    if (!warned++)
+      fprintf(stderr, "[pim-runtime] WARN kernel carries no layout table; every tensor "
+                      "stays on the interleaved map and the host roles stand.\n");
+    return;
+  }
   const int32_t *table = __pim_layout_table;
   for (int i = 0; i < n; i++) {
     const int32_t *rec = table + (size_t)i * PIM_LAYOUT_REC_WORDS;
@@ -1156,21 +1235,70 @@ static void apply_compiler_layout(int tensor_id) {
      * its reduction_col_axis word on 2026-09-10 and a raw rec[3] silently read
      * num_axes instead, turning every operand into a streamed tensor and dropping
      * the entire W charge (matmul 64x64x32 went 32,786 -> 246 cycles). */
-    if (rec[PIM_LW_BANK_REPLICATED] >= 0 && _t->role != PIM_ROLE_ACCUMULATOR) {
-      int derived =
-          rec[PIM_LW_BANK_REPLICATED] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
+    _t->bank_replicated = (int)rec[PIM_LW_BANK_REPLICATED];
+    if (_t->bank_replicated >= 0) {
+      /* Reserve a per-lane slab, the same rows in every bank. Partitioned: a lane can
+       * touch far more than its even share when lanes overlap (a conv halo lane touched
+       * 576 of a 4,096-element input), so a small tensor gets room for every element
+       * per lane and only a large one falls back to twice the share. Replicated: every
+       * lane holds the whole tensor, so the slab IS the tensor; the copy in bank b
+       * used to keep the source word's (sa,row,col) and drop its bank bits, which
+       * aliased 4-8 distinct words onto one address (matmul A: 8,192 writes, 2,048
+       * addresses). When the rows do not fit, keep the interleaved home and say so. */
+      int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+      int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
+      int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
+      int per_lane = _t->bank_replicated == 1 ? _t->num_elements
+                     : share2 > 65536 ? share2
+                     : (_t->num_elements < 65536 ? _t->num_elements : 65536);
+      int rows = (per_lane + vpr - 1) / vpr;
+      if (rows < 1) rows = 1;
+      if (g_lane_row_top < 0)
+        g_lane_row_top = cfg_num_sa * cfg_num_rows;
+      if (rows > g_lane_row_top) {
+        fprintf(stderr, "[pim-runtime] WARN tensor %d: lane slab of %d rows does not fit "
+                        "the %d rows left; placement stays on the interleaved map.\n",
+                tensor_id, rows, g_lane_row_top);
+      } else {
+        g_lane_row_top -= rows;
+        _t->lane_row_base = g_lane_row_top;
+        _t->lane_row_count = rows;
+        _t->lane_slot = slot_map_create((size_t)per_lane / 2 + 1);
+        if (!_t->lane_slot) {
+          _t->lane_row_base = -1;
+          fprintf(stderr, "[pim-runtime] WARN tensor %d: slot map allocation failed; "
+                          "placement stays on the interleaved map.\n", tensor_id);
+        }
+      }
+    }
+    /* THE ROLE IS THE COMPILER'S. is_store marks the output (sticky in the emitter, so a
+     * tensor both loaded and stored is the output), bank_replicated says whether every
+     * bank sees the same elements. The host string used to be the role and a layout
+     * change silently inverted the charge (31x on a transposed accumulator); now it is
+     * an input to check, and a disagreement fails invariant 6 instead of costing a day. */
+    if (rec[PIM_LW_IS_STORE] == 1 || rec[PIM_LW_BANK_REPLICATED] >= 0) {
+      int derived = rec[PIM_LW_IS_STORE] == 1 ? PIM_ROLE_ACCUMULATOR
+                    : rec[PIM_LW_BANK_REPLICATED] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
       if (derived != _t->role) {
-        fprintf(stderr,
-                "[pim-runtime] tensor %d: role %s -> %s (compiler-derived from "
-                "the layout; host said otherwise)\n",
-                tensor_id, _t->role == PIM_ROLE_OPERAND ? "OPERAND" : "STREAMED",
-                derived == PIM_ROLE_OPERAND ? "OPERAND" : "STREAMED");
+        static const char *names[] = {"STREAMED", "OPERAND", "ACCUMULATOR"};
+        fprintf(stderr, "[pim-runtime] WARN tensor %d: host role %s, compiler layout says "
+                        "%s; taking the compiler's.\n", tensor_id,
+                (_t->role >= 0 && _t->role < 3) ? names[_t->role] : "?",
+                names[derived]);
         _t->role = derived;
       }
     }
+    if (_t->bank_replicated < 0 && _t->role != PIM_ROLE_OPERAND)
+      fprintf(stderr, "[pim-runtime] WARN tensor %d (%s): compiler stated no partition "
+                      "bit; placement stays on the interleaved map.\n", tensor_id,
+              _t->role == PIM_ROLE_ACCUMULATOR ? "ACCUMULATOR" : "STREAMED");
     stat_layout_from_compiler++;
     return;
   }
+  /* A table exists but has no record for this tensor: same gap, same warning. */
+  if (tensors[tensor_id].role != PIM_ROLE_OPERAND)
+    fprintf(stderr, "[pim-runtime] WARN tensor %d: no layout record; placement stays "
+                    "on the interleaved map.\n", tensor_id);
 }
 
 /* Shared tail for every pim_register_tensor return path. */
@@ -1192,6 +1320,11 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   t->base_addr = ptr;
   t->elem_size = elem_size;
   t->role = role;
+  t->bank_replicated = -1;
+  t->lane_row_base = -1;
+  t->lane_row_count = 0;
+  memset(t->lane_ord, 0, sizeof(t->lane_ord));
+  if (t->lane_slot) { slot_map_destroy(t->lane_slot); t->lane_slot = NULL; }
 
   int total = 1;
   for (int i = 0; i < ndims && i < 4; i++) {
@@ -1466,6 +1599,21 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
+  fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
+          stat_lane_placed);
+  /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
+   * rows are masked or straddling lanes, not a bug; a zero row for an active lane is. */
+  for (int i = 0; i < num_tensors; i++) {
+    tensor_info_t *t = &tensors[i];
+    if (t->bank_replicated < 0 || t->lane_row_base < 0)
+      continue;
+    int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    fprintf(stderr, "[pim-runtime]   tensor %d slab slots per lane:", i);
+    for (int l = 0; l < all_banks && l < MAX_BANKS; l++)
+      fprintf(stderr, " %d", t->lane_ord[l]);
+    fprintf(stderr, "  (rows %d..%d)\n", t->lane_row_base,
+            t->lane_row_base + t->lane_row_count - 1);
+  }
   {
     uint64_t sat = addr_dedup_saturations(g_lockstep_collapse);
     if (sat)
@@ -1693,13 +1841,21 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
        * reverted as inert, but the premise has since changed: the conv weight load
        * used to arrive one element per call and skip this path entirely, and it now
        * vectorizes. Re-keying is untested under that shape. */
-      int ch, pch, bg, bank, sa, row, col;
-      map_element(t, elem_idx, &ch, &pch, &bg, &bank, &sa, &row, &col);
-      int gb = compute_global_bank(ch, pch, bg, bank);
+      /* Key on the PLACED tuple. Keying on the interleaved home dropped every
+       * word-mate before it reached place_in_lane_slab, so a partitioned tensor's
+       * slab held one slot per word instead of one per element and came out 2-8x
+       * too few columns (matmul B read 16 BR where its 16 words per lane owe 32). */
+      pim_phys_loc_t pl;
+      pl.elem_idx = elem_idx;
+      map_element(t, elem_idx, &pl.ch, &pl.pch, &pl.bg, &pl.bank, &pl.sa, &pl.row,
+                  &pl.col);
+      if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
+        place_in_lane_slab(t, &pl);
+      int gb = compute_global_bank(pl.ch, pl.pch, pl.bg, pl.bank);
       uint64_t key = ((uint64_t)gb & 0xFFFFULL) |
-                     (((uint64_t)sa & 0xFFULL) << 16) |
-                     (((uint64_t)row & 0xFFFFFFULL) << 24) |
-                     (((uint64_t)col & 0xFFFFULL) << 48);
+                     (((uint64_t)pl.sa & 0xFFULL) << 16) |
+                     (((uint64_t)pl.row & 0xFFFFFFULL) << 24) |
+                     (((uint64_t)pl.col & 0xFFFFULL) << 48);
       int dup = 0;
       for (int j = 0; j < n_seen; j++)
         if (seen[j] == key) { dup = 1; break; }
