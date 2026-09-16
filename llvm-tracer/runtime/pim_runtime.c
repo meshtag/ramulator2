@@ -41,8 +41,13 @@ static int cfg_num_banks = 4; /* per bank group */
  * was refused on a limit the machine does not have. */
 static int cfg_num_sa = 64;
 static int cfg_num_rows = 512;
-static int cfg_num_cols = 64;
-static int cfg_dq_bits = 128;
+/* One column command moves internal_prefetch * dq = 2 * 128 = 256 bits on this part,
+ * which is the HBM-PIM datapath, so the column index counts 256-bit words. Columns per
+ * row halve to match, keeping the row at 8192 bits and the part's density unchanged.
+ * These two MUST move together, and together with the simulator org (dq/column in the
+ * rendered yaml), or the tracer addresses a row the machine does not have. */
+static int cfg_num_cols = 32;
+static int cfg_dq_bits = 256;
 static void check_compiler_dq_bits(int cfg_bits);
 
 /* Width of one modelled DATA VALUE in bits. This is a HARDWARE property (the shared
@@ -719,7 +724,7 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   }
   if (inserted)
     t->lane_ord[key_lane]++;
-  int vpc = t->values_per_col > 0 ? t->values_per_col : 8;
+  int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
   int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
   int r = slot / vpr;
   if (r >= t->lane_row_count) {
