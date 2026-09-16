@@ -278,10 +278,27 @@ static inline uint64_t lockstep_ns(const tensor_info_t *t, int ch, int pch,
  * DCC emits 547, which is how this was caught. */
 static inline uint64_t perbank_ns(const tensor_info_t *t, int ch, int pch, int bg,
                                   int bank, int is_write) {
-  return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
-         (((uint64_t)pch & 0x3ULL) << 9) |
-         ((uint64_t)(is_write ? 1 : 0) << 11) |
-         (((uint64_t)bg & 0x7ULL) << 12) | (((uint64_t)bank & 0x7ULL) << 15);
+  /* MUST FIT IN 16 BITS. addr_dedup's pack_keys gives key1 exactly 16, and it truncates
+   * silently. A first cut of this put bank at bits 15-17, so bits 16-17 were cut and bank
+   * 2 aliased 0 while bank 3 aliased 1: the accumulator appeared to reach 16 of 32 banks
+   * and I read it as a placement defect in the shipped tracer. It was not; lockstep_ns
+   * uses bits 0-11 and never overflowed. Laid out tightly here, widest field last, and
+   * checked below so the next overflow is loud. */
+  uint64_t ns = ((uint64_t)(t - tensors) & 0xFULL)        /* bits 0-3   16 tensors  */
+                | ((uint64_t)(is_write ? 1 : 0) << 4)     /* bit  4                 */
+                | (((uint64_t)ch & 0x3ULL) << 5)          /* bits 5-6    4 channels */
+                | (((uint64_t)pch & 0x3ULL) << 7)         /* bits 7-8    4 pch      */
+                | (((uint64_t)bg & 0x7ULL) << 9)          /* bits 9-11   8 bg       */
+                | (((uint64_t)bank & 0xFULL) << 12);      /* bits 12-15 16 banks/bg */
+  if (ns > 0xFFFFULL) {
+    static int warned = 0;
+    if (!warned++)
+      fprintf(stderr, "[pim-runtime] ERROR: per-bank dedup namespace %llu exceeds the "
+                      "16 bits addr_dedup gives it; banks are aliasing and the trace "
+                      "under-counts. Widen pack_keys or shrink a field.\n",
+              (unsigned long long)ns);
+  }
+  return ns;
 }
 
 static inline uint64_t channel_ns(const tensor_info_t *t, int ch, int is_write) {
