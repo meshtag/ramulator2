@@ -478,6 +478,31 @@ static uint64_t stat_lockstep_skips = 0;
  * them. Counted so the omission is visible rather than silent. */
 static uint64_t stat_dcc_free_acc_ops = 0;
 
+/* ACTIVATION STAGING, DCC's convention, this tree only.
+ *
+ * Their model stages activation vectors into the banks per invocation and leaves the
+ * weight matrix resident: GEMV emits ST for the vector and nothing for the matrix, VA
+ * emits LD for both its inputs because both are activations. We already match them on
+ * GEMV, because our operand path stages the vector -- which is why parity is 0.973x --
+ * but an elementwise kernel's inputs look partitioned to the residency classifier, get
+ * read as bank-local group commands, and are never staged. That is the whole reason our
+ * unfused VA looked 1.5-2.1x faster than theirs: 34 costed commands against 128.
+ *
+ * Which tensors are activations is the COMPILER's call, not the host's: it is
+ * reduction_tiled = false in the im.residency stamp. The host only forwards it, so no
+ * new decision is invented here and no artifact format changes.
+ *
+ * Staging is emitted once per distinct (tensor, bank, row, col), into the stage phase,
+ * on first read -- which is banks x columns-per-bank, exactly the vector. */
+static unsigned char g_dcc_activation[MAX_TENSORS];
+static addr_dedup_state_t *g_dcc_staged = NULL;
+static uint64_t stat_dcc_staged = 0;
+
+void pim_dcc_mark_activation(int tensor_id) {
+  if (tensor_id >= 0 && tensor_id < MAX_TENSORS)
+    g_dcc_activation[tensor_id] = 1;
+}
+
 /* Per-program-id store dedup for ACCUMULATOR tensors.
  *
  * Modeling assumption:
@@ -576,6 +601,8 @@ static int g_trace_format_dcc = 0;
 #define DCC_COLS_PER_ROW 32
 #define DCC_ROWS_PER_BANK 16384
 
+static void decompose_global_bank(int g, int *ch, int *pch, int *bg, int *bank);
+
 static uint64_t dcc_addr(int ch, int pch, int bg, int bank, int sa, int row, int col) {
   static int wrapped = 0;
   uint64_t g_row  = (uint64_t)DCC_COLS_PER_ROW * DCC_COL_BYTES;
@@ -644,11 +671,33 @@ static void emit_dcc(const char *op, uint64_t addr) {
   fprintf(trace_fp, "%s 0x%08llx\n", op, (unsigned long long)addr);
 }
 
+static const tensor_info_t *t_emit = NULL;  /* tensor the current emit belongs to */
+
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
   if (g_trace_format_dcc) {
     uint64_t a = dcc_addr(ch, pch, bg, bank, sa, row, col);
     if (!strcmp(op, "BR")) {                       /* streamed column read + MAC */
+      int tid = (int)(t_emit - tensors);
+      if (tid >= 0 && tid < MAX_TENSORS && g_dcc_activation[tid]) {
+        /* PER BANK, not per surviving command. The read itself is one group-level
+         * command covering every bank, but staging is host-side data movement and
+         * DCC charges it once per bank -- their LD is 64 for two M-vectors over 32
+         * banks. Deduped on (tensor, row, col) so each column stages exactly once. */
+        if (!g_dcc_staged)
+          g_dcc_staged = addr_dedup_create(4096);
+        if (addr_dedup_check_and_mark(g_dcc_staged, (uint64_t)tid,
+                                      (uint64_t)sa * (uint64_t)cfg_num_rows + row,
+                                      (uint64_t)col)) {
+          int nb = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+          for (int gb = 0; gb < nb; gb++) {
+            int c2, p2, g2, b2;
+            decompose_global_bank(gb, &c2, &p2, &g2, &b2);
+            dp_push(DP_STAGE, "ST", dcc_addr(c2, p2, g2, b2, sa, row, col));
+            stat_dcc_staged++;
+          }
+        }
+      }
       dp_push(DP_MAC, "PIM_MAC_OP1", a);
     } else if (!strcmp(op, "W")) {                 /* operand staged, then into the GRF */
       dp_push(DP_STAGE, "ST", a);
@@ -960,6 +1009,7 @@ static int resolve_access_location(tensor_info_t *t, uint64_t addr,
  * role for an already-resolved physical tuple. */
 static void emit_access_by_role_phase(tensor_info_t *t,
                                       const pim_phys_loc_t *loc, int is_write) {
+  t_emit = t;
   /* Comparison mode only, applied at the single funnel every record passes through so
    * it cannot be half-applied. See g_optipim_addressing. */
   pim_phys_loc_t _flat;
@@ -1836,9 +1886,11 @@ void pim_finalize(void) {
   fprintf(stderr, "[pim-runtime]   Total PIM ops  : %" PRIu64 "\n",
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
   fprintf(stderr,
+          "[pim-runtime]   DCC activation staging commands : %" PRIu64 "\n"
           "[pim-runtime]   DCC zero-cost acc ops omitted   : %" PRIu64 "\n"
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
-          stat_dcc_free_acc_ops, stat_lockstep_skips, g_lockstep_enabled);
+          stat_dcc_staged, stat_dcc_free_acc_ops, stat_lockstep_skips,
+          g_lockstep_enabled);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
