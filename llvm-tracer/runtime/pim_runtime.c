@@ -229,10 +229,63 @@ static int num_tensors = 0;
  * The write bit separates stores from loads, without which an ACCUMULATOR load
  * (the read half of a read-modify-write drain) marks the key the store then
  * consults, making partial-sum write-back free. Both found 2026-09-05. */
+/* ============================================================================
+ * THIS TREE IS THE DCC-PARITY TRACER. Branch dcc-parity, checked out at
+ * third_party/ramulator2_dcc. The OptiPIM-matched tracer is third_party/ramulator2
+ * and is NOT affected by anything here -- that is the whole point of the split.
+ *
+ * The two baselines disagree about exactly one thing, isolated by counting every
+ * opcode against the work it must perform (2026-09-16):
+ *
+ *   compute   both collapse to a group-level command. AGREED.
+ *   operand   both charge one command per receiving bank. AGREED -- our W count
+ *             equals DCC's PIM_LD_OP1 count exactly on every shape checked.
+ *   group     how wide that group-level command reaches. WE scope it to one
+ *             PSEUDOCHANNEL; DCC scopes it to the CHANNEL, which is the only scope
+ *             at which their MAC counts reconcile (cmds x 16 lanes x 32 cores = M*K,
+ *             exact on 9/10 matvec10 shapes, the tenth being their documented
+ *             padding) and matches their paper's definition of a PIM group as the
+ *             cores of "the same memory channel or rank".
+ *
+ * So this tree differs from the default by dropping the pseudochannel from the
+ * collapse key. The default emits two commands where DCC emits one, i.e. the default
+ * is the conservative side.
+ *
+ * STILL OPEN, and the reason parity is not yet reached: the accumulator. DCC writes
+ * it back per bank (PIM_WB_ACC 128 on matvec 512x64, one per core per accumulator
+ * register); we collapse it to a group command (BW 4). That is a 32x difference on
+ * the output path and it is where the remaining cycle gap lives.
+ * ============================================================================ */
+
 static inline uint64_t lockstep_ns(const tensor_info_t *t, int ch, int pch,
                                    int is_write) {
   return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
          (((uint64_t)pch & 0x3ULL) << 9) |
+         ((uint64_t)(is_write ? 1 : 0) << 11);
+}
+
+/* Same key with the pseudochannel dropped, so one command covers the whole CHANNEL.
+ * That is the only thing the two baselines actually disagree about, established by
+ * counting: every DCC opcode equals its physical requirement exactly, and their MAC
+ * count reconciles only at 32 cores per command (64 cmds x 16 lanes x 32 cores = M*K,
+ * exact on 9/10 matvec10 shapes; the tenth is their documented padding). Their paper
+ * defines a PIM group as the cores of "the same memory channel or rank". We scope to
+ * one pseudochannel instead, so we emit two commands where they emit one -- which
+ * makes our default the CONSERVATIVE side, not the generous one. */
+/* Bank named, so replicas do NOT fold, but (row,col) still key the entry so multiple
+ * values in one column still collapse to one command. Bypassing the table instead loses
+ * the packing too and charges one command per ELEMENT -- measured 5,252 commands where
+ * DCC emits 547, which is how this was caught. */
+static inline uint64_t perbank_ns(const tensor_info_t *t, int ch, int pch, int bg,
+                                  int bank, int is_write) {
+  return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
+         (((uint64_t)pch & 0x3ULL) << 9) |
+         ((uint64_t)(is_write ? 1 : 0) << 11) |
+         (((uint64_t)bg & 0x7ULL) << 12) | (((uint64_t)bank & 0x7ULL) << 15);
+}
+
+static inline uint64_t channel_ns(const tensor_info_t *t, int ch, int is_write) {
+  return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
          ((uint64_t)(is_write ? 1 : 0) << 11);
 }
 
@@ -811,6 +864,20 @@ static void emit_access_by_role_phase(tensor_info_t *t,
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
+        /* PARITY ITEM 3. DCC stages the vector into the bank (ST, 32 on matvec 512x64)
+         * and then loads it bank->GRF (PIM_LD_OP1, 32). Two commands per core. Our W
+         * count matches their PIM_LD_OP1 exactly, so the staging store is the one we
+         * never charged. OptiPIM writes the input straight to the register and charges
+         * once, which is why this belongs here and not in the default tree. */
+        emit_trace("BR", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
+        stat_bank_reads++;
+        t->emitted_br++;
+        /* No second command here. DCC's PIM_LD_OP1 count equals ours exactly (32 on
+         * matvec 512x64, one per core, verified across three shapes), so both stacks
+         * already charge the operand once per receiving bank. An earlier version
+         * double-charged it, on the mistaken reading that their ST and PIM_LD_OP1
+         * were two commands for the same delivery; the ST count is the vector stage
+         * plus the partial-output write, which is separate traffic. */
         break;
       }
       case PIM_ROLE_ACCUMULATOR:
@@ -822,6 +889,17 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
+        /* PARITY ITEM 2. DCC resets the accumulator register before accumulating into
+         * it and writes it back after, and emits exactly as many PIM_ACC_RESETs as
+         * PIM_WB_ACCs (128 and 128 on every shape checked). Neither our model nor
+         * OptiPIM's charges the reset at all, so it exists only in this tree. Emitted
+         * alongside the writeback rather than at the true head of the output group:
+         * the count is exact, the position is approximate, and ACC_RESET is 2.7% of
+         * DCC's cycles so the position is not where the error would live. */
+        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                   loc->row, loc->col);
+        stat_bank_writes++;
+        t->emitted_bw++;
         emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
         stat_bank_writes++;
@@ -1053,6 +1131,8 @@ void pim_init(const char *trace_file) {
 
   /* Lockstep collapse knob (default ON). See g_lockstep_collapse declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
+  fprintf(stderr, "[pim-runtime] DCC-PARITY tracer: group-level commands span the\n                  CHANNEL. Not comparable to OptiPIM numbers.\n");
+
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
   if (__pim_lanes > 0 &&
@@ -1717,6 +1797,12 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * re-solving their optimizer would charge us for a dispatch the baseline never
    * gets. Both stacks now charge one write per receiving bank. */
   int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
+  /* PARITY ITEM 1. DCC writes the accumulator back per core (PIM_WB_ACC, 128 on matvec
+   * 512x64 = 32 cores x 4 accumulator registers); we collapse it to a group command.
+   * OptiPIM is group-scope here too -- its single_bank_opt breaks the bank loop for the
+   * OUTPUT tensor as well as the weight -- so this is DCC-specific and stays in this
+   * tree. It is also the single largest remaining gap, 4 commands against 128. */
+  int is_acc_store = (is_write && t->role == PIM_ROLE_ACCUMULATOR);
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
@@ -1724,7 +1810,12 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * separate command bus and need their own event. Omitting them collapsed
      * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
      * OUT of the key: collapsing those IS the all-bank SIMD model. */
-    uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write);
+    /* Compute and streamed reads are group-level and span the CHANNEL (DCC's group).
+     * The accumulator is bank-level in DCC's model, so it keeps the bank in its key --
+     * still packed by column, just not folded across banks. */
+    uint64_t tensor_key =
+        is_acc_store ? perbank_ns(t, loc.ch, loc.pch, loc.bg, loc.bank, is_write)
+                     : channel_ns(t, loc.ch, is_write);
     /* The dispatch id rides in k2 above the linear row, so two dispatches touching
      * the same physical tuple stay distinct while the 32 bank replays of ONE
      * dispatch still collapse. Replaces resetting the table per program instance. */
