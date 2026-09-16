@@ -547,8 +547,80 @@ static int g_warned_dispatch_overflow = 0;
  *  Helpers
  * ================================================================ */
 
+/* ---------------------------------------------------------------------------
+ * DCC TRACE FORMAT (PIM_TRACE_FORMAT=dcc, this tree only).
+ *
+ * Emits DCC's own opcodes at DCC's own addresses so the trace runs through THEIR
+ * Ramulator build. Pricing is then theirs by construction, with no mapping layer left
+ * to get wrong -- which matters, because every error in this campaign bar one was a
+ * vocabulary-mapping error.
+ *
+ * Every mapping below is pinned by counting, not by judgement:
+ *   BR (group-collapsed column read)  -> PIM_MAC_OP1   one 16-lane SIMD op across 32
+ *        cores; cmds x 16 x 32 = M*K exactly on 9/10 matvec10 shapes.
+ *   W  (operand into a bank)          -> ST + PIM_LD_OP1   staged, then bank->GRF;
+ *        their PIM_LD_OP1 count equals our W count exactly.
+ *   BW (accumulator column)           -> PIM_WB_ACC + ST + PIM_ACC_RESET, 128 each on
+ *        matvec 512x64, which is their whole output path.
+ *   R  (accumulator read)             -> LD
+ *
+ * Addresses follow THEIR geometry, not ours: a 32-byte column, 32 columns to a row,
+ * and the bank/bankgroup strides their generator derives in HBM_GS. Our (sa,row) is
+ * flattened and wrapped into their 16384-row bank, which is stated below because it is
+ * the one place the two machines are not the same shape.
+ * --------------------------------------------------------------------------- */
+static int g_trace_format_dcc = 0;
+
+/* Their HBM_GS, in bytes. Mirrors align_geometry() in run_dcc_matvec_comparison.py. */
+#define DCC_COL_BYTES   32
+#define DCC_COLS_PER_ROW 32
+#define DCC_ROWS_PER_BANK 16384
+
+static uint64_t dcc_addr(int ch, int pch, int bg, int bank, int sa, int row, int col) {
+  static int wrapped = 0;
+  uint64_t g_row  = (uint64_t)DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  uint64_t g_ba   = (uint64_t)DCC_ROWS_PER_BANK * g_row;
+  uint64_t g_bg   = (uint64_t)cfg_num_banks * g_ba;
+  uint64_t g_rank = (uint64_t)cfg_num_bg * g_bg;
+  uint64_t g_pch  = g_rank;                   /* their rank level is dropped to match 32 banks */
+  uint64_t g_ch   = (uint64_t)cfg_num_pch * g_pch;
+  uint64_t lrow = (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
+  if (lrow >= DCC_ROWS_PER_BANK) {
+    if (!wrapped++)
+      fprintf(stderr, "[pim-runtime] NOTE linear row %llu exceeds DCC's %d rows per "
+                      "bank and wraps; relative placement is preserved, absolute is "
+                      "not.\n", (unsigned long long)lrow, DCC_ROWS_PER_BANK);
+    lrow %= DCC_ROWS_PER_BANK;
+  }
+  return (uint64_t)ch * g_ch + (uint64_t)pch * g_pch + (uint64_t)bg * g_bg
+       + (uint64_t)bank * g_ba + lrow * g_row
+       + (uint64_t)(col % DCC_COLS_PER_ROW) * DCC_COL_BYTES;
+}
+
+static void emit_dcc(const char *op, uint64_t addr) {
+  fprintf(trace_fp, "%s 0x%08llx\n", op, (unsigned long long)addr);
+}
+
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
+  if (g_trace_format_dcc) {
+    uint64_t a = dcc_addr(ch, pch, bg, bank, sa, row, col);
+    if (!strcmp(op, "BR")) {                       /* streamed column read + MAC */
+      emit_dcc("PIM_MAC_OP1", a);
+    } else if (!strcmp(op, "W")) {                 /* operand staged, then into the GRF */
+      emit_dcc("ST", a);
+      emit_dcc("PIM_LD_OP1", a);
+    } else if (!strcmp(op, "BW")) {                /* their entire output path */
+      emit_dcc("PIM_WB_ACC", a);
+      emit_dcc("ST", a);
+      emit_dcc("PIM_ACC_RESET", a);
+    } else if (!strcmp(op, "R")) {
+      emit_dcc("LD", a);
+    } else {
+      emit_dcc("ST", a);
+    }
+    return;
+  }
   fprintf(trace_fp, "%s %d,%d,%d,%d,%d,%d,%d\n", op, ch, pch, bg, bank, sa, row,
           col);
 }
@@ -889,9 +961,14 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * count matches their PIM_LD_OP1 exactly, so the staging store is the one we
          * never charged. OptiPIM writes the input straight to the register and charges
          * once, which is why this belongs here and not in the default tree. */
-        emit_trace("BR", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
-        stat_bank_reads++;
-        t->emitted_br++;
+        /* Only in OUR vocabulary. In DCC's format the W above already expands to
+         * ST + PIM_LD_OP1, which is both steps, so emitting this too would double the
+         * staging and show up as 32 extra PIM_MAC_OP1. */
+        if (!g_trace_format_dcc) {
+          emit_trace("BR", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
+          stat_bank_reads++;
+          t->emitted_br++;
+        }
         /* No second command here. DCC's PIM_LD_OP1 count equals ours exactly (32 on
          * matvec 512x64, one per core, verified across three shapes), so both stacks
          * already charge the operand once per receiving bank. An earlier version
@@ -1157,6 +1234,12 @@ void pim_init(const char *trace_file) {
   /* Lockstep collapse knob (default ON). See g_lockstep_collapse declaration
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
   fprintf(stderr, "[pim-runtime] DCC-PARITY tracer: group-level commands span the\n                  CHANNEL. Not comparable to OptiPIM numbers.\n");
+
+  if (getenv("PIM_TRACE_FORMAT") && !strcmp(getenv("PIM_TRACE_FORMAT"), "dcc")) {
+    g_trace_format_dcc = 1;
+    fprintf(stderr, "[pim-runtime] emitting DCC's opcodes at DCC's addresses; run this "
+                    "trace through THEIR Ramulator, not ours.\n");
+  }
 
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
