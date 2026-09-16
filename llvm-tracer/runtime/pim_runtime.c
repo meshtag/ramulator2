@@ -597,6 +597,49 @@ static uint64_t dcc_addr(int ch, int pch, int bg, int bank, int sa, int row, int
        + (uint64_t)(col % DCC_COLS_PER_ROW) * DCC_COL_BYTES;
 }
 
+/* PHASE ORDERING. DCC's trace is grouped by phase -- stage the vector, then per round
+ * reset / load operand / MAC / write back, then write the outputs -- and their controller
+ * depends on it: MAC_OP1 requires every bank's row open, and our kernel-order interleaving
+ * starves that prerequisite until the refresh manager aborts ("Failed to send refresh").
+ * Each opcode class simulates cleanly alone, so it is the interleaving and not any one
+ * command that their model rejects.
+ *
+ * Commands are therefore bucketed at emission and flushed in their order. This adopts
+ * their SCHEDULE as well as their pricing, which is the right baseline for a
+ * no-optimisations parity claim but is not free: grouping our accumulator writes alone
+ * measured 1.4x. Any levers-on number must be reported against this same phase-ordered
+ * baseline or the delta is not attributable. */
+enum { DP_STAGE = 0, DP_RESET, DP_LDOP, DP_MAC, DP_WB, DP_OUT, DP_N };
+static char  *dp_buf[DP_N];
+static size_t dp_len[DP_N], dp_cap[DP_N];
+static const char *dp_name[DP_N] = {"stage", "acc-reset", "operand-load", "mac",
+                                    "writeback", "output"};
+
+static void dp_push(int phase, const char *op, uint64_t addr) {
+  char line[64];
+  int n = snprintf(line, sizeof line, "%s 0x%08llx\n", op, (unsigned long long)addr);
+  if (dp_len[phase] + n + 1 > dp_cap[phase]) {
+    size_t cap = dp_cap[phase] ? dp_cap[phase] * 2 : (1u << 16);
+    while (cap < dp_len[phase] + n + 1) cap *= 2;
+    char *nb = (char *)realloc(dp_buf[phase], cap);
+    if (!nb) { fprintf(stderr, "[pim-runtime] ERROR: phase buffer alloc failed\n"); exit(1); }
+    dp_buf[phase] = nb; dp_cap[phase] = cap;
+  }
+  memcpy(dp_buf[phase] + dp_len[phase], line, n);
+  dp_len[phase] += n;
+}
+
+static void dp_flush(void) {
+  if (!trace_fp) return;
+  for (int i = 0; i < DP_N; i++) {
+    if (!dp_len[i]) continue;
+    fwrite(dp_buf[i], 1, dp_len[i], trace_fp);
+    /* a barrier between phases, as their generator emits */
+    if (i != DP_N - 1) fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+    free(dp_buf[i]); dp_buf[i] = NULL; dp_len[i] = dp_cap[i] = 0;
+  }
+}
+
 static void emit_dcc(const char *op, uint64_t addr) {
   fprintf(trace_fp, "%s 0x%08llx\n", op, (unsigned long long)addr);
 }
@@ -606,18 +649,18 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
   if (g_trace_format_dcc) {
     uint64_t a = dcc_addr(ch, pch, bg, bank, sa, row, col);
     if (!strcmp(op, "BR")) {                       /* streamed column read + MAC */
-      emit_dcc("PIM_MAC_OP1", a);
+      dp_push(DP_MAC, "PIM_MAC_OP1", a);
     } else if (!strcmp(op, "W")) {                 /* operand staged, then into the GRF */
-      emit_dcc("ST", a);
-      emit_dcc("PIM_LD_OP1", a);
+      dp_push(DP_STAGE, "ST", a);
+      dp_push(DP_LDOP, "PIM_LD_OP1", a);
     } else if (!strcmp(op, "BW")) {                /* their entire output path */
-      emit_dcc("PIM_WB_ACC", a);
-      emit_dcc("ST", a);
-      emit_dcc("PIM_ACC_RESET", a);
+      dp_push(DP_RESET, "PIM_ACC_RESET", a);
+      dp_push(DP_WB, "PIM_WB_ACC", a);
+      dp_push(DP_OUT, "ST", a);
     } else if (!strcmp(op, "R")) {
-      emit_dcc("LD", a);
+      dp_push(DP_STAGE, "LD", a);
     } else {
-      emit_dcc("ST", a);
+      dp_push(DP_OUT, "ST", a);
     }
     return;
   }
@@ -1770,6 +1813,9 @@ void pim_finalize(void) {
     return;
 
   finalized = 1;
+
+  if (g_trace_format_dcc)
+    dp_flush();
 
   if (trace_fp) {
     fclose(trace_fp);
