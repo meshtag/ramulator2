@@ -474,6 +474,9 @@ static int g_acc_spill_ksteps = 0;
 static uint64_t stat_acc_spill_emitted = 0;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
+/* Accumulator ops DCC's model charges nothing for, so this tree does not emit
+ * them. Counted so the omission is visible rather than silent. */
+static uint64_t stat_dcc_free_acc_ops = 0;
 
 /* Per-program-id store dedup for ACCUMULATOR tensors.
  *
@@ -906,34 +909,26 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
-        /* PARITY ITEM 2, and the one place this tree adopts DCC's PRICING as well as
-         * their count. Their output path is PIM_WB_ACC + ST at the same offsets, 128
-         * each, which is what these two commands correspond to; their PIM_ACC_RESET is
-         * the third, emitted below.
+        /* PARITY ITEM 2, and the one place this tree adopts DCC's COST MODEL rather
+         * than just its counts. Their output path is three commands per accumulator
+         * column: PIM_WB_ACC, ST and PIM_ACC_RESET, 128 each on matvec 512x64. Only the
+         * ST is costed. PIM_WB_ACC and PIM_ACC_RESET appear in ZERO timing constraints
+         * in their DRAM model -- no bus occupancy, no spacing, nothing -- which is why
+         * their measured marginal costs are -8 and +24 cycles, i.e. noise.
          *
-         * They are emitted as WB rather than BW on purpose. Our BKWR carries full DRAM
-         * write semantics -- nRCDWR after ACT, and nCWL+nBL+nWR recovery before PRE --
-         * and charging the accumulator that way costs 1,677 of our 2,004 cycles where
-         * the same 256 commands cost DCC about 2% of theirs. Every PIM op in their
-         * model is spaced at nBL with no write recovery, which in our DRAM model is the
-         * BCAST_W timing class. Adopting it is a deliberate choice to evaluate against
-         * this baseline under ITS cost model, and it is confined to this tree: the
-         * default still charges an accumulator writeback as the DRAM write it is, which
-         * is the stricter of the two readings.
+         * So one costed write is emitted and the two free ones are not. Emitting them
+         * would charge us 1,418 of 1,745 cycles for work the baseline charges nothing
+         * for, which is not a cost model difference we should absorb silently: it is
+         * the difference between the two models, and the comparison is run under
+         * theirs. The omitted count is tracked so it stays visible.
          *
-         * The opcode is borrowed for its timing, not its semantics -- BCAST_W is a
-         * pseudochannel broadcast and an accumulator writeback is not. Reported numbers
-         * from this tree must say so. */
-        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+         * This is confined to this tree. The default charges an accumulator writeback
+         * as the DRAM write it is. */
+        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        /* PARITY ITEM 4. PIM_ACC_RESET, one per accumulator register per core, exactly
-         * as many as the writebacks. Nothing in our model or OptiPIM's charges it. */
-        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_writes += 3;
-        t->emitted_bw += 3;
+        stat_bank_writes++;
+        t->emitted_bw++;
+        stat_dcc_free_acc_ops += 2;   /* PIM_WB_ACC + PIM_ACC_RESET */
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
@@ -1712,8 +1707,9 @@ void pim_finalize(void) {
   fprintf(stderr, "[pim-runtime]   Total PIM ops  : %" PRIu64 "\n",
           stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
   fprintf(stderr,
+          "[pim-runtime]   DCC zero-cost acc ops omitted   : %" PRIu64 "\n"
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
-          stat_lockstep_skips, g_lockstep_enabled);
+          stat_dcc_free_acc_ops, stat_lockstep_skips, g_lockstep_enabled);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
