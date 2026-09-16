@@ -906,21 +906,34 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
-        /* PARITY ITEM 2. DCC resets the accumulator register before accumulating into
-         * it and writes it back after, and emits exactly as many PIM_ACC_RESETs as
-         * PIM_WB_ACCs (128 and 128 on every shape checked). Neither our model nor
-         * OptiPIM's charges the reset at all, so it exists only in this tree. Emitted
-         * alongside the writeback rather than at the true head of the output group:
-         * the count is exact, the position is approximate, and ACC_RESET is 2.7% of
-         * DCC's cycles so the position is not where the error would live. */
-        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+        /* PARITY ITEM 2, and the one place this tree adopts DCC's PRICING as well as
+         * their count. Their output path is PIM_WB_ACC + ST at the same offsets, 128
+         * each, which is what these two commands correspond to; their PIM_ACC_RESET is
+         * the third, emitted below.
+         *
+         * They are emitted as WB rather than BW on purpose. Our BKWR carries full DRAM
+         * write semantics -- nRCDWR after ACT, and nCWL+nBL+nWR recovery before PRE --
+         * and charging the accumulator that way costs 1,677 of our 2,004 cycles where
+         * the same 256 commands cost DCC about 2% of theirs. Every PIM op in their
+         * model is spaced at nBL with no write recovery, which in our DRAM model is the
+         * BCAST_W timing class. Adopting it is a deliberate choice to evaluate against
+         * this baseline under ITS cost model, and it is confined to this tree: the
+         * default still charges an accumulator writeback as the DRAM write it is, which
+         * is the stricter of the two readings.
+         *
+         * The opcode is borrowed for its timing, not its semantics -- BCAST_W is a
+         * pseudochannel broadcast and an accumulator writeback is not. Reported numbers
+         * from this tree must say so. */
+        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        stat_bank_writes++;
-        t->emitted_bw++;
-        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        stat_bank_writes++;
-        t->emitted_bw++;
+        /* PARITY ITEM 4. PIM_ACC_RESET, one per accumulator register per core, exactly
+         * as many as the writebacks. Nothing in our model or OptiPIM's charges it. */
+        emit_trace("WB", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                   loc->row, loc->col);
+        stat_bank_writes += 3;
+        t->emitted_bw += 3;
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
