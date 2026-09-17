@@ -99,6 +99,11 @@ __attribute__((weak)) extern const int32_t __pim_dq_bits;
  * configured bank count the charge shifts by their ratio. 0 = the kernel did not say. */
 __attribute__((weak)) extern const int32_t __pim_lanes;
 
+/* Cells ONE LANE keeps live across a reduction: the widest loop-carried accumulator, as
+ * the compiler saw it. The register file has to hold this, so the bound compares it
+ * against GRF_B. 0 = no loop-carried store, which is every elementwise kernel. */
+__attribute__((weak)) extern const int32_t __pim_acc_cells_per_lane;
+
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
@@ -106,6 +111,7 @@ const int32_t __pim_layout_rec_words = 0;
 const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
 const int32_t __pim_lanes = 0;
+const int32_t __pim_acc_cells_per_lane = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;

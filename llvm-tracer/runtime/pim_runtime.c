@@ -495,6 +495,79 @@ static uint64_t stat_dcc_free_acc_ops = 0;
  * Staging is emitted once per distinct (tensor, bank, row, col), into the stage phase,
  * on first read -- which is banks x columns-per-bank, exactly the vector. */
 static unsigned char g_dcc_activation[MAX_TENSORS];
+
+/* GRF-SIDE OPERAND, DCC's convention, this tree only.
+ *
+ * HBM-PIM's MAC takes one operand from a DRAM column and the other from the register
+ * file, so exactly one input needs a bank->GRF load. The residency classifier decides
+ * only REPLICATION, and a GEMV vector partitioned across a parallel axis comes back
+ * with the same verdict as the matrix (ReductionStridedMatrix, partitioned), so neither
+ * was staged and the GRF load went uncharged entirely -- the whole 1.28x on DCC's own
+ * gemv_single shapes.
+ *
+ * Discriminator is RANK, already in the artifact: the operand is broadcast along a
+ * parallel axis the streamed tensor carries, so it has fewer footprint axes. Equal
+ * ranks disqualify everything, which is every elementwise kernel, so the VA/RELU parity
+ * this tree exists for cannot move.
+ *
+ * Deduped per (bank, row, col), so a value loaded once stays resident. DCC instead
+ * reloads per output GRF block because n_grf is a fixed 8 in their generators; that
+ * difference is the residency LEVER and is deliberately left visible rather than
+ * emulated here. */
+static unsigned char g_dcc_grf_operand[MAX_TENSORS];
+static addr_dedup_state_t *g_dcc_grf_staged = NULL;
+static uint64_t stat_dcc_grf_loads = 0;
+static int g_dcc_grf_decided = 0;
+
+/* GRF_A, the operand register file: 8 entries of one column each (Aquabolt-XL GRF_A,
+ * and DCC's n_grf). Per bank, per dispatch. A column re-touched while resident is free;
+ * one evicted and touched again is staged and loaded again, which is the reload DCC's
+ * generator emits per output block. addr_dedup has no eviction, so this is a small LRU
+ * per bank rather than a table. */
+#define GRF_A_ENTRIES 8
+typedef struct { uint64_t key[GRF_A_ENTRIES]; uint64_t dispatch; uint8_t n; } grf_a_t;
+static grf_a_t g_grf_a[MAX_BANKS];
+static uint64_t stat_grf_a_loads = 0;    /* first touch of a column in a dispatch */
+static uint64_t stat_grf_a_refetch = 0;  /* touched again after eviction */
+
+/* GRF_B, the accumulator register file: 8 entries. The compiler states the widest
+ * loop-carried accumulator per lane (__pim_acc_cells_per_lane). Past capacity the kernel
+ * as written cannot run here: no opcode loads a partial sum back into GRF_B, so the only
+ * realization is a blocked kernel, and that is the compiler's to write. FLAGGED, NOT
+ * CHARGED. An invented spill cost would credit a transformation nobody made. */
+#define GRF_B_ENTRIES 8
+static int g_grf_b_overflow = 0;   /* cells beyond capacity, 0 = fits */
+
+/* Lazy: registration is one tensor at a time and this needs to compare them all.
+ *
+ * Rank would be the principled discriminator -- the operand is broadcast along a
+ * parallel axis the streamed tensor carries -- but PIM_LW_NUM_AXES reads 0 on these
+ * kernels because the residency pass does not populate `footprint`, so the comparison
+ * is vacuous. Size stands in, and it is DCC's own stated rule rather than an invention:
+ * they stage the activation vector per invocation and leave the weight matrix resident.
+ * STRICTLY smaller, so an elementwise kernel whose inputs match in size selects nothing
+ * and the VA/RELU parity this tree exists for cannot move. */
+static void dcc_pick_grf_operand(void) {
+  int best = -1;
+  for (int i = 0; i < num_tensors; i++) {
+    if (tensors[i].role == PIM_ROLE_ACCUMULATOR) continue;
+    if (tensors[i].bank_replicated != 0) continue;  /* replicated takes the W path */
+    if (best < 0 || tensors[i].num_elements < tensors[best].num_elements) best = i;
+  }
+  if (best < 0) return;
+  /* The larger tensor must be PARTITIONED too. Comparing against a replicated one elects
+   * the streamed matrix whenever a replicated operand is bigger: measured on matmul
+   * 64x256x32 with bank_axis=0 (A partitioned 2,048, B replicated 8,192) as PIM_MAC_OP1
+   * 0 -- the entire compute stream replaced by operand loads. A replicated tensor is
+   * already the GRF side by way of the W path and is not a candidate on either side. */
+  for (int i = 0; i < num_tensors; i++)
+    if (i != best && tensors[i].role != PIM_ROLE_ACCUMULATOR &&
+        tensors[i].bank_replicated == 0 &&
+        tensors[i].num_elements > tensors[best].num_elements) {
+      g_dcc_grf_operand[best] = 1;
+      return;
+    }
+}
 static addr_dedup_state_t *g_dcc_staged = NULL;
 static uint64_t stat_dcc_staged = 0;
 
@@ -656,16 +729,127 @@ static void dp_push(int phase, const char *op, uint64_t addr) {
   dp_len[phase] += n;
 }
 
+/* GRF-operand staging is recorded, not pushed as text, because its ORDER is DCC's and
+ * not the replay's. Each lane replays the program in turn, so pushing at emission gives
+ * eight consecutive commands to one bank, serialized; their generator nests block, then
+ * column, then bank, so consecutive commands hit 32 different banks. Same commands, 4%
+ * apart in cycles. Flushed sorted into the stage and operand-load positions. */
+typedef struct { uint64_t dispatch, addr, round; int stage; } grf_rec_t;
+static grf_rec_t *g_grf_recs = NULL;
+static size_t g_grf_n = 0, g_grf_cap = 0;
+
+static void grf_record(uint64_t addr, int stage) {
+  if (g_grf_n == g_grf_cap) {
+    g_grf_cap = g_grf_cap ? g_grf_cap * 2 : 4096;
+    g_grf_recs = (grf_rec_t *)realloc(g_grf_recs, g_grf_cap * sizeof *g_grf_recs);
+    if (!g_grf_recs) { fprintf(stderr, "[pim-runtime] ERROR: grf record alloc\n"); exit(1); }
+  }
+  g_grf_recs[g_grf_n].dispatch = cur_dispatch;
+  g_grf_recs[g_grf_n].round = 0;
+  g_grf_recs[g_grf_n].stage = stage;
+  g_grf_recs[g_grf_n++].addr = addr;
+}
+
+/* Their nesting is block, column, bank. Within one dispatch a reloaded column (GRF_A
+ * evicted it) is a later ROUND, not a neighbour of its first load, so the round sorts
+ * ahead of the column. Rounds are numbered after a first sort brings equal addresses
+ * together; on the DCC shapes nothing reloads within a dispatch and every round is 0. */
+static int grf_rec_cmp(const void *a, const void *b) {
+  const grf_rec_t *x = (const grf_rec_t *)a, *y = (const grf_rec_t *)b;
+  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  if (x->dispatch != y->dispatch) return x->dispatch < y->dispatch ? -1 : 1;
+  if (x->round != y->round) return x->round < y->round ? -1 : 1;
+  uint64_t xo = x->addr % g_ba, yo = y->addr % g_ba;      /* column within the bank */
+  if (xo != yo) return xo < yo ? -1 : 1;
+  return x->addr < y->addr ? -1 : (x->addr > y->addr);    /* then bank */
+}
+
+static void grf_sort(void) {
+  for (size_t i = 0; i < g_grf_n; i++) g_grf_recs[i].round = 0;
+  qsort(g_grf_recs, g_grf_n, sizeof *g_grf_recs, grf_rec_cmp);   /* equal addrs adjacent */
+  for (size_t i = 1; i < g_grf_n; i++)
+    if (g_grf_recs[i].addr == g_grf_recs[i - 1].addr &&
+        g_grf_recs[i].dispatch == g_grf_recs[i - 1].dispatch)
+      g_grf_recs[i].round = g_grf_recs[i - 1].round + 1;
+  qsort(g_grf_recs, g_grf_n, sizeof *g_grf_recs, grf_rec_cmp);
+}
+
+/* DRAM state and register state have different lifetimes, so they are emitted on
+ * different conditions. The ST puts the value into the bank and it STAYS there, so it is
+ * charged once per address for the whole kernel. The PIM_LD_OP1 pulls it bank -> GRF_A
+ * and the register file is reloaded per dispatch, so it is charged on every miss.
+ * Coupling them, which this did until 2026-09-17, re-staged x once per output block:
+ * 768 surplus ST worth 1,512 cycles at 1x32x128x512, charged against us on the parity
+ * rung and credited to us on the lever rung. DCC separates them the same way -- their
+ * 256 LD + 256 ST is a one-time host broadcast, their 1,024 PIM_LD_OP1 is per block. */
+static void grf_flush_into(int phase) {
+  for (size_t i = 0; i < g_grf_n; i++) {
+    if (phase == DP_STAGE) {
+      if (g_grf_recs[i].stage)
+        fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)g_grf_recs[i].addr);
+    } else {
+      fprintf(trace_fp, "PIM_LD_OP1 0x%08llx\n", (unsigned long long)g_grf_recs[i].addr);
+    }
+  }
+}
+
 static void dp_flush(void) {
   if (!trace_fp) return;
+  if (g_grf_n) grf_sort();
   for (int i = 0; i < DP_N; i++) {
-    if (!dp_len[i]) continue;
-    fwrite(dp_buf[i], 1, dp_len[i], trace_fp);
+    int grf_here = g_grf_n && (i == DP_STAGE || i == DP_LDOP);
+    if (!dp_len[i] && !grf_here) continue;
+    if (dp_len[i]) fwrite(dp_buf[i], 1, dp_len[i], trace_fp);
+    if (grf_here) grf_flush_into(i);
     /* a barrier between phases, as their generator emits */
     if (i != DP_N - 1) fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
     free(dp_buf[i]); dp_buf[i] = NULL; dp_len[i] = dp_cap[i] = 0;
   }
+  free(g_grf_recs); g_grf_recs = NULL; g_grf_n = g_grf_cap = 0;
 }
+
+/* 1 = miss, stage and load; 0 = resident. Most recent at slot 0. dispatch+1 so a
+ * zeroed struct never matches dispatch 0. */
+static int grf_a_touch(int gb, uint64_t key) {
+  grf_a_t *g = &g_grf_a[gb];
+  if (g->dispatch != cur_dispatch + 1) { g->dispatch = cur_dispatch + 1; g->n = 0; }
+  for (int i = 0; i < g->n; i++)
+    if (g->key[i] == key) {
+      for (int j = i; j > 0; j--) g->key[j] = g->key[j - 1];
+      g->key[0] = key;
+      return 0;
+    }
+  int n = g->n < GRF_A_ENTRIES ? g->n + 1 : GRF_A_ENTRIES;
+  for (int j = n - 1; j > 0; j--) g->key[j] = g->key[j - 1];
+  g->key[0] = key;
+  g->n = (uint8_t)n;
+  return 1;
+}
+
+static void grf_b_check(void) {
+  /* Cells, so the cap is entries x values-per-entry and depends on the ACCUMULATOR's
+   * dtype: 16 fp16 or 8 int32 per 256-bit entry. Reading it off the registered tensor
+   * rather than cfg_data_width_bits keeps an int32 accumulator from being judged as fp16. */
+  int esz = cfg_data_width_bits > 0 ? cfg_data_width_bits / 8 : 2;
+  for (int i = 0; i < num_tensors; i++)
+    if (tensors[i].role == PIM_ROLE_ACCUMULATOR && tensors[i].elem_size > 0) {
+      esz = tensors[i].elem_size;
+      break;
+    }
+  if (esz < 1) esz = 2;
+  int cap = GRF_B_ENTRIES * ((cfg_dq_bits / 8) / esz);
+  if ((int)__pim_acc_cells_per_lane > cap) {
+    g_grf_b_overflow = (int)__pim_acc_cells_per_lane - cap;
+    fprintf(stderr, "[pim-runtime] ERROR: accumulator tile is %d cells per lane; GRF_B "
+                    "holds %d. Not realizable as written, block the output in the "
+                    "kernel. Cycles from this run are NOT physical.\n",
+            (int)__pim_acc_cells_per_lane, cap);
+  }
+}
+
+/* Read back by the harness over ctypes, so a number can carry whether it is physical. */
+int pim_dcc_grf_b_overflow(void) { return g_grf_b_overflow; }
+uint64_t pim_dcc_grf_a_refetches(void) { return stat_grf_a_refetch; }
 
 static void emit_dcc(const char *op, uint64_t addr) {
   fprintf(trace_fp, "%s 0x%08llx\n", op, (unsigned long long)addr);
@@ -1265,6 +1449,12 @@ void pim_init(const char *trace_file) {
   }
 
   num_tensors = 0;
+  g_dcc_grf_decided = 0;
+  memset(g_dcc_grf_operand, 0, sizeof(g_dcc_grf_operand));
+  memset(g_grf_a, 0, sizeof(g_grf_a));
+  g_grf_b_overflow = 0;
+  stat_grf_a_loads = stat_grf_a_refetch = stat_dcc_grf_loads = 0;
+  if (g_dcc_grf_staged) { addr_dedup_destroy(g_dcc_grf_staged); g_dcc_grf_staged = NULL; }
   cur_phase = PIM_PHASE_IDLE;
   memset(next_free_row, 0, sizeof(next_free_row));
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
@@ -1864,8 +2054,17 @@ void pim_finalize(void) {
 
   finalized = 1;
 
-  if (g_trace_format_dcc)
+  if (g_trace_format_dcc) {
+    /* The check is lazy, on the first compute-phase load of a non-accumulator tensor. A
+     * kernel with no such load would otherwise never be judged, so a run can never end
+     * with the bound unexamined. */
+    if (!g_dcc_grf_decided) {
+      g_dcc_grf_decided = 1;
+      dcc_pick_grf_operand();
+      grf_b_check();
+    }
     dp_flush();
+  }
 
   if (trace_fp) {
     fclose(trace_fp);
@@ -1891,6 +2090,10 @@ void pim_finalize(void) {
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_dcc_staged, stat_dcc_free_acc_ops, stat_lockstep_skips,
           g_lockstep_enabled);
+  fprintf(stderr,
+          "[pim-runtime]   GRF_A operand loads / refetches : %" PRIu64 " / %" PRIu64 "\n"
+          "[pim-runtime]   GRF_B accumulator overflow      : %d cells beyond capacity\n",
+          stat_grf_a_loads, stat_grf_a_refetch, g_grf_b_overflow);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
@@ -2010,6 +2213,52 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * OUTPUT tensor as well as the weight -- so this is DCC-specific and stays in this
    * tree. It is also the single largest remaining gap, 4 commands against 128. */
   int is_acc_store = (is_write && t->role == PIM_ROLE_ACCUMULATOR);
+  /* GRF-SIDE OPERAND, DCC format only. A per-bank event decided by that bank's GRF_A, so
+   * it must not enter the group-level collapse below: the collapse folds a later re-read
+   * of the same column into the first as if it were a lane replica, which granted
+   * residency upstream of any bound (K=256 loaded each column once where a bounded
+   * GRF_A reloads per block). It also emitted a group-level MAC_OP1 for the read, which
+   * DCC does not: their x read IS the LD_OP1. */
+  if (g_trace_format_dcc && !is_write && cur_phase == PIM_PHASE_COMPUTE &&
+      t->role != PIM_ROLE_ACCUMULATOR) {
+    if (!g_dcc_grf_decided) {
+      g_dcc_grf_decided = 1;
+      dcc_pick_grf_operand();
+      grf_b_check();
+    }
+    int tid = (int)(t - tensors);
+    if (tid >= 0 && tid < MAX_TENSORS && g_dcc_grf_operand[tid]) {
+      int lane = __pim_get_bank_id();
+      if (lane < 0 || lane >= MAX_BANKS)
+        lane = 0;
+      uint64_t lrow = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+      uint64_t key = ((uint64_t)tid << 40) | (lrow << 8) | (uint64_t)loc.col;
+      if (grf_a_touch(lane, key)) {
+        /* g_dcc_grf_staged only tells a first touch from a refetch, for the stats. */
+        /* Keyed WITHOUT the dispatch: this asks whether the value has ever been put in
+         * this bank, not whether it is in the register file right now. */
+        if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
+        int first_stage = addr_dedup_check_and_mark(
+            g_dcc_grf_staged, perbank_ns(t, loc.ch, loc.pch, loc.bg, loc.bank, 0),
+            lrow, (uint64_t)loc.col);
+        if (first_stage)
+          stat_grf_a_loads++;
+        else
+          stat_grf_a_refetch++;
+        grf_record(dcc_addr(loc.ch, loc.pch, loc.bg, loc.bank, loc.sa, loc.row, loc.col),
+                   first_stage);
+        stat_dcc_grf_loads++;
+        /* Counted as W: this IS an operand delivered into a bank's register file, and in
+         * DCC format the W branch of emit_trace emits the same ST + PIM_LD_OP1 pair.
+         * Without it the finalize table shows the tensor as never read while its commands
+         * sit in the trace. A resident hit emits nothing and counts nothing, so the gap
+         * between range_calls and W is the residency. */
+        stat_writes++;
+        t->emitted_w++;
+      }
+      return;
+    }
+  }
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
