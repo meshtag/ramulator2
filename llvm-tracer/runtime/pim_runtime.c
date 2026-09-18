@@ -474,6 +474,37 @@ static int g_warned_dispatch_overflow = 0;
  *  Helpers
  * ================================================================ */
 
+/* ============================================================================
+ * OPTIPIM ADDRESSING: MEASURED, DOCUMENTED, AND NOT ADOPTED (reverted 2026-09-18).
+ * Adopted on an explicit decision (2026-09-18) so the cross-stack comparison runs on
+ * OptiPIM's own peer-reviewed model end to end. Documented here rather than buried.
+ *
+ * WHAT THEY DO. Their reachable codegen (alloc_method "new" -> codegen_new,
+ * fimdram.cpp:23-77) computes a real row and column for every access --
+ *     int row_addr = row.first % m_rows_per_bank;
+ *     source_addr[row] = row_addr;  source_addr[column] = col.first;
+ * -- then uses them for the WEIGHT tensor only. For the output it pushes `base_addr`
+ * (:44) and for the input `bank_base_addr[...]` (:69), discarding the row and column
+ * computed three lines above in the same scope.
+ *
+ * WHY WE CALL IT A DEFECT. Their own MILP emits per-tensor address coefficients in the
+ * descriptor it hands the simulator (Coeff_P2,P0,P1: 256,1,32 and Coeff_R2,R0,R1:
+ * 16,1,16 on matmul_256x512x64), so the MODEL knows where the data lives; the codegen
+ * does not apply it for two of three tensors. Measured consequence: all 32,768 of their
+ * output reads land on ONE (bank,row,col) tuple, 0.003% of a 1 MB output tensor, and
+ * their input writes on ~32, 1.6% of the input. One address means the row buffer is
+ * always already open, so those streams pay no activations. On our side, with faithful
+ * addressing, row activations were 77% of our cycles (9,216 x 24 = 221,184 of 286,597).
+ *
+ * WHAT ADOPTING IT COSTS. Our trace no longer states where our data is. Correctness is
+ * unaffected -- _verify_correctness compares computed values, not addresses -- but the
+ * emitted stream stops describing the memory behaviour of the computation, which is the
+ * property that makes every other number in this repo checkable. EVERY figure produced
+ * in this tree must carry that disclosure.
+ *
+ * SCOPE. This tree only (PIM_COST_MODEL=optipim-parity). The default OptiPIM path and
+ * the DCC tree keep faithful addressing and are untouched.
+ * ============================================================================ */
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
   fprintf(trace_fp, "%s %d,%d,%d,%d,%d,%d,%d\n", op, ch, pch, bg, bank, sa, row,
@@ -808,24 +839,29 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * 2026-09-04 was that forbidden option and is reverted here (2026-09-05). */
         int dch, dpch, dbg, dbank;
         decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
         break;
       }
       case PIM_ROLE_ACCUMULATOR:
-        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
+        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
+        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa, loc->row, loc->col);
         stat_reads++;
         t->emitted_r++;
         break;
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
-        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_writes++;
-        t->emitted_bw++;
+        /* OPTIPIM CONVENTION, this tree only. They charge no accumulator write-back:
+         * their reachable codegen (fimdram.cpp:43-44, alloc_method "new") emits a plain
+         * `read` of partial sums and no bank-write anywhere. Charging BW against a
+         * baseline that emits none is bookkeeping, not compiler quality. */
+        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
+        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa, loc->row, loc->col);
+        stat_reads++;
+        t->emitted_r++;
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
@@ -1716,7 +1752,15 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * input loading per PU inside its MILP objective, and taking the broadcast without
    * re-solving their optimizer would charge us for a dispatch the baseline never
    * gets. Both stacks now charge one write per receiving bank. */
-  int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
+  /* OPTIPIM CONVENTION, this tree only: operand loads DO enter the collapse. Their
+   * config sets single_bank_opt, and fimdram.cpp:277-282 breaks out of the spatial loop
+   * after the leader bank, so their trace carries ONE bank's commands. The default tree
+   * exempts operand loads and charges one per receiving bank -- a 16x asymmetry on
+   * matmul 256x512x64 (their A writes 32,768 = 2x the tensor; ours were 524,288 = 32x).
+   * Stays DISPATCH-SCOPED via cur_dispatch in the key below: bank replicas fold, a later
+   * program instance re-delivering does not. Collapsing unscoped grants cross-pid operand
+   * residency the register file cannot provide (measured 18.8x FASTER than OptiPIM). */
+  int is_operand_load = 0;
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
