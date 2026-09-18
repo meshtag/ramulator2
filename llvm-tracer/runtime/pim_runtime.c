@@ -1710,13 +1710,28 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * STREAMED tensors (each PE reads its own bank-local slice via BR)
    * still collapse — those are genuine SIMD-bank-parallel bank-reads,
    * not bus broadcasts. */
-  /* EVERY operand load bypasses the collapse and pays its per-bank write, broadcasts
-   * included. Real HBM-PIM does have an all-bank GRF broadcast (Lee et al. ISCA'21
-   * III-A/III-B), so this is a SYMMETRY choice, not a hardware limit: OptiPIM prices
-   * input loading per PU inside its MILP objective, and taking the broadcast without
-   * re-solving their optimizer would charge us for a dispatch the baseline never
-   * gets. Both stacks now charge one write per receiving bank. */
-  int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
+  /* OPERAND LOADS NOW COLLAPSE. 2026-09-18.
+   *
+   * They used to bypass, paying one write per RECEIVING BANK (32x here), to stay
+   * "symmetric" with OptiPIM on the belief that "both stacks charge one write per
+   * receiving bank". THAT PREMISE IS FALSE, measured on 40 shapes. OptiPIM's shared
+   * config sets single_bank_opt, and their fimdram.cpp:277-282 breaks out of the spatial
+   * loop after the leader bank, so their trace carries ONE bank's commands and the other
+   * 31 are assumed to run in lockstep for free:
+   *   matmul_1024x512x32  their writes 16,384 = banks x columns EXACTLY
+   *   matmul_256x512x64   A is 16,384 elements, their writes 32,768 = ~2 per element
+   *   38 conv shapes      writes per input element 0.06x-2.3x, clustered near 0.5x
+   * Nothing near the 32x that per-receiving-bank charging produces.
+   *
+   * The hardware agrees with the collapse, not the exemption: real HBM-PIM has an
+   * all-bank GRF broadcast (Lee et al. ISCA'21 III-A/III-B), which the old comment
+   * conceded while giving it up anyway.
+   *
+   * Scope is unchanged and load-bearing: cur_dispatch rides in the key below, so bank
+   * replicas of ONE instruction fold while a later program instance re-delivering the
+   * same operand does not. Collapsing unscoped grants cross-pid operand residency the
+   * register file cannot provide (measured 18.8x FASTER than OptiPIM, an artifact). */
+  int is_operand_load = 0;
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
