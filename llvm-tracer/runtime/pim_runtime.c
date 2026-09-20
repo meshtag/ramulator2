@@ -505,6 +505,24 @@ static int g_warned_dispatch_overflow = 0;
  * SCOPE. This tree only (PIM_COST_MODEL=optipim-parity). The default OptiPIM path and
  * the DCC tree keep faithful addressing and are untouched.
  * ============================================================================ */
+/* OPERAND RESIDENCY, OPTIPIM COST MODEL, THIS TREE ONLY.
+ *
+ * Their codegen gates the operand write on first_time_in_col (fimdram.cpp:58): an operand
+ * column is written into each receiving bank ONCE and reused across every temporal step.
+ * Verified on matmul_1024x512x32, where their writes are banks x columns exactly.
+ *
+ * So: delivery is PER RECEIVING BANK (no collapse -- that would be a second amortisation
+ * they do not take, measured 32x too generous) and residency is UNBOUNDED across programs.
+ *
+ * NEITHER SIDE MODELS THE REGISTER FILE HERE, deliberately. Their MILP has no
+ * register-file term (ten arch fields, all DRAM geometry), and holding an operand this
+ * long needs 8,192 fp16 per PE against Aquabolt-XL's 128-value GRF_A -- 64x over. We adopt
+ * their model so the comparison is on their terms rather than ours. REQUIRED DISCLOSURE on
+ * every number from this tree; it is optimistic for BOTH stacks symmetrically. The default
+ * path and the DCC tree keep the per-dispatch model and are untouched. */
+static addr_dedup_state_t *g_op_resident = NULL;
+static uint64_t stat_op_resident_hits = 0;
+
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
   fprintf(trace_fp, "%s %d,%d,%d,%d,%d,%d,%d\n", op, ch, pch, bg, bank, sa, row,
@@ -839,7 +857,18 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * 2026-09-04 was that forbidden option and is reverted here (2026-09-05). */
         int dch, dpch, dbg, dbank;
         decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
-        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
+        /* Charged once per (bank, row, col) for the whole kernel: their first_time_in_col. */
+        if (!g_op_resident) g_op_resident = addr_dedup_create(65536);
+        if (!addr_dedup_check_and_mark(
+                g_op_resident,
+                /* per-BANK namespace: fields packed tight, widest last, 16 bits total */
+                (((uint64_t)(t - tensors) & 0xFULL)
+                 | (((uint64_t)dch & 0x3ULL) << 4)
+                 | (((uint64_t)dpch & 0x3ULL) << 6)
+                 | (((uint64_t)dbg & 0x7ULL) << 8)
+                 | (((uint64_t)dbank & 0xFULL) << 11)),
+                (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row,
+                (uint64_t)loc->col)) { stat_op_resident_hits++; break; }
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
@@ -1028,6 +1057,8 @@ void pim_init(const char *trace_file) {
   }
 
   num_tensors = 0;
+  if (g_op_resident) { addr_dedup_destroy(g_op_resident); g_op_resident = NULL; }
+  stat_op_resident_hits = 0;
   cur_phase = PIM_PHASE_IDLE;
   memset(next_free_row, 0, sizeof(next_free_row));
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
@@ -1760,7 +1791,13 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * Stays DISPATCH-SCOPED via cur_dispatch in the key below: bank replicas fold, a later
    * program instance re-delivering does not. Collapsing unscoped grants cross-pid operand
    * residency the register file cannot provide (measured 18.8x FASTER than OptiPIM). */
-  int is_operand_load = 0;
+  /* Operand loads do NOT collapse across banks in this tree. Their model delivers the
+   * operand PER RECEIVING BANK and amortises it across temporal steps (first_time_in_col,
+   * fimdram.cpp:58) -- one amortisation, not two. Collapsing as well gave both and came
+   * out 32x too generous (geomean 6.33x, up to 14x). Arithmetic on matmul_256x512x64:
+   * A is 16,384 elements = 1,024 columns; 32 banks x 1,024 columns = 32,768, which is
+   * their measured write count exactly. */
+  int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
   if (g_lockstep_enabled && g_lockstep_collapse &&
       cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
@@ -1774,7 +1811,27 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * dispatch still collapse. Replaces resetting the table per program instance. */
     uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
     uint64_t key_col = (uint64_t)loc.col;
-    key_row |= cur_dispatch << g_dispatch_shift;
+    /* OPERAND RESIDENCY IS CROSS-PROGRAM IN THIS TREE, matching OptiPIM's cost model.
+     *
+     * Their codegen gates the operand write on first_time_in_col (fimdram.cpp:58), so an
+     * operand column is delivered ONCE and reused across every temporal step. Verified on
+     * matmul_1024x512x32: their writes are 16,384 = banks x columns exactly, not per
+     * temporal step and not per use. We charge per dispatch everywhere else, which is the
+     * per-pid model the default path keeps, and against a baseline that charges once that
+     * asymmetry is ours to eat.
+     *
+     * NEITHER SIDE MODELS THE REGISTER FILE HERE. Their MILP has no register-file term at
+     * all (ten arch fields, all DRAM geometry), and holding an operand across temporal
+     * steps needs 8,192 fp16 per PE against Aquabolt-XL's 128-value GRF_A -- 64x over. We
+     * adopt it anyway so the comparison is apples-to-apples on their cost model rather
+     * than ours. THIS IS A REQUIRED DISCLOSURE on any number from this tree: it is
+     * optimistic for BOTH stacks symmetrically, not for one.
+     *
+     * Scoped to operand loads. Streamed reads keep the dispatch in their key, because
+     * their weight load is ungated too (:37, the first_time_in_use is commented out), so
+     * re-streaming is already symmetric. */
+    if (!(t->role == PIM_ROLE_OPERAND && !is_write))
+      key_row |= cur_dispatch << g_dispatch_shift;
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key, key_row,
                                    key_col)) {
       stat_lockstep_skips++;
