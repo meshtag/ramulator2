@@ -162,7 +162,6 @@ typedef struct {
   size_t total_bytes;
   int elem_size;
   // The maximum number of dimensions is 4 for now.
-  int dims[4];
   int num_elements;
   pim_role_t role;
 
@@ -404,48 +403,6 @@ static int g_acc_spill_ksteps = 0;
 static uint64_t stat_acc_spill_emitted = 0;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
-
-/* Per-program-id store dedup for ACCUMULATOR tensors.
- *
- * Modeling assumption:
- *   A Triton program-id is one logical unit of work (one output tile). In the
- *   common kernels we model here (matvec/matmul/conv/elemwise), the tile's
- *   partial sums live in registers during COMPUTE and are materialized to the
- *   ACCUMULATOR tensor once at the end of that program-id. Under that
- *   write-once-per-output-tuple model, multiple IR-level stores that resolve
- *   to the same physical (global_bank, linear_row, col) within one program-id
- *   are redundant from the DRAM-trace point of view and should count as one
- *   BW emission.
- *
- * Why duplicates happen even when the kernel is logically "write once":
- *   - Scalarization/vectorization can expose multiple IR stores that still
- *     target one physical column.
- *   - Adjacent vector lanes may collapse to the same physical tuple when
- *     values_per_col > 1.
- *   - A later store instruction in the same program-id may revisit a tuple a
- *     previous store instruction already materialized.
- *
- * What this does:
- *   The first store to a tuple in a program-id emits BW; later stores to that
- *   same tuple in the same program-id are dropped.
- *
- * When this is safe:
- *   For the current benchmark kernels, the kernels compute one output tile per
- *   program-id, keep the accumulator live, then drain it. They do not
- *   intentionally perform two semantically distinct writes to the same output
- *   tuple within one program-id.
- *
- * When this would be wrong:
- *   If a future kernel intentionally writes the same physical output location
- *   twice within one program-id and both writes should incur DRAM cost
- *   separately, this dedup would undercount. Examples include explicit
- *   spill/reload/drain patterns, multi-phase in-place updates, atomics, or any
- *   kernel whose memory semantics are not "final output materialization".
- *
- * Reset cadence:
- *   Reset on any program-id axis change (same cadence as g_dedup, the
- *   per-program-id load state).
- */
 
 /* The dispatch this runtime is currently seeing, taken from __pim_program_epoch.
  *
@@ -892,7 +849,6 @@ void pim_init(const char *trace_file) {
   if (cfg_data_width_bits < 1)
     cfg_data_width_bits = 1;
 
-  /* Reduction-col-axis lever (default OFF). */
 
   /* Bankgroup-interleave lever (default OFF). The compiler decides; the env var is an
    * ablation override. It used to win silently, which is the one compiler/host conflict
@@ -1153,23 +1109,6 @@ void pim_init(const char *trace_file) {
 
 static int stat_layout_from_compiler = 0;
 
-/* Kernel scalar arguments, indexed the way the compiler numbers tt.func
- * arguments (pointers first, then scalars, no constexprs). Pointer slots go
- * unused. This is the host reporting its own launch, not deciding anything. */
-#define PIM_MAX_KERNEL_SCALARS 64
-static int32_t g_kernel_scalars[PIM_MAX_KERNEL_SCALARS];
-static int g_num_kernel_scalars = 0;
-
-void pim_set_kernel_scalars(const int32_t *vals, int n) {
-  if (!vals || n < 0)
-    return;
-  if (n > PIM_MAX_KERNEL_SCALARS)
-    n = PIM_MAX_KERNEL_SCALARS;
-  for (int i = 0; i < n; i++)
-    g_kernel_scalars[i] = vals[i];
-  g_num_kernel_scalars = n;
-}
-
 /* Honor the compiler's descriptor for one tensor. No-op if the kernel has none.
  */
 /* Refuse a descriptor whose record width is not the one we stride by. The compiler's
@@ -1333,7 +1272,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
 
   int total = 1;
   for (int i = 0; i < ndims && i < 4; i++) {
-    t->dims[i] = dims[i];
     total *= dims[i];
   }
   t->num_elements = total;
@@ -1520,17 +1458,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
 /* (duplicate_bcast_tensor_per_bg removed 2026-06-22 with the row-duplicate
  * blank-dedup machinery.) */
 
-void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
-  /* REMOVED 2026-06-22: broadcast-scalar / row-duplicate was a blank reuse
-   * dedup (it modeled OptiPIM-style row_duplicate replication at trace level).
-   * Operand reuse is now realized in the IR (capacity-capped tiling) and the
-   * residual is charged by the faithful per-bank LRU + lockstep. This setter is
-   * a permanent no-op kept only for ABI compatibility with the harness bridge
-   * (pass_ablation.py wraps the call in try/except). */
-  (void)tensor_id;
-  (void)on;
-}
-
 void pim_set_phase(pim_phase_t phase) {
   const char *names[] = {"IDLE", "COMPUTE", "HOST"};
   if (phase <= PIM_PHASE_HOST) {
@@ -1546,6 +1473,25 @@ void pim_set_phase(pim_phase_t phase) {
       emit_acc_spill();
   }
   cur_phase = phase;
+}
+
+/* Arm the modelled spill. RESTORED 2026-09-22: the definition was lost in 36a995c,
+ * which deleted three neighbouring levers. emit_acc_spill() and its globals survived,
+ * so for two weeks IM_CHARGE_ACC_SPILL=1 charged nothing and an over-capacity tile was
+ * free again, which is the exact thing this mechanism exists to prevent. The host has
+ * called it the whole time and swallowed the AttributeError. */
+void pim_set_acc_spill(int tensor_id, int overflow_per_pe, int k_steps) {
+  if (tensor_id < 0 || tensor_id >= num_tensors || overflow_per_pe <= 0 ||
+      k_steps <= 0) {
+    g_acc_spill_tensor = -1;
+    return;
+  }
+  g_acc_spill_tensor = tensor_id;
+  g_acc_spill_overflow = overflow_per_pe;
+  g_acc_spill_ksteps = k_steps;
+  fprintf(stderr,
+          "[pim-runtime] accumulator spill armed: tensor %d, %d values/PE x %d K steps\n",
+          tensor_id, overflow_per_pe, k_steps);
 }
 
 /* Emit the modelled accumulator spill. Called once as COMPUTE ends, so it lands in
@@ -1632,7 +1578,7 @@ void pim_finalize(void) {
   if (stat_coalesce_overflow)
     fprintf(stderr,
             "[pim-runtime]   WARN coalesce buffer overflow    : %" PRIu64
-            " (raise PIM_COALESCE_MAX)\n",
+            " (PIM_COALESCE_MAX is a compile-time #define, not an env var)\n",
             stat_coalesce_overflow);
 
   /* Per-tensor breakdown — Stage-0 diagnostics. Useful for figuring out
@@ -1693,7 +1639,8 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
   /* Operand register-residency reuse skip retired 2026-09-04: reuse is now the
    * kernel tile, and a broadcast operand collapses to one WB below. ACCUMULATOR
    * (psum) residency is realized in codegen (loop-carried SSA), never a runtime
-   * skip. Stores are handled by the per-program-id write-once model below. */
+   * skip. Stores go through the same lockstep collapse as loads; the separate
+   * per-program-id store write-once model was removed 2026-09-09. */
 
   /* Lockstep dedup: collapse bank-replicated events at the same
    * (tensor_id, sa, row, col) within a program-id. Models 1 SIMD
@@ -1731,9 +1678,11 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * replicas of ONE instruction fold while a later program instance re-delivering the
    * same operand does not. Collapsing unscoped grants cross-pid operand residency the
    * register file cannot provide (measured 18.8x FASTER than OptiPIM, an artifact). */
-  int is_operand_load = 0;
+  /* No operand exemption any more: the evidence above retired it, so every role
+     takes the collapse. The `&& !is_operand_load` term that used to sit here was a
+     hardcoded 0 and could not fire. */
   if (g_lockstep_enabled && g_lockstep_collapse &&
-      cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
+      cur_phase == PIM_PHASE_COMPUTE) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
      * banks of a single (ch,pch); replicas in a different pch or channel ride a
      * separate command bus and need their own event. Omitting them collapsed

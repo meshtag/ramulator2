@@ -149,7 +149,6 @@ typedef struct {
   uint64_t emitted_R;      /* regular DRAM read  (R)  */
   uint64_t emitted_W;      /* regular DRAM write (W)  */
   uint64_t emitted_BR;     /* bank-read MAJ-3 op (BR) */
-  uint64_t emitted_BW;     /* bank-write         (BW) — reserved, currently unused on SIMDRAM */
   uint64_t dedup_skips;    /* re-touches of a resident (lane, cell): read out once */
 } tensor_info_t;
 
@@ -165,7 +164,6 @@ static int initialized = 0;
 static int finalized = 0;
 
 /* Per-bank linear row allocation, indexed by flat bank id */
-#define MAX_BANKS 4096
 
 /* Per-accumulator-tensor location tracking.
  * Each registered ACCUMULATOR tensor gets its own tracker entry so that
@@ -248,7 +246,6 @@ static uint64_t stat_k_amort_skips = 0;
  * Set PIM_K_AMORT=0 for the no-amortization
  * baseline (every compute_trace emits its full maj_cost). */
 static int g_k_amort_batch = 0;
-static uint64_t g_compute_trace_count = 0;
 /* Per-opcode batch counters: a MUL and an ADD amortize independently because
  * their MAJ-3 costs differ by ~14x. */
 static uint64_t g_compute_trace_count_by_op[SIMDRAM_OP_COUNT] = {0};
@@ -611,7 +608,6 @@ void simdram_init(const char *trace_file) {
    * still turns amortization off wholesale, which is a real ablation. */
   g_k_amort_batch = cfg_num_cols * cfg_dq_bits;
   if (g_k_amort_batch < 1) g_k_amort_batch = 1;
-  g_compute_trace_count = 0;
   memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   stat_k_amort_emissions = 0;
   fprintf(stderr,
@@ -668,9 +664,6 @@ void simdram_init(const char *trace_file) {
  * cost the baseline does not charge. What SIMDRAM lacked was the ALARM, not the
  * override, so this is the alarm on its own.
  *
- * PIM_STRICT_ROLES=1 turns a disagreement into an abort. It must stay silent on every
- * benchmarked kernel; if it ever fires, the host tag and the layout have diverged and
- * the SIMDRAM numbers for that shape are describing a mapping nobody chose.
  */
 /* Occupancy the COMPILER planned for, read out of the artifact.
  *
@@ -831,7 +824,7 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->role = role;
   t->cell_fanout = 1;
   t->emitted_R = t->emitted_W = 0;
-  t->emitted_BR = t->emitted_BW = 0;
+  t->emitted_BR = 0;
   t->dedup_skips = 0;
 
   int total = 1;
@@ -884,7 +877,6 @@ void simdram_set_phase(simdram_phase_t phase) {
   if (cur_phase != phase) {
     if (cur_phase == SIMDRAM_PHASE_COMPUTE)
       flush_all_lanes(); /* the last lane has no successor to flush it */
-    g_compute_trace_count = 0;
     memset(g_compute_trace_count_by_op, 0, sizeof(g_compute_trace_count_by_op));
   }
   cur_phase = phase;
@@ -926,7 +918,7 @@ void simdram_finalize(void) {
 
   fprintf(stderr,
           "\n[simdram] === Per-tensor breakdown ===\n"
-          "[simdram]   tid  role             R          W         BR         BW  "
+          "[simdram]   tid  role             R          W         BR  "
           "res_skips\n");
   for (int i = 0; i < num_tensors; i++) {
     tensor_info_t *t = &tensors[i];
@@ -935,10 +927,9 @@ void simdram_finalize(void) {
                                                                : "ACCUMUL.";
     fprintf(stderr,
             "[simdram]   %3d  %-9s  %10" PRIu64 " %10" PRIu64 " %10" PRIu64
-            " %10" PRIu64 "  %11" PRIu64 "\n",
+            "  %11" PRIu64 "\n",
             i, role_str,
-            t->emitted_R, t->emitted_W,
-            t->emitted_BR, t->emitted_BW,
+            t->emitted_R, t->emitted_W, t->emitted_BR,
             t->dedup_skips);
   }
 
@@ -1270,59 +1261,17 @@ void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes) {
  * ================================================================ */
 
 /*
- * Emit MAJ-3 gate operations as bank-read (BR) trace ops.
- * Cycles through pe_bits rows at the current accumulator location
- * (acc_trackers[current_acc]), matching OptiPIM's SimDRAMCodeGen pattern.
+ * Emit MAJ-3 gate operations as bank-read (BR) trace ops, cycling through
+ * pe_bits rows at the destination accumulator, matching OptiPIM's
+ * SimDRAMCodeGen pattern.
  *
- * KNOWN LIMITATION — Implicit accumulator association for non-accumulator ops
- * ─────────────────────────────────────────────────────────────────────────────
- * ComputeTracePass (ComputeTracePass.cpp) instruments every BinaryOperator in
- * LLVM IR with:
- *
- *     __compute_trace(opcode, bit_width)
- *
- * It passes ONLY the opcode and bit-width — NO destination address or SSA
- * value identity.  The runtime therefore cannot determine which accumulator
- * tensor a given arithmetic op feeds; instead, it relies on `current_acc`,
- * which is set by the most recent accumulator load or store in
- * simdram_trace_access().
- *
- * This works correctly for the typical tiled matmul access pattern:
- *
- *     load  acc[i,j]   →  sets current_acc to acc's tracker
- *     mul   a, b       →  BR ops emitted at acc[i,j]'s physical coords  ✓
- *     add   acc, tmp   →  BR ops emitted at acc[i,j]'s physical coords  ✓
- *     store acc[i,j]   →  updates acc's tracker (still correct)
- *
- * It BREAKS when:
- *
- *   1. Multiple accumulators are interleaved at the instruction level
- *      without an intervening accumulator load/store to switch current_acc.
- *      Example (fused kernel writing to both C and D):
- *
- *        load  C[i,j]     →  current_acc = C's tracker
- *        load  D[i,j]     →  current_acc = D's tracker  (overwritten!)
- *        mul   a, b       →  BR ops land at D's coords, but may feed C  ✗
- *
- *   2. Arithmetic ops that produce intermediate values consumed by later
- *      ops (e.g., `t = a * b; acc += t`): the `mul` has no inherent link
- *      to any accumulator.  It is attributed to whichever accumulator was
- *      most recently accessed — correct only if no other accumulator was
- *      touched in between.
- *
- *   3. Non-accumulator arithmetic (e.g., address calculations, loop
- *      induction variables) during COMPUTE phase: these get emitted as
- *      BR ops at the current accumulator location even though they aren't
- *      SIMDRAM in-memory operations.  This causes mild overcounting.
- *
- * POTENTIAL FIX: Extend ComputeTracePass to propagate the destination
- * address through LLVM's def-use chains — for each BinaryOperator, walk
- * the use chain forward to find the eventual StoreInst and pass that
- * store address to __compute_trace as a third argument.  The runtime can
- * then call find_tensor() + simdram_place_acc() to determine the exact physical
- * coordinates, fully decoupling compute tracing from the load/store order.
- * This requires non-trivial LLVM analysis (phi nodes, select instructions,
- * multi-level GEPs) and is left as future work.
+ * dest_addr is ComputeTracePass's forward def-use walk to the eventual store.
+ * When that walk fails the pass passes NULL and we fall back to `current_acc`,
+ * the tracker of the most recently touched accumulator cell. The fall-back
+ * misattributes when two accumulators interleave with no load or store between
+ * them, and charges BR for arithmetic that is not a SIMDRAM operation at all
+ * (address math, induction variables) during COMPUTE. bit_width is part of the
+ * ABI but unused: the MAJ-3 cost comes from the tensor's own pe_bits.
  */
 void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
   (void)bit_width;
@@ -1388,7 +1337,6 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
     tensor_id = at->tensor_idx;
   }
 
-  (void)tensor_id; /* reserved for future honest per-tensor stats */
 
   /* K-axis batch amortization (corrected A2). Count compute_traces
    * globally; emit MAJ-3 cost every g_k_amort_batch traces. This
@@ -1415,15 +1363,12 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
       stat_k_amort_skips++;
       return;
     }
-    g_compute_trace_count++;
     stat_k_amort_emissions++;
     cost = maj_cost(opcode);
-  } else if (g_k_amort_enabled) {
-    /* BATCH=1 → emit this opcode's MAJ-3 every compute_trace (no
-     * amortization). The honest per-arithmetic-op baseline. */
-    cost = maj_cost(opcode);
   } else {
-    /* k-amortization off (PIM_K_AMORT=0): every op pays in full. */
+    /* Either BATCH=1 or PIM_K_AMORT=0. Both mean the same thing, every op pays its
+     * own MAJ-3, which is the honest per-arithmetic-op baseline. They were two
+     * branches with identical bodies until 2026-09-22. */
     cost = maj_cost(opcode);
   }
 
