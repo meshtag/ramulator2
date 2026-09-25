@@ -887,8 +887,15 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
       dp_push(DP_STAGE, "ST", a);
       dp_push(DP_LDOP, "PIM_LD_OP1", a);
     } else if (!strcmp(op, "BW")) {                /* their entire output path */
-      dp_push(DP_RESET, "PIM_ACC_RESET", a);
-      dp_push(DP_WB, "PIM_WB_ACC", a);
+      /* A map has no accumulator to reset or drain, and DCC's own VA and RELU emit
+       * neither command. Gate on layout_count too: the weak-extern fallback makes both
+       * globals 0, so an artifact carrying no table must not read as elementwise. */
+      if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0) {
+        stat_dcc_free_acc_ops += 2;
+      } else {
+        dp_push(DP_RESET, "PIM_ACC_RESET", a);
+        dp_push(DP_WB, "PIM_WB_ACC", a);
+      }
       dp_push(DP_OUT, "ST", a);
     } else if (!strcmp(op, "R")) {
       dp_push(DP_STAGE, "LD", a);
@@ -1133,7 +1140,10 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   }
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
    * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x. */
-  int key_lane = (t->bank_replicated == 1) ? 0 : lane;
+  /* >= 1, not == 1: the compiler word carries the RECEIVER COUNT now (0 partitioned,
+   * 1 every bank, >1 exactly that many), so an equality test read a replicated tensor
+   * as partitioned the moment the count stopped being a flag. */
+  int key_lane = (t->bank_replicated >= 1) ? 0 : lane;
   int inserted = 0;
   int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
                                      t->lane_ord[key_lane], &inserted);
@@ -1263,18 +1273,9 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
-        /* PARITY ITEM 2, and the one place this tree adopts DCC's COST MODEL rather
-         * than just its counts. Their output path is three commands per accumulator
-         * column: PIM_WB_ACC, ST and PIM_ACC_RESET, 128 each on matvec 512x64. Only the
-         * ST is costed. PIM_WB_ACC and PIM_ACC_RESET appear in ZERO timing constraints
-         * in their DRAM model -- no bus occupancy, no spacing, nothing -- which is why
-         * their measured marginal costs are -8 and +24 cycles, i.e. noise.
-         *
-         * So one costed write is emitted and the two free ones are not. Emitting them
-         * would charge us 1,418 of 1,745 cycles for work the baseline charges nothing
-         * for, which is not a cost model difference we should absorb silently: it is
-         * the difference between the two models, and the comparison is run under
-         * theirs. The omitted count is tracked so it stays visible.
+        /* ACCUMULATOR here means "target of a tt.store", not "reduction target", so a
+         * map lands in this branch too. Whether its reset and writeback are emitted is
+         * decided in emit_trace's BW arm from the compiler's acc_cells_per_lane.
          *
          * This is confined to this tree. The default charges an accumulator writeback
          * as the DRAM write it is. */
@@ -1282,7 +1283,6 @@ static void emit_access_by_role_phase(tensor_info_t *t,
                    loc->row, loc->col);
         stat_bank_writes++;
         t->emitted_bw++;
-        stat_dcc_free_acc_ops += 2;   /* PIM_WB_ACC + PIM_ACC_RESET */
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
@@ -1724,7 +1724,7 @@ static void apply_compiler_layout(int tensor_id) {
       int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
       int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
       int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
-      int per_lane = _t->bank_replicated == 1 ? _t->num_elements
+      int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
                      : share2 > 65536 ? share2
                      : (_t->num_elements < 65536 ? _t->num_elements : 65536);
       int rows = (per_lane + vpr - 1) / vpr;
