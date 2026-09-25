@@ -269,6 +269,10 @@ static int next_free_row[MAX_BANKS];
 /* Statistics */
 static uint64_t stat_bank_reads = 0;
 static uint64_t stat_bank_writes = 0;
+/* Operand deliveries NOT charged because the compiler said the value is replicated over
+ * only some of the banks. 0 whenever every split is single-axis, which is every mapping
+ * our own picker emits. */
+static uint64_t stat_operand_repl_skips = 0;
 static uint64_t stat_reads = 0;
 static uint64_t stat_writes = 0;
 static uint64_t stat_ignored = 0;
@@ -669,7 +673,7 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   }
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
    * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x. */
-  int key_lane = (t->bank_replicated == 1) ? 0 : lane;
+  int key_lane = (t->bank_replicated >= 1) ? 0 : lane;
   int inserted = 0;
   int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
                                      t->lane_ord[key_lane], &inserted);
@@ -763,6 +767,20 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
          * (its broadcast shortcut is commented out). The BCAST_W path added
          * 2026-09-04 was that forbidden option and is reverted here (2026-09-05). */
+        /* HOW MANY BANKS ACTUALLY RECEIVE IT. bank_replicated is the compiler's count:
+         * 1 means every bank (a scalar splat, or an artifact built before the count
+         * existed), >1 means exactly that many. A value occupying one lane axis of a
+         * multi-axis split is replicated only along the axes it misses, so charging one
+         * write per replay lane billed OptiPIM's own 2-on-M-by-16-on-N mapping 16x over.
+         * Identical to the old behaviour whenever the split has a single axis. */
+        int all_b = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+        int recv = (t->bank_replicated > 1 && t->bank_replicated < all_b)
+                       ? t->bank_replicated : all_b;
+        int stride = (recv > 0) ? (all_b / recv) : 1;
+        if (stride > 1 && (__pim_get_bank_id() % stride) != 0) {
+          stat_operand_repl_skips++;
+          break;
+        }
         int dch, dpch, dbg, dbank;
         decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
@@ -1192,7 +1210,7 @@ static void apply_compiler_layout(int tensor_id) {
       int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
       int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
       int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
-      int per_lane = _t->bank_replicated == 1 ? _t->num_elements
+      int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
                      : share2 > 65536 ? share2
                      : (_t->num_elements < 65536 ? _t->num_elements : 65536);
       int rows = (per_lane + vpr - 1) / vpr;
@@ -1550,6 +1568,11 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
+  if (stat_operand_repl_skips)
+    fprintf(stderr,
+            "[pim-runtime]   Operand replication skips       : %" PRIu64
+            " (compiler said fewer banks receive it)\n",
+            stat_operand_repl_skips);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
