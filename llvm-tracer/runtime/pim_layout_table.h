@@ -104,6 +104,12 @@ __attribute__((weak)) extern const int32_t __pim_lanes;
  * against GRF_B. 0 = no loop-carried store, which is every elementwise kernel. */
 __attribute__((weak)) extern const int32_t __pim_acc_cells_per_lane;
 
+/* DCC's tile MAC (im-dcc-tile-mac), [operand_arg, column reads per MAC] pairs. Emitted only
+ * when the kernel selected it, so count 0 is the default. */
+#define PIM_MAX_TILE_MAC 16
+__attribute__((weak)) extern const int32_t __pim_dcc_tile_mac[2 * PIM_MAX_TILE_MAC];
+__attribute__((weak)) extern const int32_t __pim_dcc_tile_mac_count;
+
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
@@ -112,6 +118,8 @@ const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
 const int32_t __pim_lanes = 0;
 const int32_t __pim_acc_cells_per_lane = 0;
+const int32_t __pim_dcc_tile_mac[2 * PIM_MAX_TILE_MAC] = {0};
+const int32_t __pim_dcc_tile_mac_count = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;

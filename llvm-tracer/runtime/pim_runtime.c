@@ -218,6 +218,10 @@ typedef struct {
   uint64_t emitted_w;
   uint64_t dedup_skips;
   uint64_t range_calls;
+  /* DCC tile MAC: column reads one command covers (0 = one per column), and the count of
+   * surviving reads in the current dispatch. */
+  int tile_mac_reads;
+  uint64_t tile_ord, tile_disp;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -1027,9 +1031,28 @@ static int rec_cmp(const void *a, const void *b) {
  * FAN issues each collapsed compute command per addressed bank, ACC applies the declared
  * accumulator table (PIM_DCC_FANOUT), WAVE splits each program into its two waves, HOIST
  * puts operand loads hoisted above a tile loop after the next group's resets. */
-enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_HOIST = 8, NAT_ALL = 15 };
+enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_HOIST = 8, NAT_TILE = 16, NAT_ALL = 31 };
 static int g_dcc_native = 0, g_dcc_reset_none = 0, g_dcc_wb_addressed = 0;
-static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0;
+static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
+
+/* TILE: a stamped tensor issues one MAC per tile of surviving column reads. The reads it
+ * absorbs still resolve, place, stage and count for coverage, so no later address moves.
+ * A dispatch that ends mid-tile is refused: a DCC MAC cannot span one. */
+static int dcc_tile_issue(tensor_info_t *t) {
+  if (!(g_dcc_native & NAT_TILE) || !t || t->tile_mac_reads <= 0) return 1;
+  if (t->tile_disp != cur_dispatch + 1) {
+    if (t->tile_disp && t->tile_ord % (uint64_t)t->tile_mac_reads) {
+      fprintf(stderr, "[pim-runtime] ERROR: a dispatch ended mid-tile (%llu reads, tiles of "
+                      "%d)\n", (unsigned long long)t->tile_ord, t->tile_mac_reads);
+      exit(1);
+    }
+    t->tile_disp = cur_dispatch + 1;
+    t->tile_ord = 0;
+  }
+  if (t->tile_ord++ % (uint64_t)t->tile_mac_reads == 0) return 1;
+  stat_tile_absorbed++;
+  return 0;
+}
 
 static int dcc_addressed(int gb) { return gb % 4 < 2; }
 static uint64_t dcc_epoch(const dcc_rec_t *r) {
@@ -1058,6 +1081,18 @@ static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
 /* Records [0, nc) are the compute block in rec_cmp order. */
 static void dcc_native_emit(size_t nc) {
   uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  if (g_dcc_native & NAT_TILE) {
+    if (stat_fold_cmds) {
+      fprintf(stderr, "[pim-runtime] ERROR: TILE with lane folds, which no DCC MAC covers\n");
+      exit(1);
+    }
+    for (int k = 0; k < num_tensors; k++)
+      if (tensors[k].tile_mac_reads > 0 &&
+          tensors[k].tile_ord % (uint64_t)tensors[k].tile_mac_reads) {
+        fprintf(stderr, "[pim-runtime] ERROR: tensor %d ended mid-tile\n", k);
+        exit(1);
+      }
+  }
   if (cfg_num_channels != 1 || cfg_num_banks != 4 ||
       cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks != 32) {
     fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE models DCC's one-channel, 32-bank "
@@ -1108,6 +1143,7 @@ static void dcc_native_emit(size_t nc) {
 }
 
 int pim_dcc_native_mask(void) { return g_dcc_native; }
+uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
 
@@ -1236,7 +1272,8 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
           }
         }
       }
-      dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", a);
+      if (dcc_tile_issue((tensor_info_t *)t_emit))
+        dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", a);
       g_last_mac = a;
     } else if (!strcmp(op, "W")) {                 /* operand staged once, then into the GRF */
       if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
@@ -1898,7 +1935,7 @@ void pim_init(const char *trace_file) {
                     "trace through THEIR Ramulator, not ours.\n");
   }
   g_dcc_native = g_dcc_reset_none = g_dcc_wb_addressed = 0;
-  stat_native_off_bank0 = g_dcc_waves = 0;
+  stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = 0;
   {
     const char *nat = getenv("PIM_DCC_NATIVE"), *fo = getenv("PIM_DCC_FANOUT");
     if (nat && *nat) {
@@ -2085,7 +2122,18 @@ static void check_layout_rec_words(void) {
   }
 }
 
+static void apply_dcc_tile_mac(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  t->tile_mac_reads = 0;
+  t->tile_ord = t->tile_disp = 0;
+  int n = (int)__pim_dcc_tile_mac_count;
+  for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
+    if (__pim_dcc_tile_mac[2 * i] == tensor_id)
+      t->tile_mac_reads = __pim_dcc_tile_mac[2 * i + 1];
+}
+
 static void apply_compiler_layout(int tensor_id) {
+  apply_dcc_tile_mac(tensor_id);
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
   if (n <= 0) {
