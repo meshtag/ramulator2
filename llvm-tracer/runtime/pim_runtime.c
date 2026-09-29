@@ -1021,6 +1021,96 @@ static int rec_cmp(const void *a, const void *b) {
   return x->seq < y->seq ? -1 : (x->seq > y->seq);
 }
 
+/* DCC's machine, natively. Their generators address compute to the 16 banks at
+ * bank-in-group 0 and 1 and run each program as an even-bank wave, then an odd-bank wave,
+ * with their own accumulator addressing. PIM_DCC_NATIVE selects what is emitted that way:
+ * FAN issues each collapsed compute command per addressed bank, ACC applies the declared
+ * accumulator table (PIM_DCC_FANOUT), WAVE splits each program into its two waves, HOIST
+ * puts operand loads hoisted above a tile loop after the next group's resets. */
+enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_HOIST = 8, NAT_ALL = 15 };
+static int g_dcc_native = 0, g_dcc_reset_none = 0, g_dcc_wb_addressed = 0;
+static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0;
+
+static int dcc_addressed(int gb) { return gb % 4 < 2; }
+static uint64_t dcc_epoch(const dcc_rec_t *r) {
+  return __pim_persistent ? r->dispatch >> PIM_TILE_BITS : r->dispatch;
+}
+
+static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
+  int gb = (int)(r->addr / g_ba);
+  if (r->phase == DP_MAC && (g_dcc_native & NAT_FAN)) {
+    if (gb != 0) stat_native_off_bank0++;
+    uint64_t off = r->addr % g_ba;
+    for (int b = 0; b < 32; b++)
+      if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave))
+        fprintf(trace_fp, "%s 0x%08llx\n", r->op,
+                (unsigned long long)(off + (uint64_t)b * g_ba));
+    return;
+  }
+  if (g_dcc_native & NAT_ACC) {
+    if (r->phase == DP_RESET && g_dcc_reset_none) return;
+    if (r->phase == DP_WB && g_dcc_wb_addressed && !dcc_addressed(gb)) return;
+  }
+  if (wave >= 0 && (gb & 1) != wave) return;
+  fprintf(trace_fp, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+}
+
+/* Records [0, nc) are the compute block in rec_cmp order. */
+static void dcc_native_emit(size_t nc) {
+  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  if (cfg_num_channels != 1 || cfg_num_banks != 4 ||
+      cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks != 32) {
+    fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE models DCC's one-channel, 32-bank "
+                    "machine only\n");
+    exit(1);
+  }
+  if (!(g_dcc_native & NAT_WAVE)) {
+    for (size_t k = 0; k < nc; k++) nat_print(&g_recs[k], -1, g_ba);
+    return;
+  }
+  size_t *ord = (size_t *)malloc((nc ? nc : 1) * sizeof *ord);
+  if (!ord) { fprintf(stderr, "[pim-runtime] ERROR: native order alloc\n"); exit(1); }
+  for (size_t i = 0; i < nc;) {
+    uint64_t ep = dcc_epoch(&g_recs[i]);
+    size_t j = i, n = 0;
+    while (j < nc && dcc_epoch(&g_recs[j]) == ep) j++;
+    /* Groups are runs of one (dispatch, round). A group of operand loads only is held and
+     * placed after the next group's leading resets, where their generator loads it. */
+    size_t held_a = 0, held_b = 0;
+    int holding = 0, compute = 0;
+    for (size_t g = i; g < j;) {
+      size_t h = g;
+      int loads_only = 1;
+      while (h < j && g_recs[h].dispatch == g_recs[g].dispatch &&
+             g_recs[h].round == g_recs[g].round) {
+        if (g_recs[h].phase != DP_LDOP) loads_only = 0;
+        if (g_recs[h].phase == DP_MAC) compute = 1;
+        h++;
+      }
+      if ((g_dcc_native & NAT_HOIST) && loads_only && !holding) {
+        held_a = g; held_b = h; holding = 1;
+      } else {
+        size_t r = g;
+        if (holding)
+          while (r < h && g_recs[r].phase == DP_RESET) ord[n++] = r++;
+        if (holding) { for (size_t k = held_a; k < held_b; k++) ord[n++] = k; holding = 0; }
+        for (; r < h; r++) ord[n++] = r;
+      }
+      g = h;
+    }
+    if (holding) for (size_t k = held_a; k < held_b; k++) ord[n++] = k;
+    for (int w = 0; w < 2; w++)
+      for (size_t k = 0; k < n; k++) nat_print(&g_recs[ord[k]], w, g_ba);
+    g_dcc_waves += compute;
+    i = j;
+  }
+  free(ord);
+}
+
+int pim_dcc_native_mask(void) { return g_dcc_native; }
+uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
+uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
+
 static void dp_flush(void) {
   if (!trace_fp) return;
   if (g_grf_n) grf_sort();
@@ -1051,8 +1141,12 @@ static void dp_flush(void) {
   }
   if (g_rec_n) qsort(g_recs, g_rec_n, sizeof *g_recs, rec_cmp);
   size_t i = 0;
-  for (; i < g_rec_n && g_recs[i].phase != DP_OUT; i++)
-    fprintf(trace_fp, "%s 0x%08llx\n", g_recs[i].op, (unsigned long long)g_recs[i].addr);
+  while (i < g_rec_n && g_recs[i].phase != DP_OUT) i++;
+  if (g_dcc_native)
+    dcc_native_emit(i);
+  else
+    for (size_t k = 0; k < i; k++)
+      fprintf(trace_fp, "%s 0x%08llx\n", g_recs[k].op, (unsigned long long)g_recs[k].addr);
   if (i) fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
   for (; i < g_rec_n; i++)
     fprintf(trace_fp, "%s 0x%08llx\n", g_recs[i].op, (unsigned long long)g_recs[i].addr);
@@ -1802,6 +1896,38 @@ void pim_init(const char *trace_file) {
     g_trace_format_dcc = 1;
     fprintf(stderr, "[pim-runtime] emitting DCC's opcodes at DCC's addresses; run this "
                     "trace through THEIR Ramulator, not ours.\n");
+  }
+  g_dcc_native = g_dcc_reset_none = g_dcc_wb_addressed = 0;
+  stat_native_off_bank0 = g_dcc_waves = 0;
+  {
+    const char *nat = getenv("PIM_DCC_NATIVE"), *fo = getenv("PIM_DCC_FANOUT");
+    if (nat && *nat) {
+      g_dcc_native = atoi(nat);
+      if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
+          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
+          ((g_dcc_native & NAT_HOIST) && !(g_dcc_native & NAT_WAVE))) {
+        fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
+                        "trace format\n", nat);
+        exit(1);
+      }
+    }
+    if (fo && *fo) {
+      if (!(g_dcc_native & NAT_ACC) ||
+          !(strstr(fo, "reset=none") || strstr(fo, "reset=bank")) ||
+          !(strstr(fo, "wb=addressed") || strstr(fo, "wb=bank"))) {
+        fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_FANOUT=%s needs the ACC bit and "
+                        "reset=none|bank,wb=addressed|bank\n", fo);
+        exit(1);
+      }
+      g_dcc_reset_none = strstr(fo, "reset=none") != NULL;
+      g_dcc_wb_addressed = strstr(fo, "wb=addressed") != NULL;
+    } else if (g_dcc_native & NAT_ACC) {
+      fprintf(stderr, "[pim-runtime] ERROR: the ACC bit needs PIM_DCC_FANOUT\n");
+      exit(1);
+    }
+    if (g_dcc_native)
+      fprintf(stderr, "[pim-runtime] dcc native mask=%d reset=%s wb=%s\n", g_dcc_native,
+              g_dcc_reset_none ? "none" : "bank", g_dcc_wb_addressed ? "addressed" : "bank");
   }
 
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
