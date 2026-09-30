@@ -1058,20 +1058,25 @@ static int rec_cmp(const void *a, const void *b) {
  * from the geometry the compiler stated, their pos_mat stride included (a convention of
  * their trace). RET emits a tensor's return stage as wide as the input the compiler named,
  * as their RED sizes it from the input, walking away from the input in allocation order,
- * which mirrors their addresses. Bit 8 reordered hoisted operand loads until the compiler
+ * which mirrors their addresses, under row-pack placement only. A convention the runtime
+ * cannot apply is counted rather than fatal, so an in-process harness survives and the
+ * reading refuses the stream. Bit 8 reordered hoisted operand loads until the compiler
  * placed them. */
 enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_RET = 64,
        NAT_ALL = 119 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
-static uint64_t stat_ret_added = 0;
+static uint64_t stat_ret_added = 0, stat_ret_refused = 0, stat_acc_unstated = 0;
 static int g_emit_elem = -1;  /* logical element index of the access being emitted */
 
 /* ADDR: their generator's address for the tile the kept read at element e opens. With A as
  * mat[head][k][out], their MAC for head-in-bank itr, k tile i and column group c sits at
  * itr*K*M + i*K + c*n_mac elements from the matrix base (gen_trace_HBMPIM_GEMV.py:139,
  * the k tile stepping by dhead where the row is seq long), here from our slab's base. */
+static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
+                        int *bg, int *bank, int *sa, int *row, int *col);
+
 static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, int bank) {
   int64_t n = t->tile_mac_reads, K = t->addr_kext, M = t->addr_k;
   int64_t h = e / t->addr_head, k = (e % t->addr_head) / M, o = e % M;
@@ -1081,20 +1086,29 @@ static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, i
    * and a reading at their addresses refuses the stream. */
   int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
   int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
-  if (e < 0 || k % n || o % n || t->pack_base_col < 0 || t->elem_size != 2 || n != vpc ||
-      off % vpc || off / vpc >= t->pack_cols) {
+  if (e < 0 || k % n || o % n || t->elem_size != 2 || n != vpc || off % vpc ||
+      (t->pack_base_col >= 0 && off / vpc >= t->pack_cols)) {
     stat_addr_unmapped++;
     return 0;
   }
-  /* Their order is column group outer, k tile inner. Another order would read their
-   * aliasing through our schedule, so it is counted and the reading refuses it. */
+  /* Their order is column group outer, k tile inner, through every block of a head, so the
+   * key runs on across the epoch's dispatches. Another order would read their aliasing
+   * through our schedule, so it is counted and the reading refuses it. */
   int64_t key = ((o / n) * (K / n) + k / n);
-  if (t->addr_disp == cur_dispatch + 1 && key != t->addr_last + 1) stat_addr_order_mismatch++;
-  t->addr_disp = cur_dispatch + 1;
+  uint64_t ep = (__pim_persistent ? cur_dispatch >> PIM_TILE_BITS : cur_dispatch) + 1;
+  if (t->addr_disp == ep && key != t->addr_last + 1) stat_addr_order_mismatch++;
+  t->addr_disp = ep;
   t->addr_last = key;
   stat_addr_mapped++;
-  /* The slab column the tile's offset lands on, through the placement's own row map. */
-  long lc = t->pack_base_col + off / vpc, cpr = vpr / vpc;
+  /* The matrix base is the slab's first column under row-pack, else where the tensor's
+   * first element lands in this bank's row map. */
+  long cpr = vpr / vpc, base = t->pack_base_col;
+  if (base < 0) {
+    int c0, p0, g0, b0, s0, r0, col0;
+    map_element(t, 0, &c0, &p0, &g0, &b0, &s0, &r0, &col0);
+    base = ((long)s0 * cfg_num_rows + r0) * cpr + col0;
+  }
+  long lc = base + off / vpc;
   int linear_row = (int)(lc / cpr);
   return dcc_addr(ch, pch, bg, bank, linear_row / cfg_num_rows, linear_row % cfg_num_rows,
                   (int)(lc % cpr));
@@ -1137,10 +1151,11 @@ static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
   }
   if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
     const tensor_info_t *t = r->tid >= 0 && r->tid < num_tensors ? &tensors[r->tid] : NULL;
-    if (!t || t->acc_wb < 0) {
-      fprintf(stderr, "[pim-runtime] ERROR: an accumulator command of tensor %d, which the "
-                      "compiler stated no DCC convention for\n", r->tid);
-      exit(1);
+    if (!t || t->acc_wb < 0) {  /* no convention stated: kept, counted, and refused */
+      stat_acc_unstated++;
+      if (wave >= 0 && (gb & 1) != wave) return;
+      fprintf(trace_fp, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+      return;
     }
     if (r->phase == DP_RESET && t->acc_reset == 0) return;
     if (r->phase == DP_WB && t->acc_wb == 2 && !dcc_addressed(gb)) return;
@@ -1192,6 +1207,8 @@ uint64_t pim_dcc_addr_order_mismatch(void) { return stat_addr_order_mismatch; }
 uint64_t pim_dcc_addr_unmapped(void) { return stat_addr_unmapped; }
 uint64_t pim_dcc_addr_mapped(void) { return stat_addr_mapped; }
 uint64_t pim_dcc_ret_added(void) { return stat_ret_added; }
+uint64_t pim_dcc_ret_refused(void) { return stat_ret_refused; }
+uint64_t pim_dcc_acc_unstated(void) { return stat_acc_unstated; }
 uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
@@ -1378,6 +1395,8 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
        * globals 0, so an artifact carrying no table must not read as elementwise. */
       /* DCC's result-register path writes a map's output back too (WB_RES), so under
        * the ACC bit a tensor the compiler gave a write-back keeps it. */
+      if ((g_dcc_native & NAT_ACC) && __pim_dcc_decided && (!t_emit || t_emit->acc_wb < 0))
+        stat_acc_unstated++;  /* a stored tensor the compiler stated nothing for */
       if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0 &&
           !((g_dcc_native & NAT_ACC) && t_emit && t_emit->acc_wb > 0)) {
         stat_dcc_free_acc_ops += 2;
@@ -2029,15 +2048,15 @@ void pim_init(const char *trace_file) {
   }
   g_dcc_native = 0;
   stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
-  stat_addr_unmapped = stat_addr_mapped = stat_ret_added = 0;
+  stat_addr_unmapped = stat_addr_mapped = stat_ret_added = stat_ret_refused = 0;
+  stat_acc_unstated = 0;
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
           ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
-          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE)) ||
-          ((g_dcc_native & NAT_RET) && cfg_place_align != PIM_ALIGN_ROW_PACK)) {
+          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE))) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
         exit(1);
@@ -2252,6 +2271,10 @@ static void apply_dcc_return_from(int tensor_id) {
   int n = (int)__pim_dcc_return_from_count;
   for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
     if (__pim_dcc_return_from[2 * i] == tensor_id) t->ret_src = __pim_dcc_return_from[2 * i + 1];
+  if ((g_dcc_native & NAT_RET) && t->ret_src >= 0 && cfg_place_align != PIM_ALIGN_ROW_PACK) {
+    stat_ret_refused++;  /* their layout packs the input beside the output, row-pack only */
+    t->ret_src = -1;
+  }
 }
 
 static void apply_compiler_layout(int tensor_id) {
@@ -2332,22 +2355,16 @@ static void apply_compiler_layout(int tensor_id) {
         _t->pack_cols = cols;
         if ((g_dcc_native & NAT_RET) && _t->ret_src >= 0) {
           /* Their Ret_addr = Vec_addr + Vec_size: the input sits right beside the output,
-           * and the return stage takes the input's width. */
+           * and the return stage takes the input's width. Anything else emits no return
+           * stage and is counted, and the padded reading refuses it. */
           tensor_info_t *src = _t->ret_src < num_tensors ? &tensors[_t->ret_src] : NULL;
-          if (!src || src->pack_base_col != _t->pack_base_col + _t->pack_cols) {
-            fprintf(stderr, "[pim-runtime] ERROR tensor %d: RET needs its source %d packed "
-                            "right above it\n", tensor_id, _t->ret_src);
-            exit(1);
-          }
-          _t->ret_cols = src->pack_cols;
-          int extra = _t->ret_cols - _t->pack_cols;
-          if (extra > 0) {
-            if (g_pack_col_top - extra < floor_col) {
-              fprintf(stderr, "[pim-runtime] ERROR tensor %d: its return stage does not fit\n",
-                      tensor_id);
-              exit(1);
-            }
-            g_pack_col_top -= extra;
+          int extra = src ? src->pack_cols - _t->pack_cols : 0;
+          if (!src || src->pack_base_col != _t->pack_base_col + _t->pack_cols ||
+              g_pack_col_top - (extra > 0 ? extra : 0) < floor_col) {
+            stat_ret_refused++;
+          } else {
+            _t->ret_cols = src->pack_cols;
+            if (extra > 0) g_pack_col_top -= extra;
           }
         }
         _t->lane_row_base = (int)(g_pack_col_top / cpr);
