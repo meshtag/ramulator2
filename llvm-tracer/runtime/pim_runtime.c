@@ -1029,9 +1029,9 @@ static int rec_cmp(const void *a, const void *b) {
  * bank-in-group 0 and 1 and run each program as an even-bank wave, then an odd-bank wave,
  * with their own accumulator addressing. PIM_DCC_NATIVE selects what is emitted that way:
  * FAN issues each collapsed compute command per addressed bank, ACC applies the declared
- * accumulator table (PIM_DCC_FANOUT), WAVE splits each program into its two waves, HOIST
- * puts operand loads hoisted above a tile loop after the next group's resets. */
-enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_HOIST = 8, NAT_TILE = 16, NAT_ALL = 31 };
+ * accumulator table (PIM_DCC_FANOUT), WAVE splits each program into its two waves. Bit 8
+ * reordered hoisted operand loads here until the compiler placed them (im-tile-boundary). */
+enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ALL = 23 };
 static int g_dcc_native = 0, g_dcc_reset_none = 0, g_dcc_wb_addressed = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 
@@ -1103,43 +1103,17 @@ static void dcc_native_emit(size_t nc) {
     for (size_t k = 0; k < nc; k++) nat_print(&g_recs[k], -1, g_ba);
     return;
   }
-  size_t *ord = (size_t *)malloc((nc ? nc : 1) * sizeof *ord);
-  if (!ord) { fprintf(stderr, "[pim-runtime] ERROR: native order alloc\n"); exit(1); }
   for (size_t i = 0; i < nc;) {
     uint64_t ep = dcc_epoch(&g_recs[i]);
-    size_t j = i, n = 0;
-    while (j < nc && dcc_epoch(&g_recs[j]) == ep) j++;
-    /* Groups are runs of one (dispatch, round). A group of operand loads only is held and
-     * placed after the next group's leading resets, where their generator loads it. */
-    size_t held_a = 0, held_b = 0;
-    int holding = 0, compute = 0;
-    for (size_t g = i; g < j;) {
-      size_t h = g;
-      int loads_only = 1;
-      while (h < j && g_recs[h].dispatch == g_recs[g].dispatch &&
-             g_recs[h].round == g_recs[g].round) {
-        if (g_recs[h].phase != DP_LDOP) loads_only = 0;
-        if (g_recs[h].phase == DP_MAC) compute = 1;
-        h++;
-      }
-      if ((g_dcc_native & NAT_HOIST) && loads_only && !holding) {
-        held_a = g; held_b = h; holding = 1;
-      } else {
-        size_t r = g;
-        if (holding)
-          while (r < h && g_recs[r].phase == DP_RESET) ord[n++] = r++;
-        if (holding) { for (size_t k = held_a; k < held_b; k++) ord[n++] = k; holding = 0; }
-        for (; r < h; r++) ord[n++] = r;
-      }
-      g = h;
-    }
-    if (holding) for (size_t k = held_a; k < held_b; k++) ord[n++] = k;
+    size_t j = i;
+    int compute = 0;
+    for (; j < nc && dcc_epoch(&g_recs[j]) == ep; j++)
+      if (g_recs[j].phase == DP_MAC) compute = 1;
     for (int w = 0; w < 2; w++)
-      for (size_t k = 0; k < n; k++) nat_print(&g_recs[ord[k]], w, g_ba);
+      for (size_t k = i; k < j; k++) nat_print(&g_recs[k], w, g_ba);
     g_dcc_waves += compute;
     i = j;
   }
-  free(ord);
 }
 
 int pim_dcc_native_mask(void) { return g_dcc_native; }
@@ -1941,8 +1915,7 @@ void pim_init(const char *trace_file) {
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
-          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
-          ((g_dcc_native & NAT_HOIST) && !(g_dcc_native & NAT_WAVE))) {
+          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN))) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
         exit(1);
