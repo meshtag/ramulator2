@@ -222,6 +222,8 @@ typedef struct {
    * surviving reads in the current dispatch. */
   int tile_mac_reads;
   uint64_t tile_ord, tile_disp;
+  /* __pim_dcc_acc: -1 when the compiler stated nothing for this tensor. */
+  int acc_reset, acc_wb;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -559,6 +561,17 @@ static int g_grf_b_overflow = 0;   /* cells beyond capacity, 0 = fits */
  * STRICTLY smaller, so an elementwise kernel whose inputs match in size selects nothing
  * and the VA/RELU parity this tree exists for cannot move. */
 static void dcc_pick_grf_operand(void) {
+  if (__pim_dcc_decided) {  /* the compiler elected, possibly nothing */
+    for (int i = 0; i < (int)__pim_dcc_grf_a_count && i < PIM_MAX_DCC_ACC; i++) {
+      int a = __pim_dcc_grf_a[i];
+      if (a < 0 || a >= num_tensors || tensors[a].role == PIM_ROLE_ACCUMULATOR) {
+        fprintf(stderr, "[pim-runtime] ERROR: compiler elected GRF_A operand %d\n", a);
+        exit(1);
+      }
+      g_dcc_grf_operand[a] = 1;
+    }
+    return;
+  }
   int best = -1;
   for (int i = 0; i < num_tensors; i++) {
     if (tensors[i].role == PIM_ROLE_ACCUMULATOR) continue;
@@ -844,7 +857,8 @@ int pim_dcc_coverage_failures(void) { return g_cov_failures; }
 /* Everything after staging is recorded and flushed sorted. Pushed in lane-replay order,
  * 32 consecutive stores land on one bank and serialise, where their generator spreads the
  * same stores over 32 banks. */
-typedef struct { uint64_t dispatch, addr, seq; uint32_t round; int phase; const char *op; } dcc_rec_t;
+typedef struct { uint64_t dispatch, addr, seq; uint32_t round; int phase; const char *op; int tid; } dcc_rec_t;
+static const tensor_info_t *t_emit;  /* the tensor the current emit belongs to */
 static dcc_rec_t *g_recs = NULL;
 static size_t g_rec_n = 0, g_rec_cap = 0;
 
@@ -859,7 +873,8 @@ static void dp_record(int phase, const char *op, uint64_t addr) {
     g_recs = (dcc_rec_t *)realloc(g_recs, g_rec_cap * sizeof *g_recs);
     if (!g_recs) { fprintf(stderr, "[pim-runtime] ERROR: command record alloc\n"); exit(1); }
   }
-  g_recs[g_rec_n] = (dcc_rec_t){cur_dispatch, addr, g_rec_n, g_rnd, phase, op};
+  g_recs[g_rec_n] = (dcc_rec_t){cur_dispatch, addr, g_rec_n, g_rnd, phase, op,
+                                t_emit ? (int)(t_emit - tensors) : -1};
   g_rec_n++;
 }
 
@@ -1028,11 +1043,12 @@ static int rec_cmp(const void *a, const void *b) {
 /* DCC's machine, natively. Their generators address compute to the 16 banks at
  * bank-in-group 0 and 1 and run each program as an even-bank wave, then an odd-bank wave,
  * with their own accumulator addressing. PIM_DCC_NATIVE selects what is emitted that way:
- * FAN issues each collapsed compute command per addressed bank, ACC applies the declared
- * accumulator table (PIM_DCC_FANOUT), WAVE splits each program into its two waves. Bit 8
+ * FAN issues each collapsed compute command per addressed bank, ACC applies the accumulator
+ * convention the compiler stated per tensor (__pim_dcc_acc), WAVE splits each program into
+ * its two waves. Bit 8
  * reordered hoisted operand loads here until the compiler placed them (im-tile-boundary). */
 enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ALL = 23 };
-static int g_dcc_native = 0, g_dcc_reset_none = 0, g_dcc_wb_addressed = 0;
+static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 
 /* TILE: a stamped tensor issues one MAC per tile of surviving column reads. The reads it
@@ -1070,9 +1086,15 @@ static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
                 (unsigned long long)(off + (uint64_t)b * g_ba));
     return;
   }
-  if (g_dcc_native & NAT_ACC) {
-    if (r->phase == DP_RESET && g_dcc_reset_none) return;
-    if (r->phase == DP_WB && g_dcc_wb_addressed && !dcc_addressed(gb)) return;
+  if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
+    const tensor_info_t *t = r->tid >= 0 && r->tid < num_tensors ? &tensors[r->tid] : NULL;
+    if (!t || t->acc_wb < 0) {
+      fprintf(stderr, "[pim-runtime] ERROR: an accumulator command of tensor %d, which the "
+                      "compiler stated no DCC convention for\n", r->tid);
+      exit(1);
+    }
+    if (r->phase == DP_RESET && t->acc_reset == 0) return;
+    if (r->phase == DP_WB && t->acc_wb == 2 && !dcc_addressed(gb)) return;
   }
   if (wave >= 0 && (gb & 1) != wave) return;
   fprintf(trace_fp, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
@@ -1147,7 +1169,7 @@ static void dp_flush(void) {
     }
     g_recs[g_rec_n++] = (dcc_rec_t){g_grf_recs[i].dispatch, g_grf_recs[i].addr,
                                     ((uint64_t)1 << 62) + i, g_grf_recs[i].blk, DP_LDOP,
-                                    "PIM_LD_OP1"};
+                                    "PIM_LD_OP1", -1};
   }
   if (g_rec_n) qsort(g_recs, g_rec_n, sizeof *g_recs, rec_cmp);
   size_t i = 0;
@@ -1217,7 +1239,7 @@ static void emit_dcc(const char *op, uint64_t addr) {
   fprintf(trace_fp, "%s 0x%08llx\n", op, (unsigned long long)addr);
 }
 
-static const tensor_info_t *t_emit = NULL;  /* tensor the current emit belongs to */
+static const tensor_info_t *t_emit = NULL;
 
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
@@ -1261,7 +1283,10 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
       /* A map has no accumulator to reset or drain, and DCC's own VA and RELU emit
        * neither command. Gate on layout_count too: the weak-extern fallback makes both
        * globals 0, so an artifact carrying no table must not read as elementwise. */
-      if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0) {
+      /* DCC's result-register path writes a map's output back too (WB_RES), so under
+       * the ACC bit a tensor the compiler gave a write-back keeps it. */
+      if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0 &&
+          !((g_dcc_native & NAT_ACC) && t_emit && t_emit->acc_wb > 0)) {
         stat_dcc_free_acc_ops += 2;
       } else {
         dp_record(DP_RESET, "PIM_ACC_RESET", a);
@@ -1908,10 +1933,10 @@ void pim_init(const char *trace_file) {
     fprintf(stderr, "[pim-runtime] emitting DCC's opcodes at DCC's addresses; run this "
                     "trace through THEIR Ramulator, not ours.\n");
   }
-  g_dcc_native = g_dcc_reset_none = g_dcc_wb_addressed = 0;
+  g_dcc_native = 0;
   stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = 0;
   {
-    const char *nat = getenv("PIM_DCC_NATIVE"), *fo = getenv("PIM_DCC_FANOUT");
+    const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
@@ -1921,23 +1946,19 @@ void pim_init(const char *trace_file) {
         exit(1);
       }
     }
-    if (fo && *fo) {
-      if (!(g_dcc_native & NAT_ACC) ||
-          !(strstr(fo, "reset=none") || strstr(fo, "reset=bank")) ||
-          !(strstr(fo, "wb=addressed") || strstr(fo, "wb=bank"))) {
-        fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_FANOUT=%s needs the ACC bit and "
-                        "reset=none|bank,wb=addressed|bank\n", fo);
-        exit(1);
-      }
-      g_dcc_reset_none = strstr(fo, "reset=none") != NULL;
-      g_dcc_wb_addressed = strstr(fo, "wb=addressed") != NULL;
-    } else if (g_dcc_native & NAT_ACC) {
-      fprintf(stderr, "[pim-runtime] ERROR: the ACC bit needs PIM_DCC_FANOUT\n");
+    if ((g_dcc_native & NAT_ACC) && !__pim_dcc_decided) {
+      fprintf(stderr, "[pim-runtime] ERROR: the ACC bit needs the compiler's accumulator "
+                      "convention (im_dcc_acc_grf)\n");
+      exit(1);
+    }
+    if (getenv("PIM_DCC_FANOUT")) {
+      fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_FANOUT is retired, the compiler states "
+                      "the accumulator convention\n");
       exit(1);
     }
     if (g_dcc_native)
-      fprintf(stderr, "[pim-runtime] dcc native mask=%d reset=%s wb=%s\n", g_dcc_native,
-              g_dcc_reset_none ? "none" : "bank", g_dcc_wb_addressed ? "addressed" : "bank");
+      fprintf(stderr, "[pim-runtime] dcc native mask=%d, %d accumulator conventions from the "
+                      "compiler\n", g_dcc_native, (int)__pim_dcc_acc_count);
   }
 
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
@@ -2105,8 +2126,22 @@ static void apply_dcc_tile_mac(int tensor_id) {
       t->tile_mac_reads = __pim_dcc_tile_mac[2 * i + 1];
 }
 
+static void apply_dcc_acc(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  t->acc_reset = t->acc_wb = -1;
+  int n = __pim_dcc_decided ? (int)__pim_dcc_acc_count : 0;
+  for (int i = 0; i < n && i < PIM_MAX_DCC_ACC; i++)
+    if (__pim_dcc_acc[3 * i] == tensor_id) {
+      t->acc_reset = __pim_dcc_acc[3 * i + 1];
+      t->acc_wb = __pim_dcc_acc[3 * i + 2];
+    }
+}
+
+int pim_dcc_acc_decided(void) { return __pim_dcc_decided; }
+
 static void apply_compiler_layout(int tensor_id) {
   apply_dcc_tile_mac(tensor_id);
+  apply_dcc_acc(tensor_id);
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
   if (n <= 0) {
