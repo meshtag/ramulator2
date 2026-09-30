@@ -1062,7 +1062,7 @@ static uint64_t dcc_epoch(const dcc_rec_t *r) {
 static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
   int gb = (int)(r->addr / g_ba);
   if (r->phase == DP_MAC && (g_dcc_native & NAT_FAN)) {
-    if (gb != 0) stat_native_off_bank0++;
+    if (gb != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
     uint64_t off = r->addr % g_ba;
     for (int b = 0; b < 32; b++)
       if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave))
