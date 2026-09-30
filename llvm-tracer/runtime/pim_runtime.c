@@ -588,8 +588,10 @@ static void dcc_pick_grf_operand(void) {
     if (i != best && tensors[i].role != PIM_ROLE_ACCUMULATOR &&
         tensors[i].bank_replicated == 0 &&
         tensors[i].num_elements > tensors[best].num_elements) {
-      g_dcc_grf_operand[best] = 1;
-      return;
+      /* Which operand GRF_A holds is a residency decision, so it is the compiler's. */
+      fprintf(stderr, "[pim-runtime] ERROR: tensor %d would be elected GRF_A by size; compile "
+                      "with im_dcc_acc_grf so the compiler makes that call\n", best);
+      exit(1);
     }
 }
 static addr_dedup_state_t *g_dcc_staged = NULL;
