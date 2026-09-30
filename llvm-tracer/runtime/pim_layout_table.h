@@ -126,6 +126,12 @@ __attribute__((weak)) extern const int32_t __pim_dcc_decided;
 __attribute__((weak)) extern const int32_t __pim_dcc_mac_addr[4 * PIM_MAX_TILE_MAC];
 __attribute__((weak)) extern const int32_t __pim_dcc_mac_addr_count;
 
+/* DCC's return stage sized from the input (im_dcc_return_from_input), [store_arg,
+ * source_arg] pairs: the stored partials' return stage is as wide per bank as the input,
+ * as their RED sizes it (gen_trace_HBMPIM_RED.py:150-151). */
+__attribute__((weak)) extern const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC];
+__attribute__((weak)) extern const int32_t __pim_dcc_return_from_count;
+
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
@@ -143,6 +149,8 @@ const int32_t __pim_dcc_grf_a_count = 0;
 const int32_t __pim_dcc_decided = 0;
 const int32_t __pim_dcc_mac_addr[4 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_mac_addr_count = 0;
+const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC] = {0};
+const int32_t __pim_dcc_return_from_count = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;

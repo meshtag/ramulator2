@@ -228,6 +228,9 @@ typedef struct {
    * addr_last is the previous kept tile's order key within addr_disp. */
   int64_t addr_head, addr_k, addr_kext, addr_last;
   uint64_t addr_disp;
+  /* __pim_dcc_return_from: the input this tensor's return stage is sized from, -1 none,
+   * and under RET the columns per bank that return stage spans. */
+  int ret_src, ret_cols;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -1053,11 +1056,16 @@ static int rec_cmp(const void *a, const void *b) {
  * convention the compiler stated per tensor (__pim_dcc_acc), WAVE splits each program into
  * its two waves. ADDR issues each kept MAC at the address DCC's generator gives its tile,
  * from the geometry the compiler stated, their pos_mat stride included (a convention of
- * their trace). Bit 8 reordered hoisted operand loads until the compiler placed them. */
-enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_ALL = 55 };
+ * their trace). RET emits a tensor's return stage as wide as the input the compiler named,
+ * as their RED sizes it from the input, walking away from the input in allocation order,
+ * which mirrors their addresses. Bit 8 reordered hoisted operand loads until the compiler
+ * placed them. */
+enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_RET = 64,
+       NAT_ALL = 119 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
+static uint64_t stat_ret_added = 0;
 static int g_emit_elem = -1;  /* logical element index of the access being emitted */
 
 /* ADDR: their generator's address for the tile the kept read at element e opens. With A as
@@ -1183,9 +1191,43 @@ int pim_dcc_native_mask(void) { return g_dcc_native; }
 uint64_t pim_dcc_addr_order_mismatch(void) { return stat_addr_order_mismatch; }
 uint64_t pim_dcc_addr_unmapped(void) { return stat_addr_unmapped; }
 uint64_t pim_dcc_addr_mapped(void) { return stat_addr_mapped; }
+uint64_t pim_dcc_ret_added(void) { return stat_ret_added; }
 uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
+
+/* RET: the positions past a tensor's own columns, position outer and bank inner over the
+ * banks it stored to, each at the next column away from the input. Not coverage: no kernel
+ * access touched these. */
+static void dcc_return_stage(void) {
+  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  for (int t = 0; t < num_tensors; t++) {
+    tensor_info_t *T = &tensors[t];
+    if (T->ret_src < 0 || T->ret_cols <= T->pack_cols) continue;
+    int stored[MAX_BANKS] = {0};
+    for (size_t k = 0; k < g_rec_n; k++)
+      if (g_recs[k].phase == DP_OUT && g_recs[k].tid == t) {
+        uint64_t gb = g_recs[k].addr / g_ba;
+        if (gb < MAX_BANKS) stored[gb] = 1;
+      }
+    int vpc = T->values_per_col > 0 ? T->values_per_col : 16;
+    int vpr = T->values_per_row > 0 ? T->values_per_row : 512;
+    long cpr = vpr / vpc;
+    for (int p = T->pack_cols; p < T->ret_cols; p++) {
+      long lc = T->pack_base_col + T->pack_cols - 1 - p;
+      int linear_row = (int)(lc / cpr);
+      for (int gb = 0; gb < MAX_BANKS; gb++) {
+        if (!stored[gb]) continue;
+        int ch, pch, bg, bank;
+        decompose_global_bank(gb, &ch, &pch, &bg, &bank);
+        fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)dcc_addr(
+                    ch, pch, bg, bank, linear_row / cfg_num_rows, linear_row % cfg_num_rows,
+                    (int)(lc % cpr)));
+        stat_ret_added++;
+      }
+    }
+  }
+}
 
 static void dp_flush(void) {
   if (!trace_fp) return;
@@ -1226,6 +1268,7 @@ static void dp_flush(void) {
   if (i) fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
   for (; i < g_rec_n; i++)
     fprintf(trace_fp, "%s 0x%08llx\n", g_recs[i].op, (unsigned long long)g_recs[i].addr);
+  if (g_dcc_native & NAT_RET) dcc_return_stage();
   for (int p = 0; p < DP_N; p++) {
     free(dp_buf[p]); dp_buf[p] = NULL; dp_len[p] = dp_cap[p] = 0;
   }
@@ -1986,14 +2029,15 @@ void pim_init(const char *trace_file) {
   }
   g_dcc_native = 0;
   stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
-  stat_addr_unmapped = stat_addr_mapped = 0;
+  stat_addr_unmapped = stat_addr_mapped = stat_ret_added = 0;
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
           ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
-          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE))) {
+          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE)) ||
+          ((g_dcc_native & NAT_RET) && cfg_place_align != PIM_ALIGN_ROW_PACK)) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
         exit(1);
@@ -2201,9 +2245,19 @@ static void apply_dcc_acc(int tensor_id) {
 
 int pim_dcc_acc_decided(void) { return __pim_dcc_decided; }
 
+static void apply_dcc_return_from(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  t->ret_src = -1;
+  t->ret_cols = 0;
+  int n = (int)__pim_dcc_return_from_count;
+  for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
+    if (__pim_dcc_return_from[2 * i] == tensor_id) t->ret_src = __pim_dcc_return_from[2 * i + 1];
+}
+
 static void apply_compiler_layout(int tensor_id) {
   apply_dcc_tile_mac(tensor_id);
   apply_dcc_acc(tensor_id);
+  apply_dcc_return_from(tensor_id);
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
   if (n <= 0) {
@@ -2276,6 +2330,26 @@ static void apply_compiler_layout(int tensor_id) {
         g_pack_col_top -= cols;
         _t->pack_base_col = g_pack_col_top;
         _t->pack_cols = cols;
+        if ((g_dcc_native & NAT_RET) && _t->ret_src >= 0) {
+          /* Their Ret_addr = Vec_addr + Vec_size: the input sits right beside the output,
+           * and the return stage takes the input's width. */
+          tensor_info_t *src = _t->ret_src < num_tensors ? &tensors[_t->ret_src] : NULL;
+          if (!src || src->pack_base_col != _t->pack_base_col + _t->pack_cols) {
+            fprintf(stderr, "[pim-runtime] ERROR tensor %d: RET needs its source %d packed "
+                            "right above it\n", tensor_id, _t->ret_src);
+            exit(1);
+          }
+          _t->ret_cols = src->pack_cols;
+          int extra = _t->ret_cols - _t->pack_cols;
+          if (extra > 0) {
+            if (g_pack_col_top - extra < floor_col) {
+              fprintf(stderr, "[pim-runtime] ERROR tensor %d: its return stage does not fit\n",
+                      tensor_id);
+              exit(1);
+            }
+            g_pack_col_top -= extra;
+          }
+        }
         _t->lane_row_base = (int)(g_pack_col_top / cpr);
         _t->lane_row_count = (int)((g_pack_col_top + cols + cpr - 1) / cpr) - _t->lane_row_base;
         g_lane_row_top = _t->lane_row_base;
