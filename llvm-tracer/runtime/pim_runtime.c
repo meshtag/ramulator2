@@ -224,6 +224,10 @@ typedef struct {
   uint64_t tile_ord, tile_disp;
   /* __pim_dcc_acc: -1 when the compiler stated nothing for this tensor. */
   int acc_reset, acc_wb;
+  /* __pim_dcc_mac_addr: head and reduce strides and the reduce extent, 0 when unstated;
+   * addr_last is the previous kept tile's order key within addr_disp. */
+  int64_t addr_head, addr_k, addr_kext, addr_last;
+  uint64_t addr_disp;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -1047,11 +1051,46 @@ static int rec_cmp(const void *a, const void *b) {
  * with their own accumulator addressing. PIM_DCC_NATIVE selects what is emitted that way:
  * FAN issues each collapsed compute command per addressed bank, ACC applies the accumulator
  * convention the compiler stated per tensor (__pim_dcc_acc), WAVE splits each program into
- * its two waves. Bit 8
- * reordered hoisted operand loads here until the compiler placed them (im-tile-boundary). */
-enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ALL = 23 };
+ * its two waves. ADDR issues each kept MAC at the address DCC's generator gives its tile,
+ * from the geometry the compiler stated, their pos_mat stride included (a convention of
+ * their trace). Bit 8 reordered hoisted operand loads until the compiler placed them. */
+enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_ALL = 55 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
+static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
+static int g_emit_elem = -1;  /* logical element index of the access being emitted */
+
+/* ADDR: their generator's address for the tile the kept read at element e opens. With A as
+ * mat[head][k][out], their MAC for head-in-bank itr, k tile i and column group c sits at
+ * itr*K*M + i*K + c*n_mac elements from the matrix base (gen_trace_HBMPIM_GEMV.py:139,
+ * the k tile stepping by dhead where the row is seq long), here from our slab's base. */
+static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, int bank) {
+  int64_t n = t->tile_mac_reads, K = t->addr_kext, M = t->addr_k;
+  int64_t h = e / t->addr_head, k = (e % t->addr_head) / M, o = e % M;
+  int64_t itr = h / (__pim_lanes > 0 ? __pim_lanes : 1);
+  int64_t off = itr * K * M + (k / n) * K + (o / n) * n;
+  /* A read off a tile corner has no tile of theirs. It keeps our address and is counted,
+   * and a reading at their addresses refuses the stream. */
+  int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
+  int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
+  if (e < 0 || k % n || o % n || t->pack_base_col < 0 || t->elem_size != 2 || n != vpc ||
+      off % vpc || off / vpc >= t->pack_cols) {
+    stat_addr_unmapped++;
+    return 0;
+  }
+  /* Their order is column group outer, k tile inner. Another order would read their
+   * aliasing through our schedule, so it is counted and the reading refuses it. */
+  int64_t key = ((o / n) * (K / n) + k / n);
+  if (t->addr_disp == cur_dispatch + 1 && key != t->addr_last + 1) stat_addr_order_mismatch++;
+  t->addr_disp = cur_dispatch + 1;
+  t->addr_last = key;
+  stat_addr_mapped++;
+  /* The slab column the tile's offset lands on, through the placement's own row map. */
+  long lc = t->pack_base_col + off / vpc, cpr = vpr / vpc;
+  int linear_row = (int)(lc / cpr);
+  return dcc_addr(ch, pch, bg, bank, linear_row / cfg_num_rows, linear_row % cfg_num_rows,
+                  (int)(lc % cpr));
+}
 
 /* TILE: a stamped tensor issues one MAC per tile of surviving column reads. The reads it
  * absorbs still resolve, place, stage and count for coverage, so no later address moves.
@@ -1141,6 +1180,9 @@ static void dcc_native_emit(size_t nc) {
 }
 
 int pim_dcc_native_mask(void) { return g_dcc_native; }
+uint64_t pim_dcc_addr_order_mismatch(void) { return stat_addr_order_mismatch; }
+uint64_t pim_dcc_addr_unmapped(void) { return stat_addr_unmapped; }
+uint64_t pim_dcc_addr_mapped(void) { return stat_addr_mapped; }
 uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
@@ -1270,8 +1312,14 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
           }
         }
       }
-      if (dcc_tile_issue((tensor_info_t *)t_emit))
+      if (dcc_tile_issue((tensor_info_t *)t_emit)) {
+        if ((g_dcc_native & NAT_ADDR) && t_emit->addr_head > 0) {
+          uint64_t their = dcc_mac_addr((tensor_info_t *)t_emit, g_emit_elem, ch, pch, bg,
+                                        bank);
+          if (their) a = their;
+        }
         dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", a);
+      }
       g_last_mac = a;
     } else if (!strcmp(op, "W")) {                 /* operand staged once, then into the GRF */
       if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
@@ -1622,6 +1670,7 @@ static int resolve_access_location(tensor_info_t *t, uint64_t addr,
 static void emit_access_by_role_phase(tensor_info_t *t,
                                       const pim_phys_loc_t *loc, int is_write) {
   t_emit = t;
+  g_emit_elem = loc->elem_idx;
   /* Comparison mode only, applied at the single funnel every record passes through so
    * it cannot be half-applied. See g_optipim_addressing. */
   pim_phys_loc_t _flat;
@@ -1936,13 +1985,15 @@ void pim_init(const char *trace_file) {
                     "trace through THEIR Ramulator, not ours.\n");
   }
   g_dcc_native = 0;
-  stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = 0;
+  stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
+  stat_addr_unmapped = stat_addr_mapped = 0;
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if (!g_trace_format_dcc || (g_dcc_native & ~NAT_ALL) ||
-          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN))) {
+          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
+          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE))) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
         exit(1);
@@ -2126,6 +2177,15 @@ static void apply_dcc_tile_mac(int tensor_id) {
   for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
     if (__pim_dcc_tile_mac[2 * i] == tensor_id)
       t->tile_mac_reads = __pim_dcc_tile_mac[2 * i + 1];
+  t->addr_head = t->addr_k = t->addr_kext = t->addr_last = 0;
+  t->addr_disp = 0;
+  n = (int)__pim_dcc_mac_addr_count;
+  for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
+    if (__pim_dcc_mac_addr[4 * i] == tensor_id) {
+      t->addr_head = __pim_dcc_mac_addr[4 * i + 1];
+      t->addr_k = __pim_dcc_mac_addr[4 * i + 2];
+      t->addr_kext = __pim_dcc_mac_addr[4 * i + 3];
+    }
 }
 
 static void apply_dcc_acc(int tensor_id) {
