@@ -231,6 +231,9 @@ typedef struct {
   /* __pim_dcc_return_from: the input this tensor's return stage is sized from, -1 none,
    * and under RET the columns per bank that return stage spans. */
   int ret_src, ret_cols;
+  /* __pim_pcu_pair: the PCU side that folds and stores this tensor, -1 unpaired, and the
+   * GRF_B cells each PCU carries from its even pass into its odd one. */
+  int pcu_owner, pcu_cells;
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -557,6 +560,8 @@ static uint64_t stat_grf_a_lru_hits = 0; /* reloads an 8-entry LRU would absorb,
  * CHARGED. An invented spill cost would credit a transformation nobody made. */
 #define GRF_B_ENTRIES 8
 static int g_grf_b_overflow = 0;   /* cells beyond capacity, 0 = fits */
+/* One PCU serves banks 2p and 2p+1 and owns their GRF_A and GRF_B. */
+#define PCU_LANES 2
 
 /* Lazy: registration is one tensor at a time and this needs to compare them all.
  *
@@ -879,7 +884,46 @@ int pim_dcc_coverage_failures(void) { return g_cov_failures; }
 /* Everything after staging is recorded and flushed sorted. Pushed in lane-replay order,
  * 32 consecutive stores land on one bank and serialise, where their generator spreads the
  * same stores over 32 banks. */
-typedef struct { uint64_t dispatch, addr, seq; uint32_t round; int phase; const char *op; int tid; } dcc_rec_t;
+/* skip_sides: PCU sides the record does not fan onto, 0 = both. Zero-initialised by every
+ * compound literal, so only __pim_trace_fold_sides sets it. */
+typedef struct { uint64_t dispatch, addr, seq; uint32_t round; int phase; const char *op; int tid;
+                 uint8_t skip_sides; } dcc_rec_t;
+static uint8_t g_rec_skip_sides = 0;
+static uint64_t stat_side_filtered = 0;  /* fanned commands a one-sided record left out */
+
+#define PCU_CARRY_CELLS (GRF_B_ENTRIES * 16)
+static int32_t g_carry_val[MAX_BANKS / 2][PCU_CARRY_CELLS];
+static uint8_t g_carry_full[MAX_BANKS / 2][PCU_CARRY_CELLS];
+static uint32_t g_carry_put[MAX_BANKS / 2], g_carry_got[MAX_BANKS / 2], g_carry_ord[MAX_BANKS];
+static uint64_t g_carry_disp = UINT64_MAX;
+static uint64_t stat_pcu_carries = 0;   /* cells carried, over every PCU and dispatch */
+static uint64_t stat_pair_nonowner_store = 0;
+
+static void carry_reset(void) {
+  memset(g_carry_full, 0, sizeof g_carry_full);
+  memset(g_carry_put, 0, sizeof g_carry_put);
+  memset(g_carry_got, 0, sizeof g_carry_got);
+  memset(g_carry_ord, 0, sizeof g_carry_ord);
+  g_carry_disp = UINT64_MAX;
+}
+
+static void carry_close(const char *when) {
+  if (g_carry_disp == UINT64_MAX) return;
+  int stated = 0;
+  for (int i = 0; i < (int)__pim_pcu_pair_count && i < PIM_MAX_DCC_ACC; i++)
+    stated += __pim_pcu_pair[3 * i + 2];
+  for (int p = 0; p < MAX_BANKS / 2; p++) {
+    if (!g_carry_put[p] && !g_carry_got[p]) continue;
+    if (g_carry_put[p] != g_carry_got[p] || (int)g_carry_put[p] != stated) {
+      fprintf(stderr, "[pim-runtime] ERROR: %s, PCU %d's even bank deposited %u cells and "
+                      "its odd bank took %u, where the kernel states %d\n",
+              when, p, g_carry_put[p], g_carry_got[p], stated);
+      exit(1);
+    }
+  }
+  carry_reset();
+}
+
 static const tensor_info_t *t_emit;  /* the tensor the current emit belongs to */
 static dcc_rec_t *g_recs = NULL;
 static size_t g_rec_n = 0, g_rec_cap = 0;
@@ -896,7 +940,7 @@ static void dp_record(int phase, const char *op, uint64_t addr) {
     if (!g_recs) { fprintf(stderr, "[pim-runtime] ERROR: command record alloc\n"); exit(1); }
   }
   g_recs[g_rec_n] = (dcc_rec_t){cur_dispatch, addr, g_rec_n, g_rnd, phase, op,
-                                t_emit ? (int)(t_emit - tensors) : -1};
+                                t_emit ? (int)(t_emit - tensors) : -1, g_rec_skip_sides};
   g_rec_n++;
 }
 
@@ -1157,9 +1201,14 @@ static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
     if (gb != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
     uint64_t off = r->addr % g_ba;
     for (int b = 0; b < 32; b++)
-      if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave))
+      if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave)) {
+        if ((r->skip_sides >> (b & 1)) & 1) {
+          stat_side_filtered++;
+          continue;
+        }
         fprintf(trace_fp, "%s 0x%08llx\n", r->op,
                 (unsigned long long)(off + (uint64_t)b * g_ba));
+      }
     return;
   }
   if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
@@ -1225,6 +1274,8 @@ uint64_t pim_dcc_acc_unstated(void) { return stat_acc_unstated; }
 uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
+uint64_t pim_dcc_side_filtered(void) { return stat_side_filtered; }
+int pim_dcc_pcu_lanes(void) { return __pim_pcu_lanes; }
 
 /* RET: the positions past a tensor's own columns, position outer and bank inner over the
  * banks it stored to, each at the next column away from the input. Not coverage: no kernel
@@ -1442,6 +1493,8 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
         op_stage_record(a);
       dp_record(DP_LDOP, "PIM_LD_OP1", a);
     } else if (!strcmp(op, "BW")) {                /* their entire output path */
+      if (t_emit && t_emit->pcu_owner >= 0 && (__pim_get_bank_id() & 1) != t_emit->pcu_owner)
+        stat_pair_nonowner_store++;
       /* A map has no accumulator to reset or drain, and DCC's own VA and RELU emit
        * neither command. Gate on layout_count too: the weak-extern fallback makes both
        * globals 0, so an artifact carrying no table must not read as elementwise. */
@@ -2108,6 +2161,8 @@ void pim_init(const char *trace_file) {
   stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
   stat_addr_unmapped = stat_addr_mapped = stat_ret_added = stat_ret_refused = 0;
   stat_acc_unstated = 0;
+  stat_side_filtered = stat_pcu_carries = stat_pair_nonowner_store = 0;
+  carry_reset();
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
@@ -2142,6 +2197,17 @@ void pim_init(const char *trace_file) {
     fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, machine has %d "
                     "banks; lane placement puts lane b in bank b and assumes they agree.\n",
             (int)__pim_lanes, cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks);
+  /* A kernel that states its PCU geometry is refused on a machine that pairs otherwise:
+   * PCU = lane / 2 holds only while lane b sits in bank b. */
+  if (__pim_pcu_lanes > 0) {
+    int banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    if (__pim_pcu_lanes != PCU_LANES || banks % __pim_pcu_lanes || __pim_lanes != banks) {
+      fprintf(stderr, "[pim-runtime] ERROR: kernel states %d banks per PCU over %d lanes, "
+                      "this machine has %d per PCU over %d banks\n",
+              (int)__pim_pcu_lanes, (int)__pim_lanes, PCU_LANES, banks);
+      exit(1);
+    }
+  }
   stat_lockstep_skips = 0;
   stat_fold_steps = stat_fold_cmds = 0;
   g_last_mac = 0;
@@ -2335,10 +2401,35 @@ static void apply_dcc_return_from(int tensor_id) {
   }
 }
 
+static void apply_pcu_pair(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  t->pcu_owner = -1;
+  t->pcu_cells = 0;
+  int n = (int)__pim_pcu_pair_count;
+  for (int i = 0; i < n && i < PIM_MAX_DCC_ACC; i++) {
+    if (__pim_pcu_pair[3 * i] != tensor_id) continue;
+    int side = __pim_pcu_pair[3 * i + 1], cells = __pim_pcu_pair[3 * i + 2];
+    const char *why = __pim_pcu_lanes != PCU_LANES ? "the kernel states no PCU geometry"
+                      : side != 1 ? "its owner is not the odd bank, which GRF_B writes back to"
+                      : cells <= 0 || cells > GRF_B_ENTRIES * 16 ? "its cells do not fit GRF_B"
+                      : t->acc_reset == 1 ? "it resets per lane, which would clear the "
+                                            "even pass's sum"
+                      : __pim_persistent ? "a persistent kernel's tiles would share the carry"
+                      : NULL;
+    if (why) {
+      fprintf(stderr, "[pim-runtime] ERROR: tensor %d is PCU-paired, but %s\n", tensor_id, why);
+      exit(1);
+    }
+    t->pcu_owner = side;
+    t->pcu_cells = cells;
+  }
+}
+
 static void apply_compiler_layout(int tensor_id) {
   apply_dcc_tile_mac(tensor_id);
   apply_dcc_acc(tensor_id);
   apply_dcc_return_from(tensor_id);
+  apply_pcu_pair(tensor_id);
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
   if (n <= 0) {
@@ -2779,6 +2870,7 @@ void pim_finalize(void) {
     return;
 
   finalized = 1;
+  carry_close("at finalize");
 
   if (g_trace_format_dcc) {
     /* The check is lazy, on the first compute-phase load of a non-accumulator tensor. A
@@ -3195,6 +3287,66 @@ void __pim_trace_fold(int64_t steps, int64_t outputs) {
       stat_fold_cmds++;
     }
 }
+
+/* The same, recorded for the PCU sides in `sides` only (im_pcu_pair_accumulate): every
+ * lane calls it so the lanes of a PCU stay at one access ordinal, and the fan leaves the
+ * other side's banks out. */
+void __pim_trace_fold_sides(int64_t steps, int64_t outputs, int64_t sides) {
+  if (sides <= 0 || sides > 3) {
+    fprintf(stderr, "[pim-runtime] ERROR: fold side mask %lld\n", (long long)sides);
+    exit(1);
+  }
+  g_rec_skip_sides = (uint8_t)(3 & ~sides);
+  __pim_trace_fold(steps, outputs);
+  g_rec_skip_sides = 0;
+}
+
+/* GRF_B surviving from a PCU's even pass into its odd one (im_pcu_pair_accumulate). The
+ * even lane deposits each cell and gets 0, the odd lane takes it. Untraced: no command
+ * moves it, the PCU's register simply keeps it. Lanes replay in ascending order within a
+ * dispatch, so a get with no put means the replay order broke and the run stops. */
+int32_t __pim_pcu_carry(int32_t bits) {
+  advance_program_epoch_if_needed();
+  if (cur_dispatch != g_carry_disp) {
+    carry_close("at a dispatch change");
+    g_carry_disp = cur_dispatch;
+  }
+  int lane = __pim_get_bank_id();
+  if (__pim_pcu_lanes != PCU_LANES || lane < 0 || lane >= MAX_BANKS) {
+    fprintf(stderr, "[pim-runtime] ERROR: a PCU carry from lane %d without the PCU geometry\n",
+            lane);
+    exit(1);
+  }
+  int pcu = lane >> 1;
+  uint32_t k = g_carry_ord[lane]++;
+  if (k >= PCU_CARRY_CELLS) {
+    fprintf(stderr, "[pim-runtime] ERROR: PCU %d carries more cells than GRF_B's %d entries "
+                    "hold\n", pcu, GRF_B_ENTRIES);
+    exit(1);
+  }
+  if ((lane & 1) == 0) {
+    if (g_carry_full[pcu][k]) {
+      fprintf(stderr, "[pim-runtime] ERROR: PCU %d's even bank deposited cell %u twice\n", pcu, k);
+      exit(1);
+    }
+    g_carry_full[pcu][k] = 1;
+    g_carry_val[pcu][k] = bits;
+    g_carry_put[pcu]++;
+    return 0;
+  }
+  if (!g_carry_full[pcu][k]) {
+    fprintf(stderr, "[pim-runtime] ERROR: PCU %d's odd bank took cell %u, which its even bank "
+                    "never deposited. The lanes must replay in ascending order.\n", pcu, k);
+    exit(1);
+  }
+  g_carry_full[pcu][k] = 0;
+  g_carry_got[pcu]++;
+  stat_pcu_carries++;
+  return g_carry_val[pcu][k];
+}
+
+uint64_t pim_dcc_pcu_carries(void) { return stat_pcu_carries; }
+uint64_t pim_dcc_pair_nonowner_store(void) { return stat_pair_nonowner_store; }
 
 /* im-relu-opcode brackets a load whose only use is a ReLU. DCC issues that read as
  * PIM_RELU, which their simulator does not space on the command bus. */
