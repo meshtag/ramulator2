@@ -757,9 +757,9 @@ static void dp_push(int phase, const char *op, uint64_t addr) {
   dp_len[phase] += n;
 }
 
-/* GRF block rounds. A block ends at its accumulator store, which only the ACCESSES show:
- * the lockstep collapse drops lanes 1..N's MACs, so counting emitted commands would leave
- * every later lane in round 0. A map has no GRF block, so it stays one round. */
+/* GRF block rounds. A block ends at its store, which only the ACCESSES show: the lockstep
+ * collapse drops lanes 1..N's MACs, so counting emitted commands would leave every later
+ * lane in round 0. A map's rounds are the strips its program stores in. */
 static int g_rnd_lane = -1;
 static uint64_t g_rnd_disp = UINT64_MAX;
 static uint32_t g_rnd = 0;
@@ -793,14 +793,27 @@ static uint64_t lockstep_key(uint64_t ns, uint64_t disp, uint64_t ord, uint64_t 
   return lk_mix(h ^ ((row << 16) | col));
 }
 
+/* A reset zeroes what is live in GRF_B, so it belongs before the first access of the
+ * accumulation its write-back drains, which is dispatches earlier when a tile boundary falls
+ * inside one accumulator's life. Per lane: opened by the first read after a write. */
+static int g_open_lane = -1, g_open_valid = 0, g_open_closed = 0;
+static uint64_t g_open_disp = 0;
+static uint32_t g_open_rnd = 0;
+static uint64_t stat_reset_reopened = 0;
+uint64_t pim_dcc_reset_reopened(void) { return stat_reset_reopened; }
+
 static void dcc_round_note(int is_write) {
   int lane = __pim_get_bank_id();
   if (lane != g_rnd_lane || cur_dispatch != g_rnd_disp) {
     g_rnd_lane = lane; g_rnd_disp = cur_dispatch; g_rnd = 0; g_rnd_closed = 0;
   }
-  if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0) return;
+  if (lane != g_open_lane) { g_open_lane = lane; g_open_valid = 0; g_open_closed = 0; }
   if (is_write) g_rnd_closed = 1;
   else if (g_rnd_closed) { g_rnd++; g_rnd_closed = 0; }
+  if (is_write) g_open_closed = 1;
+  else if (!g_open_valid || g_open_closed) {
+    g_open_valid = 1; g_open_closed = 0; g_open_disp = cur_dispatch; g_open_rnd = g_rnd;
+  }
 }
 
 /* Replay coverage, marked as each access enters the tracer and before coalescing, GRF
@@ -1246,6 +1259,43 @@ static void dcc_return_stage(void) {
   }
 }
 
+/* A map's results sit in GRF_B until its stores, one entry per output column per lane, so a
+ * round may store at most GRF_B_ENTRIES columns per bank. Flagged like grf_b_check and never
+ * re-blocked, since the strip is the program's. */
+static int map_rec_cmp(const void *a, const void *b) {
+  const dcc_rec_t *x = *(const dcc_rec_t *const *)a, *y = *(const dcc_rec_t *const *)b;
+  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  if (x->dispatch != y->dispatch) return x->dispatch < y->dispatch ? -1 : 1;
+  if (x->round != y->round) return x->round < y->round ? -1 : 1;
+  if (x->addr / g_ba != y->addr / g_ba) return x->addr / g_ba < y->addr / g_ba ? -1 : 1;
+  return (x->addr > y->addr) - (x->addr < y->addr);
+}
+
+static void map_grf_b_check(void) {
+  if (!(__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0) || !g_rec_n) return;
+  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  const dcc_rec_t **v = (const dcc_rec_t **)malloc(g_rec_n * sizeof *v);
+  if (!v) { fprintf(stderr, "[pim-runtime] ERROR: map GRF_B check alloc\n"); exit(1); }
+  size_t n = 0;
+  for (size_t q = 0; q < g_rec_n; q++)
+    if (g_recs[q].phase == DP_OUT) v[n++] = &g_recs[q];
+  qsort(v, n, sizeof *v, map_rec_cmp);
+  int most = 0, cur = 0;
+  for (size_t q = 0; q < n; q++) {
+    if (!q || v[q]->dispatch != v[q - 1]->dispatch || v[q]->round != v[q - 1]->round ||
+        v[q]->addr / g_ba != v[q - 1]->addr / g_ba) cur = 1;
+    else if (v[q]->addr != v[q - 1]->addr) cur++;
+    if (cur > most) most = cur;
+  }
+  free(v);
+  if (most > GRF_B_ENTRIES) {
+    g_grf_b_overflow = most - GRF_B_ENTRIES;
+    fprintf(stderr, "[pim-runtime] ERROR: a map stores %d result columns per bank in one "
+                    "round, and GRF_B holds %d. Strip it in the kernel. Cycles from this run "
+                    "are NOT physical.\n", most, GRF_B_ENTRIES);
+  }
+}
+
 static void dp_flush(void) {
   if (!trace_fp) return;
   if (g_grf_n) grf_sort();
@@ -1274,6 +1324,7 @@ static void dp_flush(void) {
                                     ((uint64_t)1 << 62) + i, g_grf_recs[i].blk, DP_LDOP,
                                     "PIM_LD_OP1", -1};
   }
+  map_grf_b_check();
   if (g_rec_n) qsort(g_recs, g_rec_n, sizeof *g_recs, rec_cmp);
   size_t i = 0;
   while (i < g_rec_n && g_recs[i].phase != DP_OUT) i++;
@@ -1294,6 +1345,7 @@ static void dp_flush(void) {
   free(g_op_stage); g_op_stage = NULL; g_op_stage_n = g_op_stage_cap = 0;
   free(g_grf_recs); g_grf_recs = NULL; g_grf_n = g_grf_cap = 0;
   g_rnd_lane = -1; g_rnd_disp = UINT64_MAX; g_rnd = 0; g_rnd_closed = 0;
+  g_open_lane = -1; g_open_valid = 0; g_open_closed = 0;
 }
 
 /* 1 = miss, stage and load; 0 = resident. Most recent at slot 0. dispatch+1 so a
@@ -1402,6 +1454,12 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
         stat_dcc_free_acc_ops += 2;
       } else {
         dp_record(DP_RESET, "PIM_ACC_RESET", a);
+        if (g_open_valid && g_open_lane == __pim_get_bank_id() &&
+            (g_open_disp != cur_dispatch || g_open_rnd != g_rnd)) {
+          g_recs[g_rec_n - 1].dispatch = g_open_disp;
+          g_recs[g_rec_n - 1].round = g_open_rnd;
+          stat_reset_reopened++;
+        }
         dp_record(DP_WB, "PIM_WB_ACC", a);
       }
       dp_record(DP_OUT, "ST", a);
