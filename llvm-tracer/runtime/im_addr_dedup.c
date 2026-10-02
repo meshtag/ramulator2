@@ -2,7 +2,6 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 typedef struct {
   uint64_t key;
@@ -14,9 +13,7 @@ struct addr_dedup_state {
   int capacity;       /* power of two */
   int mask;           /* capacity - 1 */
   uint32_t cur_epoch; /* 0 reserved as "empty"/uninitialized */
-  uint64_t hits;
   int live;           /* slots claimed at cur_epoch */
-  uint64_t grows;     /* doublings; a nonzero value means the create() hint was low */
   uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
 
@@ -59,9 +56,7 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
   s->capacity = capacity;
   s->mask = capacity - 1;
   s->cur_epoch = 1; /* epoch 0 reserved as "empty" */
-  s->hits = 0;
   s->live = 0;
-  s->grows = 0;
   s->saturations = 0;
   return s;
 }
@@ -97,7 +92,6 @@ static int addr_dedup_grow(addr_dedup_state_t *s) {
   s->slots = ns;
   s->capacity = newcap;
   s->mask = newmask;
-  s->grows++;
   return 1;
 }
 
@@ -113,10 +107,8 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
   for (int probe = 0; probe < s->capacity; probe++) {
     dedup_slot_t *slot = &s->slots[idx];
     if (slot->epoch == s->cur_epoch) {
-      if (slot->key == key) {
-        s->hits++;
+      if (slot->key == key)
         return 0; /* already seen this epoch */
-      }
       /* live collision — keep probing */
     } else {
       /* empty or stale slot — claim it, growing first if we are at the load target */
@@ -125,10 +117,8 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
         for (;;) {
           dedup_slot_t *g = &s->slots[idx];
           if (g->epoch == s->cur_epoch) {
-            if (g->key == key) { /* cannot happen: we probed to a free slot */
-              s->hits++;
+            if (g->key == key) /* cannot happen: we probed to a free slot */
               return 0;
-            }
             idx = (idx + 1) & s->mask;
             continue;
           }
@@ -147,34 +137,14 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
   }
 
   /* No room and growth failed (allocation refused). Fall back to "new": over-emit,
-   * never under-emit. Counted, and both runtimes print the count, because a silent
+   * never under-emit. Counted, and the runtime prints the count, because a silent
    * fallback here reads as a faithful trace while the collapse has stopped working. */
   s->saturations++;
   return 1;
 }
 
-void addr_dedup_reset(addr_dedup_state_t *s) {
-  if (!s)
-    return;
-  s->cur_epoch++;
-  if (s->cur_epoch == 0) {
-    /* wraparound: physically wipe and restart epoch counter */
-    memset(s->slots, 0, (size_t)s->capacity * sizeof(dedup_slot_t));
-    s->cur_epoch = 1;
-  }
-  s->live = 0;
-}
-
-uint64_t addr_dedup_hits(const addr_dedup_state_t *s) {
-  return s ? s->hits : 0;
-}
-
 uint64_t addr_dedup_saturations(const addr_dedup_state_t *s) {
   return s ? s->saturations : 0;
-}
-
-int addr_dedup_capacity(const addr_dedup_state_t *s) {
-  return s ? s->capacity : 0;
 }
 
 void addr_dedup_destroy(addr_dedup_state_t *s) {
@@ -208,14 +178,6 @@ slot_map_t *slot_map_create(size_t hint) {
   return m;
 }
 
-void slot_map_clear(slot_map_t *m) {
-  if (!m)
-    return;
-  memset(m->keys, 0, m->cap * sizeof(*m->keys));
-  memset(m->vals, 0, m->cap * sizeof(*m->vals));
-  m->n = 0;
-}
-
 void slot_map_destroy(slot_map_t *m) {
   if (!m) return;
   free(m->keys); free(m->vals); free(m);
@@ -244,33 +206,8 @@ int32_t slot_map_get_or_put(slot_map_t *m, int lane, int elem, int32_t fresh,
   uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
   size_t i = slot_hash(key) & (m->cap - 1);
   for (;;) {
-    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* below the flag bits */
+    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* slots are 24 bits */
     if (m->keys[i] == 0) { m->keys[i] = key; m->vals[i] = fresh; m->n++; *inserted = 1; return fresh; }
-    i = (i + 1) & (m->cap - 1);
-  }
-}
-
-int slot_map_test_and_set(slot_map_t *m, int lane, int elem, int bit) {
-  uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
-  size_t i = slot_hash(key) & (m->cap - 1);
-  for (;;) {
-    if (m->keys[i] == key) {
-      int32_t mask = (int32_t)1 << bit;
-      int prev = (m->vals[i] & mask) ? 1 : 0;
-      m->vals[i] |= mask;
-      return prev;
-    }
-    if (m->keys[i] == 0) return -1;
-    i = (i + 1) & (m->cap - 1);
-  }
-}
-
-int32_t slot_map_peek(const slot_map_t *m, int lane, int elem) {
-  uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
-  size_t i = slot_hash(key) & (m->cap - 1);
-  for (;;) {
-    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF;
-    if (m->keys[i] == 0) return -1;
     i = (i + 1) & (m->cap - 1);
   }
 }
