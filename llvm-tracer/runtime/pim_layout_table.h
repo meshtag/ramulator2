@@ -111,8 +111,8 @@ __attribute__((weak)) extern const int32_t __pim_dcc_tile_mac[2 * PIM_MAX_TILE_M
 __attribute__((weak)) extern const int32_t __pim_dcc_tile_mac_count;
 
 /* DCC's accumulator convention per stored tensor (im_dcc_acc_grf), [operand_arg, reset,
- * wb] triples. reset 0 none, 1 every lane. wb 1 every lane, 2 the two addressed banks of
- * each bank group. __pim_dcc_grf_a lists the operands the compiler elected for GRF_A. Both count
+ * wb] triples. reset 0 none, 1 every lane. wb 1 every lane, 2 the addressed bank of each
+ * PCU pair. __pim_dcc_grf_a lists the operands the compiler elected for GRF_A. Both count
  * only when __pim_dcc_decided is 1, which the compiler sets whenever it made the call. */
 #define PIM_MAX_DCC_ACC 16
 __attribute__((weak)) extern const int32_t __pim_dcc_acc[3 * PIM_MAX_DCC_ACC];
@@ -131,14 +131,6 @@ __attribute__((weak)) extern const int32_t __pim_dcc_mac_addr_count;
  * as their RED sizes it (gen_trace_HBMPIM_RED.py:150-151). */
 __attribute__((weak)) extern const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC];
 __attribute__((weak)) extern const int32_t __pim_dcc_return_from_count;
-
-/* Banks per PCU (im_pcu_lanes), 0 = the kernel did not say. */
-__attribute__((weak)) extern const int32_t __pim_pcu_lanes;
-
-/* PCU-paired stores (im_pcu_pair_accumulate), [operand_arg, owner side, carried cells]:
- * both banks of a PCU accumulate into its GRF_B entry and only the owner folds and stores. */
-__attribute__((weak)) extern const int32_t __pim_pcu_pair[3 * PIM_MAX_DCC_ACC];
-__attribute__((weak)) extern const int32_t __pim_pcu_pair_count;
 
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
@@ -159,9 +151,6 @@ const int32_t __pim_dcc_mac_addr[4 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_mac_addr_count = 0;
 const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_return_from_count = 0;
-const int32_t __pim_pcu_lanes = 0;
-const int32_t __pim_pcu_pair[3 * PIM_MAX_DCC_ACC] = {0};
-const int32_t __pim_pcu_pair_count = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;
