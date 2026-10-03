@@ -48,13 +48,8 @@ __attribute__((weak)) extern const int32_t __pim_layout_rec_words;
 /* Whole-kernel bank-group interleave decision, 0 when the compiler did not ask. This
  * runtime refuses anything but 0. */
 __attribute__((weak)) extern const int32_t __pim_bg_interleave;
-/* PLACEMENT POLICY, stated by the compiler. 0 means the kernel said nothing.
- *
- *   __pim_layout_scheme    1 = striped (refused here), 2 = interleaved
- *   __pim_placement_align  1 = align each tensor to the DQ word only
- *                          2 = global-row boundary (refused here)
- *                          3 = row-pack the lane slabs */
-__attribute__((weak)) extern const int32_t __pim_layout_scheme;
+/* Placement alignment, stated by the compiler: 1 aligns each tensor to the DQ word only,
+ * 3 row-packs the lane slabs, 0 means the kernel said nothing. */
 __attribute__((weak)) extern const int32_t __pim_placement_align;
 
 /* 1 when the kernel loops over tiles inside one program instance. The trace
@@ -126,7 +121,6 @@ const int32_t __pim_dcc_mac_addr_count = 0;
 const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_return_from_count = 0;
 const int32_t __pim_persistent = 0;
-const int32_t __pim_layout_scheme = 0;
 const int32_t __pim_placement_align = 0;
 #endif
 

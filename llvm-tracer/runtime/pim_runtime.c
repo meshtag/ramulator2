@@ -1286,11 +1286,11 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   stat_lane_placed++;
 }
 
-/* An access that reaches no record. In COMPUTE that is a silent drop, so coverage fails. */
+/* An access that reaches no record. Only COMPUTE gets here, so it is a silent drop and
+ * coverage fails. */
 static void note_ignored(void) {
   stat_ignored++;
-  if (cur_phase == PIM_PHASE_COMPUTE)
-    g_emit_drops++;
+  g_emit_drops++;
 }
 
 /* Resolve one logical element access to its physical HBM tuple.
@@ -1308,71 +1308,68 @@ static int resolve_access_location(tensor_info_t *t, uint64_t addr,
   loc->elem_idx = elem_idx;
   map_element(t, elem_idx, &loc->ch, &loc->pch, &loc->bg, &loc->bank, &loc->sa,
               &loc->row, &loc->col);
-  if (cur_phase == PIM_PHASE_COMPUTE && t->bank_replicated >= 0 && t->lane_slot &&
-      t->lane_row_base >= 0)
+  if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
     place_in_lane_slab(t, loc);
   return 1;
 }
 
-/* Emit the trace op implied by the current phase, access direction, and tensor
- * role for an already-resolved physical tuple. */
+/* Emit the trace op implied by the access direction and tensor role for an
+ * already-resolved physical tuple. */
 static void emit_access_by_role_phase(tensor_info_t *t,
                                       const pim_phys_loc_t *loc, int is_write) {
   t_emit = t;
   g_emit_elem = loc->elem_idx;
-  if (cur_phase == PIM_PHASE_COMPUTE) {
-    if (!is_write) {
-      switch (t->role) {
-      case PIM_ROLE_STREAMED:
-        emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_reads++;
-        t->emitted_br++;
-        break;
-      case PIM_ROLE_OPERAND: {
-        /* An operand load is a bus-mediated write into the RECEIVING PE's register
-         * file, so address it at the replay bank rather than at the source
-         * element's home bank. Otherwise all N fanout writes pile onto one bank and
-         * serialize, which over-charges us relative to OptiPIM, whose codegen writes
-         * to global_bank_id + i (fimdram.cpp:63-76) and parallelizes.
-         *
-         * There is deliberately NO broadcast here. docs/path1-bank-model-scope.md
-         * forbade costing an all-bank op as ONE dispatch: it drops below OptiPIM's
-         * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
-         * (its broadcast shortcut is commented out). */
-        int dch, dpch, dbg, dbank;
-        decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
-        emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
-        stat_writes++;
-        t->emitted_w++;
-        /* The W already expands to ST + PIM_LD_OP1 in emit_trace, so no second command.
-         * Our W count equals DCC's PIM_LD_OP1 count exactly. */
-        break;
-      }
-      case PIM_ROLE_ACCUMULATOR:
-        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_reads++;
-        t->emitted_r++;
-        break;
-      }
-    } else {
-      if (t->role == PIM_ROLE_ACCUMULATOR) {
-        /* ACCUMULATOR here means "target of a tt.store", not "reduction target", so a
-         * map lands in this branch too. Whether its reset and writeback are emitted is
-         * decided in emit_trace's BW arm from the compiler's acc_cells_per_lane.
-         *
-         * This is confined to this tree. The default charges an accumulator writeback
-         * as the DRAM write it is. */
-        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_writes++;
-        t->emitted_bw++;
-      }
-      /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
-      else
-        g_emit_drops++;
+  if (!is_write) {
+    switch (t->role) {
+    case PIM_ROLE_STREAMED:
+      emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                 loc->row, loc->col);
+      stat_bank_reads++;
+      t->emitted_br++;
+      break;
+    case PIM_ROLE_OPERAND: {
+      /* An operand load is a bus-mediated write into the RECEIVING PE's register
+       * file, so address it at the replay bank rather than at the source
+       * element's home bank. Otherwise all N fanout writes pile onto one bank and
+       * serialize, which over-charges us relative to OptiPIM, whose codegen writes
+       * to global_bank_id + i (fimdram.cpp:63-76) and parallelizes.
+       *
+       * There is deliberately NO broadcast here. docs/path1-bank-model-scope.md
+       * forbade costing an all-bank op as ONE dispatch: it drops below OptiPIM's
+       * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
+       * (its broadcast shortcut is commented out). */
+      int dch, dpch, dbg, dbank;
+      decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+      emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
+      stat_writes++;
+      t->emitted_w++;
+      /* The W already expands to ST + PIM_LD_OP1 in emit_trace, so no second command.
+       * Our W count equals DCC's PIM_LD_OP1 count exactly. */
+      break;
     }
+    case PIM_ROLE_ACCUMULATOR:
+      emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                 loc->row, loc->col);
+      stat_reads++;
+      t->emitted_r++;
+      break;
+    }
+  } else {
+    if (t->role == PIM_ROLE_ACCUMULATOR) {
+      /* ACCUMULATOR here means "target of a tt.store", not "reduction target", so a
+       * map lands in this branch too. Whether its reset and writeback are emitted is
+       * decided in emit_trace's BW arm from the compiler's acc_cells_per_lane.
+       *
+       * This is confined to this tree. The default charges an accumulator writeback
+       * as the DRAM write it is. */
+      emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                 loc->row, loc->col);
+      stat_bank_writes++;
+      t->emitted_bw++;
+    }
+    /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
+    else
+      g_emit_drops++;
   }
 }
 
@@ -1407,18 +1404,8 @@ void pim_init(const char *trace_file) {
 
   check_compiler_dq_bits(cfg_dq_bits);
 
-  /* This tracer does not implement these placements, so refuse rather than place the
-   * kernel differently from what the artifact states. */
-  if (__pim_layout_scheme == 1) {
-    fprintf(stderr, "[pim-runtime] ERROR: the compiler asked for the striped layout "
-                    "scheme, which this tracer does not implement\n");
-    exit(1);
-  }
-  if (__pim_placement_align == 2) {
-    fprintf(stderr, "[pim-runtime] ERROR: the compiler asked for global-row alignment, "
-                    "which this tracer does not implement\n");
-    exit(1);
-  }
+  /* This tracer does not implement bank-group interleave, so refuse rather than place
+   * the kernel differently from what the artifact states. */
   if (__pim_bg_interleave) {
     fprintf(stderr, "[pim-runtime] ERROR: the compiler asked for bank-group interleave, "
                     "which this tracer does not implement\n");
@@ -1426,11 +1413,10 @@ void pim_init(const char *trace_file) {
   }
 
   cfg_place_align = __pim_placement_align == 3 ? PIM_ALIGN_ROW_PACK : PIM_ALIGN_DQ;
-  fprintf(stderr,
-          "[pim-runtime] placement: interleaved, align=%s (compiler said scheme=%d "
-          "align=%d, 0 = nothing)\n",
+  fprintf(stderr, "[pim-runtime] placement: interleaved, align=%s (compiler said %d, "
+                  "0 = nothing)\n",
           cfg_place_align == PIM_ALIGN_ROW_PACK ? "row-pack" : "dq",
-          (int)__pim_layout_scheme, (int)__pim_placement_align);
+          (int)__pim_placement_align);
   g_interleaved_next_linear = 0;
   g_lane_row_top = -1;
   g_pack_col_top = -1;
@@ -2009,7 +1995,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * residency upstream of any bound (K=256 loaded each column once where a bounded
    * GRF_A reloads per block). It also emitted a group-level MAC_OP1 for the read, which
    * DCC does not: their x read IS the LD_OP1. */
-  if (!is_write && cur_phase == PIM_PHASE_COMPUTE && t->role != PIM_ROLE_ACCUMULATOR) {
+  if (!is_write && t->role != PIM_ROLE_ACCUMULATOR) {
     if (!g_dcc_grf_decided) {
       g_dcc_grf_decided = 1;
       dcc_pick_grf_operand();
@@ -2042,7 +2028,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
       return;
     }
   }
-  if (g_lockstep_collapse && cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
+  if (g_lockstep_collapse && !is_operand_load) {
     /* Compute and streamed reads are group-level and span the CHANNEL (DCC's group).
      * The accumulator is bank-level in DCC's model, so it keeps the bank in its key --
      * still packed by column, just not folded across banks. */
@@ -2089,10 +2075,8 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   t->range_calls++;
 
   /* Track program-id boundaries so the dedup table is reset per tile. */
-  if (cur_phase == PIM_PHASE_COMPUTE) {
-    advance_program_epoch_if_needed();
-    access_ord_next();
-  }
+  advance_program_epoch_if_needed();
+  access_ord_next();
 
   int elem_size = t->elem_size > 0 ? t->elem_size : 1;
   uint64_t n_elements = size / (uint64_t)elem_size;
@@ -2117,10 +2101,8 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
     }
   }
 
-  if (cur_phase == PIM_PHASE_COMPUTE) {
-    dcc_round_note(is_write);
-    cov_mark(tidx, t, base_addr, n_elements, is_write);
-  }
+  dcc_round_note(is_write);
+  cov_mark(tidx, t, base_addr, n_elements, is_write);
 
   /* WITHIN-CALL DQ-WORD COALESCING for loads. One __mem_trace_load call is ONE
    * machine instruction. A vector load of 8 fp16 values is one 128-bit bus
@@ -2140,7 +2122,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
    *
    * Inert for scalar loads: n_elements == 1 takes the fast path below untouched, so
    * this changes nothing until a kernel actually emits vector loads. */
-  if (!is_write && n_elements > 1 && cur_phase == PIM_PHASE_COMPUTE) {
+  if (!is_write && n_elements > 1) {
     uint64_t seen[PIM_COALESCE_MAX];
     int n_seen = 0;
     for (uint64_t i = 0; i < n_elements; i++) {
