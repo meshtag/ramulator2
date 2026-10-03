@@ -76,18 +76,24 @@ static int ilog2_pow2(int n) {
 #define MAX_BANKS 1024   /* DCC's 16 channels of 64 banks */
 
 static int banks_per_channel(void) { return cfg_num_pch * cfg_num_bg * cfg_num_banks; }
-static int active_banks(void) { return g_groups * banks_per_channel(); }
+/* A group's lanes are the kernel's, the first banks of its channel, as DCC's cores of a
+ * tiling that uses fewer than a channel's banks are its first banks. */
+static int group_lanes(void) {
+  return __pim_lanes > 0 && (int)__pim_lanes < banks_per_channel() ? (int)__pim_lanes
+                                                                    : banks_per_channel();
+}
+static int active_banks(void) { return g_groups * group_lanes(); }
 
 /* The executing lane's bank on the machine: its group's channel, then its bank id. The
  * kernel indexes by bank id alone, so the group never reaches it. */
 static int phys_lane(void) {
-  int g = __pim_get_group_id(), b = __pim_get_bank_id(), n = banks_per_channel();
-  if (g < 0 || g >= g_groups || b < 0 || b >= n) {
+  int g = __pim_get_group_id(), b = __pim_get_bank_id();
+  if (g < 0 || g >= g_groups || b < 0 || b >= group_lanes()) {
     fprintf(stderr, "[pim-runtime] ERROR: group %d bank %d is outside the launch's %d groups "
-                    "of %d banks\n", g, b, g_groups, n);
+                    "of %d lanes\n", g, b, g_groups, group_lanes());
     exit(1);
   }
-  return g * n + b;
+  return g * banks_per_channel() + b;
 }
 
 void pim_set_machine(int channels, int ranks, int groups) {
@@ -782,7 +788,7 @@ static int rec_cmp(const void *a, const void *b) {
  * reading refuses the stream. NAT_ALL leaves out bit 8, the retired HOIST bit, so a mask
  * carrying it is refused. */
 enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_RET = 64,
-       NAT_ALL = 119 };
+       NAT_GPOS = 128, NAT_ALL = 247 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
@@ -855,6 +861,14 @@ static int dcc_tile_issue(tensor_info_t *t) {
 }
 
 static int dcc_addressed(int gb) { return gb % 4 < 2; }
+
+/* GPOS: their GEMV keeps every other entry of a bank list built bank-outer and channel-inner
+ * (gen_trace_HBMPIM_GEMV.py:140, 189-194). On one group that is bank-in-group 0 and 1, and at
+ * an even group count it is every bank of the even channels. Their defect, reproduced. */
+static int dcc_fan_kept(int b, int ch) {
+  if (!(g_dcc_native & NAT_GPOS)) return dcc_addressed(b);
+  return ((b / 2) * g_groups + ch) % 2 == 0;
+}
 static uint64_t dcc_epoch(const dcc_rec_t *r) {
   return __pim_persistent ? r->dispatch >> PIM_TILE_BITS : r->dispatch;
 }
@@ -864,8 +878,8 @@ static void nat_print(FILE *out, const dcc_rec_t *r, int wave, uint64_t g_ba) {
   if (r->phase == DP_MAC && (g_dcc_native & NAT_FAN)) {
     if (gb % n != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
     uint64_t off = r->addr % g_ba, base = (uint64_t)(gb / n) * (uint64_t)n;
-    for (int b = 0; b < n; b++)
-      if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave))
+    for (int b = 0; b < group_lanes(); b++)
+      if (dcc_fan_kept(b, gb / n) && (wave < 0 || (b & 1) == wave))
         fprintf(out, "%s 0x%08llx\n", r->op,
                 (unsigned long long)(off + (base + (uint64_t)b) * g_ba));
     return;
@@ -1167,7 +1181,7 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
         int nb = banks_per_channel();
         uint64_t pos = ((uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row) *
                            (uint64_t)DCC_COLS_PER_ROW + (uint64_t)col;
-        for (int gb = ch * nb; gb < (ch + 1) * nb; gb++) {
+        for (int gb = ch * nb; gb < ch * nb + group_lanes(); gb++) {
           int c2, p2, g2, b2;
           decompose_global_bank(gb, &c2, &p2, &g2, &b2);
           stage_record(tid, pos, gb, dcc_addr(c2, p2, g2, b2, sa, row, col));
@@ -1346,7 +1360,7 @@ typedef struct {
  * with the bank bits dropped, which aliased 4-8 words onto one address. */
 static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   static int warned = 0;
-  int all_banks = active_banks();
+  int all_banks = g_groups * banks_per_channel();
   int lane = phys_lane();
   if (lane < 0 || lane >= all_banks || lane >= MAX_BANKS) {
     if (!warned++)
@@ -1565,7 +1579,7 @@ void pim_init(const char *trace_file) {
     if (nat && *nat) {
       g_dcc_native = atoi(nat);
       if ((g_dcc_native & ~NAT_ALL) ||
-          ((g_dcc_native & NAT_WAVE) && !(g_dcc_native & NAT_FAN)) ||
+          ((g_dcc_native & (NAT_WAVE | NAT_GPOS)) && !(g_dcc_native & NAT_FAN)) ||
           ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE))) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
@@ -1587,10 +1601,11 @@ void pim_init(const char *trace_file) {
                       "compiler\n", g_dcc_native, (int)__pim_dcc_acc_count);
   }
 
-  if (__pim_lanes > 0 && (int)__pim_lanes != banks_per_channel())
-    fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, a group has %d "
-                    "banks; lane placement puts lane b in bank b and assumes they agree.\n",
-            (int)__pim_lanes, banks_per_channel());
+  if (__pim_lanes > 0 && (int)__pim_lanes > banks_per_channel()) {
+    fprintf(stderr, "[pim-runtime] ERROR: kernel compiled for %d lanes, a group has %d "
+                    "banks\n", (int)__pim_lanes, banks_per_channel());
+    exit(1);
+  }
   stat_lockstep_skips = 0;
   stat_fold_cmds = 0;
   g_last_mac = 0;
@@ -2013,7 +2028,7 @@ void pim_finalize(void) {
     tensor_info_t *t = &tensors[i];
     if (t->bank_replicated < 0 || t->lane_row_base < 0)
       continue;
-    int all_banks = active_banks();
+    int all_banks = g_groups * banks_per_channel();
     fprintf(stderr, "[pim-runtime]   tensor %d slab slots per lane:", i);
     for (int l = 0; l < all_banks && l < MAX_BANKS; l++)
       fprintf(stderr, " %d", t->lane_ord[l]);
