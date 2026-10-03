@@ -27,6 +27,12 @@ extern "C" {
 int32_t __pim_get_bank_id(void);
 void __pim_set_bank_id(int32_t id);
 
+/* --- Group (which channel runs the current program instance) ---
+ * Set by the host per instance. The kernel never reads it: it indexes by program id and
+ * bank id, and only the trace runtime places the group's banks. */
+int32_t __pim_get_group_id(void);
+void __pim_set_group_id(int32_t id);
+
 /* --- Program ID (which tile / block of the input this invocation covers) ---
  * Axis 0 (X) is the primary dimension; Y and Z are optional for 2D/3D grids.
  */

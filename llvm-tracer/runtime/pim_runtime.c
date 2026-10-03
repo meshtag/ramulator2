@@ -17,10 +17,15 @@
  */
 
 /* ================================================================
- *  HBM3_PIM organization, fixed to the DCC-matched machine
+ *  HBM3_PIM organization, the DCC-matched machine
  * ================================================================ */
-static const int cfg_num_channels = 1;
-static const int cfg_num_pch = 2;
+/* Set by pim_set_machine. A rank is folded into the pseudo-channel slot, which is where
+ * DCC's address puts it (bank, bank group, rank, pseudo-channel, channel from the low
+ * bits), so cfg_num_pch counts pseudo-channels times ranks. */
+static int cfg_num_channels = 1;
+static int cfg_num_pch = 2;
+/* Channels the launch spreads its program instances over, one group per channel. */
+static int g_groups = 1;
 static const int cfg_num_bg = 4;
 static const int cfg_num_banks = 4; /* per bank group */
 /* Hand copy of the simulator's org preset (HBM3_8Gb in HBM3_PIM.cpp). Nothing checks
@@ -68,7 +73,34 @@ static int ilog2_pow2(int n) {
  *  Tensor registry
  * ================================================================ */
 #define MAX_TENSORS 16
-#define MAX_BANKS 512
+#define MAX_BANKS 1024   /* DCC's 16 channels of 64 banks */
+
+static int banks_per_channel(void) { return cfg_num_pch * cfg_num_bg * cfg_num_banks; }
+static int active_banks(void) { return g_groups * banks_per_channel(); }
+
+/* The executing lane's bank on the machine: its group's channel, then its bank id. The
+ * kernel indexes by bank id alone, so the group never reaches it. */
+static int phys_lane(void) {
+  int g = __pim_get_group_id(), b = __pim_get_bank_id(), n = banks_per_channel();
+  if (g < 0 || g >= g_groups || b < 0 || b >= n) {
+    fprintf(stderr, "[pim-runtime] ERROR: group %d bank %d is outside the launch's %d groups "
+                    "of %d banks\n", g, b, g_groups, n);
+    exit(1);
+  }
+  return g * n + b;
+}
+
+void pim_set_machine(int channels, int ranks, int groups) {
+  if (channels < 1 || channels > 16 || (channels & (channels - 1)) || ranks < 1 ||
+      ranks > 2 || groups < 1 || groups > channels) {
+    fprintf(stderr, "[pim-runtime] ERROR: machine of %d channels, %d ranks, %d groups is not "
+                    "one this tracer models\n", channels, ranks, groups);
+    exit(1);
+  }
+  cfg_num_channels = channels;
+  cfg_num_pch = 2 * ranks;
+  g_groups = groups;
+}
 
 typedef struct {
   void *base_addr;
@@ -134,17 +166,15 @@ static inline uint64_t perbank_ns(const tensor_info_t *t, int ch, int pch, int b
    * silently. */
   uint64_t ns = ((uint64_t)(t - tensors) & 0xFULL)        /* bits 0-3   16 tensors  */
                 | ((uint64_t)(is_write ? 1 : 0) << 4)     /* bit  4                 */
-                | (((uint64_t)ch & 0x3ULL) << 5)          /* bits 5-6    4 channels */
-                | (((uint64_t)pch & 0x3ULL) << 7)         /* bits 7-8    4 pch      */
-                | (((uint64_t)bg & 0x7ULL) << 9)          /* bits 9-11   8 bg       */
-                | (((uint64_t)bank & 0xFULL) << 12);      /* bits 12-15 16 banks/bg */
-  if (ns > 0xFFFFULL) {
-    static int warned = 0;
-    if (!warned++)
-      fprintf(stderr, "[pim-runtime] ERROR: per-bank dedup namespace %llu exceeds the "
-                      "16 bits addr_dedup gives it; banks are aliasing and the trace "
-                      "under-counts. Widen pack_keys or shrink a field.\n",
-              (unsigned long long)ns);
+                | (((uint64_t)ch & 0xFULL) << 5)          /* bits 5-8   16 channels */
+                | (((uint64_t)pch & 0x3ULL) << 9)         /* bits 9-10   4 pch x rank */
+                | (((uint64_t)bg & 0x3ULL) << 11)         /* bits 11-12  4 bg       */
+                | (((uint64_t)bank & 0x3ULL) << 13);      /* bits 13-14  4 banks/bg */
+  if (ns > 0xFFFFULL || ch > 15 || pch > 3 || bg > 3 || bank > 3) {
+    fprintf(stderr, "[pim-runtime] ERROR: bank (%d,%d,%d,%d) does not fit the per-bank "
+                    "dedup namespace, so banks would alias and the trace under-count\n",
+            ch, pch, bg, bank);
+    exit(1);
   }
   return ns;
 }
@@ -373,6 +403,46 @@ static uint64_t dcc_addr(int ch, int pch, int bg, int bank, int sa, int row, int
        + (uint64_t)(col % DCC_COLS_PER_ROW) * DCC_COL_BYTES;
 }
 
+static uint64_t bank_bytes(void) {
+  return (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+}
+
+/* DCC's generators walk banks with the channel innermost (gen_trace_HBMPIM_VA.py:122,
+ * GEMV.py:167-180), so orders compare an address as position, bank in its channel, then
+ * channel. On one channel that is position then address, as before. */
+static void addr_parts(uint64_t a, uint64_t *off, uint64_t *bank, uint64_t *ch) {
+  uint64_t gb = a / bank_bytes(), n = (uint64_t)banks_per_channel();
+  *off = a % bank_bytes();
+  *bank = gb % n;
+  *ch = gb / n;
+}
+static int cmp3(uint64_t a0, uint64_t b0, uint64_t a1, uint64_t b1, uint64_t a2, uint64_t b2) {
+  if (a0 != b0) return a0 < b0 ? -1 : 1;
+  if (a1 != b1) return a1 < b1 ? -1 : 1;
+  return (a2 > b2) - (a2 < b2);
+}
+static int cmp_pos_bank(uint64_t a, uint64_t b) {
+  uint64_t ao, ab, ac, bo, bb, bc;
+  addr_parts(a, &ao, &ab, &ac);
+  addr_parts(b, &bo, &bb, &bc);
+  return cmp3(ao, bo, ab, bb, ac, bc);
+}
+/* Bank, position, channel: their GEMV writes its staged vector bank by bank. */
+static int cmp_bank_pos(uint64_t a, uint64_t b) {
+  uint64_t ao, ab, ac, bo, bb, bc;
+  addr_parts(a, &ao, &ab, &ac);
+  addr_parts(b, &bo, &bb, &bc);
+  return cmp3(ab, bb, ao, bo, ac, bc);
+}
+
+/* One barrier per channel of the machine, at that channel, as their generators issue a
+ * block of n_channel whatever the tiling uses. */
+static void barrier_block(FILE *f) {
+  for (int c = 0; c < cfg_num_channels; c++)
+    fprintf(f, "PIM_BARRIER 0x%08llx\n",
+            (unsigned long long)((uint64_t)c * bank_bytes() * banks_per_channel()));
+}
+
 /* PHASE ORDERING. DCC's trace is grouped by phase -- stage the vector, then per round
  * reset / load operand / MAC / write back, then write the outputs -- and their controller
  * depends on it: MAC_OP1 requires every bank's row open, and our kernel-order interleaving
@@ -418,7 +488,7 @@ static uint64_t g_ord_disp = UINT64_MAX;
 static uint64_t g_access_ord = 0;
 
 static void access_ord_next(void) {
-  int lane = __pim_get_bank_id();
+  int lane = phys_lane();
   if (lane != g_ord_lane || cur_dispatch != g_ord_disp) {
     g_ord_lane = lane; g_ord_disp = cur_dispatch; g_access_ord = 0;
   }
@@ -447,7 +517,7 @@ static uint64_t g_open_disp = 0;
 static uint32_t g_open_rnd = 0;
 
 static void dcc_round_note(int is_write) {
-  int lane = __pim_get_bank_id();
+  int lane = phys_lane();
   if (lane != g_rnd_lane || cur_dispatch != g_rnd_disp) {
     g_rnd_lane = lane; g_rnd_disp = cur_dispatch; g_rnd = 0; g_rnd_closed = 0;
   }
@@ -571,12 +641,9 @@ static void grf_record(uint64_t addr, int stage) {
  * together; on the DCC shapes nothing reloads within a dispatch and every round is 0. */
 static int grf_rec_cmp(const void *a, const void *b) {
   const grf_rec_t *x = (const grf_rec_t *)a, *y = (const grf_rec_t *)b;
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
   if (x->dispatch != y->dispatch) return x->dispatch < y->dispatch ? -1 : 1;
   if (x->round != y->round) return x->round < y->round ? -1 : 1;
-  uint64_t xo = x->addr % g_ba, yo = y->addr % g_ba;      /* column within the bank */
-  if (xo != yo) return xo < yo ? -1 : 1;
-  return x->addr < y->addr ? -1 : (x->addr > y->addr);    /* then bank */
+  return cmp_pos_bank(x->addr, y->addr);
 }
 
 static void grf_sort(void) {
@@ -609,25 +676,19 @@ static void stage_record(int tid, uint64_t pos, int gb, uint64_t addr) {
 static int stage_cmp(const void *pa, const void *pb) {
   const stage_rec_t *a = pa, *b = pb;
   if (a->tid != b->tid) return a->tid < b->tid ? -1 : 1;
-  if (a->pos != b->pos) return a->pos < b->pos ? -1 : 1;
-  return (a->gb > b->gb) - (a->gb < b->gb);
+  int n = banks_per_channel();
+  return cmp3(a->pos, b->pos, (uint64_t)(a->gb % n), (uint64_t)(b->gb % n),
+              (uint64_t)(a->gb / n), (uint64_t)(b->gb / n));
 }
 
 /* Their GEMV stages its vector as a host read of every column, position then bank, then
  * the writes bank by bank, a barrier after each half, in rounds of 16 positions
  * (gen_trace_HBMPIM_GEMV.py:165-182). Adopted for the GRF operand so both sides pay it. */
-static uint64_t stage_bank_bytes(void) {
-  return (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
-}
 static int stage_pos_cmp(const void *pa, const void *pb) {
-  uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb, g = stage_bank_bytes();
-  if (a % g != b % g) return a % g < b % g ? -1 : 1;
-  return (a > b) - (a < b);
+  return cmp_pos_bank(*(const uint64_t *)pa, *(const uint64_t *)pb);
 }
 static int stage_bank_cmp(const void *pa, const void *pb) {
-  uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb, g = stage_bank_bytes();
-  if (a / g != b / g) return a / g < b / g ? -1 : 1;
-  return (a > b) - (a < b);
+  return cmp_bank_pos(*(const uint64_t *)pa, *(const uint64_t *)pb);
 }
 
 /* DRAM state and register state have different lifetimes, so they are emitted on
@@ -659,7 +720,7 @@ static void grf_stage_flush(void) {
     if (g_grf_recs[i].stage) s[n++] = g_grf_recs[i].addr;
   for (size_t i = 0; i < g_op_stage_n; i++) s[n++] = g_op_stage[i];
   qsort(s, n, sizeof *s, stage_pos_cmp);
-  uint64_t g = stage_bank_bytes();
+  uint64_t g = bank_bytes();
   for (size_t i = 0; i < n;) {
     size_t j = i;
     int npos = 0;
@@ -673,11 +734,11 @@ static void grf_stage_flush(void) {
     }
     for (size_t k = i; k < j; k++)
       fprintf(trace_fp, "LD 0x%08llx\n", (unsigned long long)s[k]);
-    fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+    barrier_block(trace_fp);
     qsort(s + i, j - i, sizeof *s, stage_bank_cmp);
     for (size_t k = i; k < j; k++)
       fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)s[k]);
-    fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+    barrier_block(trace_fp);
     i = j;
   }
   free(s);
@@ -689,7 +750,6 @@ static void grf_stage_flush(void) {
  * the order they were recorded in. */
 static int rec_cmp(const void *a, const void *b) {
   const dcc_rec_t *x = (const dcc_rec_t *)a, *y = (const dcc_rec_t *)b;
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
   int xout = x->phase == DP_OUT, yout = y->phase == DP_OUT;
   if (xout != yout) return xout - yout;
   if (!xout) {
@@ -699,10 +759,13 @@ static int rec_cmp(const void *a, const void *b) {
     if (x->phase == DP_MAC || x->phase == DP_LDOP)
       return x->seq < y->seq ? -1 : (x->seq > y->seq);
   }
-  uint64_t xo = x->addr % g_ba, yo = y->addr % g_ba;
-  if (xo != yo) return xo < yo ? -1 : 1;
-  if (x->addr != y->addr) return x->addr < y->addr ? -1 : 1;
-  return x->seq < y->seq ? -1 : (x->seq > y->seq);
+  /* Position, bank, then replay order, which under round-robin instances is instance
+   * then channel. Keying the channel first would put a channel's two stores to one column
+   * ahead of the next channel's first. */
+  uint64_t xo, xb, xc, yo, yb, yc;
+  addr_parts(x->addr, &xo, &xb, &xc);
+  addr_parts(y->addr, &yo, &yb, &yc);
+  return cmp3(xo, yo, xb, yb, x->seq, y->seq);
 }
 
 /* DCC's machine, natively. Their generators address compute to the 16 banks at
@@ -736,7 +799,9 @@ static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
 static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, int bank) {
   int64_t n = t->tile_mac_reads, K = t->addr_kext, M = t->addr_k;
   int64_t h = e / t->addr_head, k = (e % t->addr_head) / M, o = e % M;
-  int64_t itr = h / (__pim_lanes > 0 ? __pim_lanes : 1);
+  /* The head's iteration within its core. Instances go round-robin over the groups, so
+   * a group's k-th instance holds heads (k * groups + group) * lanes onward. */
+  int64_t itr = h / (__pim_lanes > 0 ? __pim_lanes : 1) / g_groups;
   int64_t off = itr * K * M + (k / n) * K + (o / n) * n;
   /* A read off a tile corner has no tile of theirs. It keeps our address and is counted,
    * and a reading at their addresses refuses the stream. */
@@ -794,15 +859,15 @@ static uint64_t dcc_epoch(const dcc_rec_t *r) {
   return __pim_persistent ? r->dispatch >> PIM_TILE_BITS : r->dispatch;
 }
 
-static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
-  int gb = (int)(r->addr / g_ba);
+static void nat_print(FILE *out, const dcc_rec_t *r, int wave, uint64_t g_ba) {
+  int gb = (int)(r->addr / g_ba), n = banks_per_channel();
   if (r->phase == DP_MAC && (g_dcc_native & NAT_FAN)) {
-    if (gb != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
-    uint64_t off = r->addr % g_ba;
-    for (int b = 0; b < 32; b++)
+    if (gb % n != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
+    uint64_t off = r->addr % g_ba, base = (uint64_t)(gb / n) * (uint64_t)n;
+    for (int b = 0; b < n; b++)
       if (dcc_addressed(b) && (wave < 0 || (b & 1) == wave))
-        fprintf(trace_fp, "%s 0x%08llx\n", r->op,
-                (unsigned long long)(off + (uint64_t)b * g_ba));
+        fprintf(out, "%s 0x%08llx\n", r->op,
+                (unsigned long long)(off + (base + (uint64_t)b) * g_ba));
     return;
   }
   if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
@@ -810,19 +875,38 @@ static void nat_print(const dcc_rec_t *r, int wave, uint64_t g_ba) {
     if (!t || t->acc_wb < 0) {  /* no convention stated: kept, counted, and refused */
       stat_acc_unstated++;
       if (wave >= 0 && (gb & 1) != wave) return;
-      fprintf(trace_fp, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+      fprintf(out, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
       return;
     }
     if (r->phase == DP_RESET && t->acc_reset == 0) return;
     if (r->phase == DP_WB && t->acc_wb == 2 && !dcc_addressed(gb)) return;
   }
   if (wave >= 0 && (gb & 1) != wave) return;
-  fprintf(trace_fp, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+  fprintf(out, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
 }
 
-/* Records [0, nc) are the compute block in rec_cmp order. */
-static void dcc_native_emit(size_t nc) {
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+/* One group's compute records, in rec_cmp order. Returns the waves it ran. */
+static uint64_t nat_emit_group(const dcc_rec_t *recs, size_t nc, FILE *out) {
+  uint64_t g_ba = bank_bytes(), waves = 0;
+  if (!(g_dcc_native & NAT_WAVE)) {
+    for (size_t k = 0; k < nc; k++) nat_print(out, &recs[k], -1, g_ba);
+    return 0;
+  }
+  for (size_t i = 0; i < nc;) {
+    uint64_t ep = dcc_epoch(&recs[i]);
+    size_t j = i;
+    int compute = 0;
+    for (; j < nc && dcc_epoch(&recs[j]) == ep; j++)
+      if (recs[j].phase == DP_MAC) compute = 1;
+    for (int w = 0; w < 2; w++)
+      for (size_t k = i; k < j; k++) nat_print(out, &recs[k], w, g_ba);
+    waves += compute;
+    i = j;
+  }
+  return waves;
+}
+
+static void dcc_native_check(void) {
   if (g_dcc_native & NAT_TILE) {
     if (stat_fold_cmds) {
       fprintf(stderr, "[pim-runtime] ERROR: TILE with lane folds, which no DCC MAC covers\n");
@@ -835,27 +919,62 @@ static void dcc_native_emit(size_t nc) {
         exit(1);
       }
   }
-  if (cfg_num_channels != 1 || cfg_num_banks != 4 ||
-      cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks != 32) {
-    fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE models DCC's one-channel, 32-bank "
-                    "machine only\n");
+  if (cfg_num_banks != 4) {
+    fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE models DCC's bank groups of 4 "
+                    "banks only\n");
     exit(1);
   }
-  if (!(g_dcc_native & NAT_WAVE)) {
-    for (size_t k = 0; k < nc; k++) nat_print(&g_recs[k], -1, g_ba);
-    return;
+}
+
+/* Records [0, nc) are the compute block in rec_cmp order. Each group's stream is what that
+ * group emits alone, and the streams are merged a command at a time, the channel innermost
+ * as in their generators, since their frontend issues one trace in order. */
+static void emit_compute(size_t nc) {
+  if (g_dcc_native) dcc_native_check();
+  uint64_t g_ba = bank_bytes();
+  int n = banks_per_channel(), G = g_groups;
+  char *buf[16] = {0};
+  size_t len[16] = {0};
+  dcc_rec_t *mine = (dcc_rec_t *)malloc((nc + 1) * sizeof *mine);
+  if (!mine) { fprintf(stderr, "[pim-runtime] ERROR: group record alloc\n"); exit(1); }
+  uint64_t waves = 0;
+  for (int g = 0; g < G; g++) {
+    size_t m = 0;
+    for (size_t k = 0; k < nc; k++) {
+      int ch = (int)(g_recs[k].addr / g_ba / (uint64_t)n);
+      if (ch >= G) {
+        fprintf(stderr, "[pim-runtime] ERROR: a command on channel %d, the launch has %d "
+                        "groups\n", ch, G);
+        exit(1);
+      }
+      if (ch == g) mine[m++] = g_recs[k];
+    }
+    FILE *out = open_memstream(&buf[g], &len[g]);
+    if (!out) { fprintf(stderr, "[pim-runtime] ERROR: group stream alloc\n"); exit(1); }
+    if (g_dcc_native) {
+      uint64_t w = nat_emit_group(mine, m, out);
+      if (w > waves) waves = w;
+    } else {
+      for (size_t k = 0; k < m; k++)
+        fprintf(out, "%s 0x%08llx\n", mine[k].op, (unsigned long long)mine[k].addr);
+    }
+    fclose(out);
   }
-  for (size_t i = 0; i < nc;) {
-    uint64_t ep = dcc_epoch(&g_recs[i]);
-    size_t j = i;
-    int compute = 0;
-    for (; j < nc && dcc_epoch(&g_recs[j]) == ep; j++)
-      if (g_recs[j].phase == DP_MAC) compute = 1;
-    for (int w = 0; w < 2; w++)
-      for (size_t k = i; k < j; k++) nat_print(&g_recs[k], w, g_ba);
-    g_dcc_waves += compute;
-    i = j;
+  free(mine);
+  g_dcc_waves += waves;
+  size_t at[16] = {0};
+  for (int left = 1; left;) {
+    left = 0;
+    for (int g = 0; g < G; g++) {
+      if (at[g] >= len[g]) continue;
+      const char *nl = memchr(buf[g] + at[g], '\n', len[g] - at[g]);
+      size_t e = nl ? (size_t)(nl - buf[g]) + 1 : len[g];
+      fwrite(buf[g] + at[g], 1, e - at[g], trace_fp);
+      at[g] = e;
+      left = 1;
+    }
   }
+  for (int g = 0; g < G; g++) free(buf[g]);
 }
 
 uint64_t pim_dcc_addr_order_mismatch(void) { return stat_addr_order_mismatch; }
@@ -887,7 +1006,8 @@ static void dcc_return_stage(void) {
     for (int p = T->pack_cols; p < T->ret_cols; p++) {
       long lc = T->pack_base_col + T->pack_cols - 1 - p;
       int linear_row = (int)(lc / cpr);
-      for (int gb = 0; gb < MAX_BANKS; gb++) {
+      for (int k = 0; k < cfg_num_channels * banks_per_channel(); k++) {
+        int gb = (k % cfg_num_channels) * banks_per_channel() + k / cfg_num_channels;
         if (!stored[gb]) continue;
         int ch, pch, bg, bank;
         decompose_global_bank(gb, &ch, &pch, &bg, &bank);
@@ -945,11 +1065,11 @@ static void dp_flush(void) {
   for (size_t k = 0; k < g_stage_n; k++) {
     fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)g_stage[k].addr);
     if (k + 1 == g_stage_n || g_stage[k + 1].tid != g_stage[k].tid)
-      fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+      barrier_block(trace_fp);
   }
   if (dp_len[DP_STAGE]) {
     fwrite(dp_buf[DP_STAGE], 1, dp_len[DP_STAGE], trace_fp);
-    fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+    barrier_block(trace_fp);
   }
   if (g_grf_n || g_op_stage_n) grf_stage_flush();
   /* GRF loads join the round they were issued in. Their seq sits above every emitted
@@ -968,12 +1088,8 @@ static void dp_flush(void) {
   if (g_rec_n) qsort(g_recs, g_rec_n, sizeof *g_recs, rec_cmp);
   size_t i = 0;
   while (i < g_rec_n && g_recs[i].phase != DP_OUT) i++;
-  if (g_dcc_native)
-    dcc_native_emit(i);
-  else
-    for (size_t k = 0; k < i; k++)
-      fprintf(trace_fp, "%s 0x%08llx\n", g_recs[k].op, (unsigned long long)g_recs[k].addr);
-  if (i) fprintf(trace_fp, "PIM_BARRIER 0x00000000\n");
+  emit_compute(i);
+  if (i) barrier_block(trace_fp);
   for (; i < g_rec_n; i++)
     fprintf(trace_fp, "%s 0x%08llx\n", g_recs[i].op, (unsigned long long)g_recs[i].addr);
   if (g_dcc_native & NAT_RET) dcc_return_stage();
@@ -1044,13 +1160,14 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
        * banks. Deduped on (tensor, row, col) so each column stages exactly once. */
       if (!g_dcc_staged)
         g_dcc_staged = addr_dedup_create(4096);
-      if (addr_dedup_check_and_mark(g_dcc_staged, (uint64_t)tid,
+      /* Per channel: a group's banks hold its own instances' data. */
+      if (addr_dedup_check_and_mark(g_dcc_staged, (uint64_t)tid | ((uint64_t)ch << 8),
                                     (uint64_t)sa * (uint64_t)cfg_num_rows + row,
                                     (uint64_t)col)) {
-        int nb = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+        int nb = banks_per_channel();
         uint64_t pos = ((uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row) *
                            (uint64_t)DCC_COLS_PER_ROW + (uint64_t)col;
-        for (int gb = 0; gb < nb; gb++) {
+        for (int gb = ch * nb; gb < (ch + 1) * nb; gb++) {
           int c2, p2, g2, b2;
           decompose_global_bank(gb, &c2, &p2, &g2, &b2);
           stage_record(tid, pos, gb, dcc_addr(c2, p2, g2, b2, sa, row, col));
@@ -1088,7 +1205,7 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
       stat_dcc_free_acc_ops += 2;
     } else {
       dp_record(DP_RESET, "PIM_ACC_RESET", a);
-      if (g_open_valid && g_open_lane == __pim_get_bank_id() &&
+      if (g_open_valid && g_open_lane == phys_lane() &&
           (g_open_disp != cur_dispatch || g_open_rnd != g_rnd)) {
         g_recs[g_rec_n - 1].dispatch = g_open_disp;
         g_recs[g_rec_n - 1].round = g_open_rnd;
@@ -1229,8 +1346,8 @@ typedef struct {
  * with the bank bits dropped, which aliased 4-8 words onto one address. */
 static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   static int warned = 0;
-  int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-  int lane = __pim_get_bank_id();
+  int all_banks = active_banks();
+  int lane = phys_lane();
   if (lane < 0 || lane >= all_banks || lane >= MAX_BANKS) {
     if (!warned++)
       fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d banks; kept "
@@ -1339,7 +1456,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
        * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
        * (its broadcast shortcut is commented out). */
       int dch, dpch, dbg, dbank;
-      decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+      decompose_global_bank(phys_lane(), &dch, &dpch, &dbg, &dbank);
       emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
       stat_writes++;
       t->emitted_w++;
@@ -1470,11 +1587,10 @@ void pim_init(const char *trace_file) {
                       "compiler\n", g_dcc_native, (int)__pim_dcc_acc_count);
   }
 
-  if (__pim_lanes > 0 &&
-      (int)__pim_lanes != cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks)
-    fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, machine has %d "
+  if (__pim_lanes > 0 && (int)__pim_lanes != banks_per_channel())
+    fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, a group has %d "
                     "banks; lane placement puts lane b in bank b and assumes they agree.\n",
-            (int)__pim_lanes, cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks);
+            (int)__pim_lanes, banks_per_channel());
   stat_lockstep_skips = 0;
   stat_fold_cmds = 0;
   g_last_mac = 0;
@@ -1486,7 +1602,7 @@ void pim_init(const char *trace_file) {
   /* 136 entries per bank is only the starting size. The table grows on demand, so it
    * bounds nothing. */
   g_lockstep_collapse =
-      addr_dedup_create(cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks * 136);
+      addr_dedup_create(active_banks() * 136);
 
   initialized = 1;
   finalized = 0;
@@ -1634,7 +1750,7 @@ static void apply_compiler_layout(int tensor_id) {
        * used to keep the source word's (sa,row,col) and drop its bank bits, which
        * aliased 4-8 distinct words onto one address (matmul A: 8,192 writes, 2,048
        * addresses). When the rows do not fit, keep the interleaved home and say so. */
-      int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+      int all_banks = active_banks();
       int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
       int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
       if (cfg_place_align == PIM_ALIGN_ROW_PACK) {
@@ -1897,7 +2013,7 @@ void pim_finalize(void) {
     tensor_info_t *t = &tensors[i];
     if (t->bank_replicated < 0 || t->lane_row_base < 0)
       continue;
-    int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    int all_banks = active_banks();
     fprintf(stderr, "[pim-runtime]   tensor %d slab slots per lane:", i);
     for (int l = 0; l < all_banks && l < MAX_BANKS; l++)
       fprintf(stderr, " %d", t->lane_ord[l]);
@@ -2003,9 +2119,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     }
     int tid = (int)(t - tensors);
     if (tid >= 0 && tid < MAX_TENSORS && g_dcc_grf_operand[tid]) {
-      int lane = __pim_get_bank_id();
-      if (lane < 0 || lane >= MAX_BANKS)
-        lane = 0;
+      int lane = phys_lane();
       uint64_t lrow = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
       uint64_t key = ((uint64_t)tid << 40) | (lrow << 8) | (uint64_t)loc.col;
       if (!grf_a_touch(lane, key))
@@ -2203,7 +2317,7 @@ void __pim_trace_fold(int64_t steps, int64_t outputs) {
   advance_program_epoch_if_needed();
   access_ord_next();
   int fch, fpch, fbg, fbank;
-  decompose_global_bank(__pim_get_bank_id(), &fch, &fpch, &fbg, &fbank);
+  decompose_global_bank(phys_lane(), &fch, &fpch, &fbg, &fbank);
   for (int64_t o = 0; o < outputs; o++)
     for (int64_t k = 0; k < steps; k++) {
       if (g_lockstep_collapse) {

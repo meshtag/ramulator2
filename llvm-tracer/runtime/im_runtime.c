@@ -26,6 +26,7 @@
 
 /* File-scope state — one bank executes at a time on CPU. */
 static int32_t current_bank_id = 0;
+static int32_t current_group_id = 0;
 static int32_t current_program_id = 0;
 static int32_t current_program_id_y = 0;
 static int32_t current_program_id_z = 0;
@@ -53,6 +54,8 @@ static uint64_t current_tile_idx = 0;
 
 int32_t __pim_get_bank_id(void) { return current_bank_id; }
 
+int32_t __pim_get_group_id(void) { return current_group_id; }
+
 int32_t __pim_get_program_id(void) { return current_program_id; }
 
 int32_t __pim_get_program_id_y(void) { return current_program_id_y; }
@@ -66,6 +69,8 @@ void __pim_set_bank_id(int32_t id) {
   current_tile_idx = 0; /* a new replay walks the same tiles again */
 }
 
+
+void __pim_set_group_id(int32_t id) { current_group_id = id; }
 
 void __pim_set_program_id(int32_t id) {
   current_program_id = id;
