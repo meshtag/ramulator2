@@ -26,6 +26,10 @@ static int cfg_num_channels = 1;
 static int cfg_num_pch = 2;
 /* Channels the launch spreads its program instances over, one group per channel. */
 static int g_groups = 1;
+/* Sizing replay: each lane's distinct elements per tensor, measured before placement, since
+ * a tensor partitioned within a group may still be read whole by every group. */
+static int g_sizing = 0, g_sized = 0;
+static int g_sized_share[16];
 static const int cfg_num_bg = 4;
 static const int cfg_num_banks = 4; /* per bank group */
 /* Hand copy of the simulator's org preset (HBM3_8Gb in HBM3_PIM.cpp). Nothing checks
@@ -94,6 +98,12 @@ static int phys_lane(void) {
     exit(1);
   }
   return g * banks_per_channel() + b;
+}
+
+/* The next run only measures each lane's footprint, and the run after it places by it. */
+void pim_size_begin(void) {
+  g_sizing = 1;
+  g_sized = 0;
 }
 
 void pim_set_machine(int channels, int ranks, int groups) {
@@ -791,6 +801,7 @@ enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT
        NAT_GPOS = 128, NAT_ALL = 247 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
+static uint64_t stat_tile_issued = 0;
 static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
 static uint64_t stat_ret_refused = 0, stat_acc_unstated = 0;
 static int g_emit_elem = -1;  /* logical element index of the access being emitted */
@@ -804,10 +815,10 @@ static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
 
 static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, int bank) {
   int64_t n = t->tile_mac_reads, K = t->addr_kext, M = t->addr_k;
-  int64_t h = e / t->addr_head, k = (e % t->addr_head) / M, o = e % M;
-  /* The head's iteration within its core. Instances go round-robin over the groups, so
-   * a group's k-th instance holds heads (k * groups + group) * lanes onward. */
-  int64_t itr = h / (__pim_lanes > 0 ? __pim_lanes : 1) / g_groups;
+  int64_t k = (e % t->addr_head) / M, o = e % M;
+  /* The head's iteration within its core is the program's within its group, instances going
+   * round-robin over the groups. */
+  int64_t itr = (int64_t)__pim_get_program_id() / g_groups;
   int64_t off = itr * K * M + (k / n) * K + (o / n) * n;
   /* A read off a tile corner has no tile of theirs. It keeps our address and is counted,
    * and a reading at their addresses refuses the stream. */
@@ -855,7 +866,10 @@ static int dcc_tile_issue(tensor_info_t *t) {
     t->tile_disp = cur_dispatch + 1;
     t->tile_ord = 0;
   }
-  if (t->tile_ord++ % (uint64_t)t->tile_mac_reads == 0) return 1;
+  if (t->tile_ord++ % (uint64_t)t->tile_mac_reads == 0) {
+    stat_tile_issued++;
+    return 1;
+  }
   stat_tile_absorbed++;
   return 0;
 }
@@ -873,15 +887,43 @@ static uint64_t dcc_epoch(const dcc_rec_t *r) {
   return __pim_persistent ? r->dispatch >> PIM_TILE_BITS : r->dispatch;
 }
 
-static void nat_print(FILE *out, const dcc_rec_t *r, int wave, uint64_t g_ba) {
+/* One group's lines, each tagged with its segment: program, wave, tile, round, phase. */
+typedef struct { uint64_t key; uint32_t off, len; } seg_ent_t;
+typedef struct { seg_ent_t *e; size_t n, cap; char *txt; size_t tn, tcap; } seg_buf_t;
+
+static void seg_push(seg_buf_t *b, uint64_t key, const char *op, uint64_t addr) {
+  char line[64];
+  int len = snprintf(line, sizeof line, "%s 0x%08llx\n", op, (unsigned long long)addr);
+  if (b->n == b->cap) {
+    b->cap = b->cap ? b->cap * 2 : 1u << 12;
+    b->e = (seg_ent_t *)realloc(b->e, b->cap * sizeof *b->e);
+  }
+  if (b->tn + (size_t)len > b->tcap) {
+    b->tcap = b->tcap ? b->tcap * 2 : 1u << 16;
+    while (b->tn + (size_t)len > b->tcap) b->tcap *= 2;
+    b->txt = (char *)realloc(b->txt, b->tcap);
+  }
+  if (!b->e || !b->txt) { fprintf(stderr, "[pim-runtime] ERROR: group stream alloc\n"); exit(1); }
+  memcpy(b->txt + b->tn, line, (size_t)len);
+  b->e[b->n++] = (seg_ent_t){key, (uint32_t)b->tn, (uint32_t)len};
+  b->tn += (size_t)len;
+}
+
+static uint64_t seg_key(uint64_t prog, int wave, const dcc_rec_t *r) {
+  uint64_t tile = __pim_persistent ? r->dispatch & ((1ULL << PIM_TILE_BITS) - 1) : 0;
+  return ((((prog * 4 + (uint64_t)(wave + 1)) << PIM_TILE_BITS | tile) << 20 |
+           (r->round & 0xFFFFF)) << 4) | (uint64_t)r->phase;
+}
+
+static void nat_print(seg_buf_t *out, uint64_t key, const dcc_rec_t *r, int wave,
+                      uint64_t g_ba) {
   int gb = (int)(r->addr / g_ba), n = banks_per_channel();
   if (r->phase == DP_MAC && (g_dcc_native & NAT_FAN)) {
     if (gb % n != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
     uint64_t off = r->addr % g_ba, base = (uint64_t)(gb / n) * (uint64_t)n;
     for (int b = 0; b < group_lanes(); b++)
       if (dcc_fan_kept(b, gb / n) && (wave < 0 || (b & 1) == wave))
-        fprintf(out, "%s 0x%08llx\n", r->op,
-                (unsigned long long)(off + (base + (uint64_t)b) * g_ba));
+        seg_push(out, key, r->op, off + (base + (uint64_t)b) * g_ba);
     return;
   }
   if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
@@ -889,32 +931,37 @@ static void nat_print(FILE *out, const dcc_rec_t *r, int wave, uint64_t g_ba) {
     if (!t || t->acc_wb < 0) {  /* no convention stated: kept, counted, and refused */
       stat_acc_unstated++;
       if (wave >= 0 && (gb & 1) != wave) return;
-      fprintf(out, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+      seg_push(out, key, r->op, r->addr);
       return;
     }
     if (r->phase == DP_RESET && t->acc_reset == 0) return;
     if (r->phase == DP_WB && t->acc_wb == 2 && !dcc_addressed(gb)) return;
   }
   if (wave >= 0 && (gb & 1) != wave) return;
-  fprintf(out, "%s 0x%08llx\n", r->op, (unsigned long long)r->addr);
+  seg_push(out, key, r->op, r->addr);
 }
 
 /* One group's compute records, in rec_cmp order. Returns the waves it ran. */
-static uint64_t nat_emit_group(const dcc_rec_t *recs, size_t nc, FILE *out) {
-  uint64_t g_ba = bank_bytes(), waves = 0;
-  if (!(g_dcc_native & NAT_WAVE)) {
-    for (size_t k = 0; k < nc; k++) nat_print(out, &recs[k], -1, g_ba);
-    return 0;
-  }
-  for (size_t i = 0; i < nc;) {
+static uint64_t nat_emit_group(const dcc_rec_t *recs, size_t nc, seg_buf_t *out) {
+  uint64_t g_ba = bank_bytes(), waves = 0, prog = 0;
+  for (size_t i = 0; i < nc; prog++) {
     uint64_t ep = dcc_epoch(&recs[i]);
     size_t j = i;
     int compute = 0;
     for (; j < nc && dcc_epoch(&recs[j]) == ep; j++)
       if (recs[j].phase == DP_MAC) compute = 1;
-    for (int w = 0; w < 2; w++)
-      for (size_t k = i; k < j; k++) nat_print(out, &recs[k], w, g_ba);
-    waves += compute;
+    if (!g_dcc_native) {
+      for (size_t k = i; k < j; k++) seg_push(out, seg_key(prog, -1, &recs[k]), recs[k].op,
+                                              recs[k].addr);
+    } else if (!(g_dcc_native & NAT_WAVE)) {
+      for (size_t k = i; k < j; k++) nat_print(out, seg_key(prog, -1, &recs[k]), &recs[k], -1,
+                                               g_ba);
+    } else {
+      for (int w = 0; w < 2; w++)
+        for (size_t k = i; k < j; k++) nat_print(out, seg_key(prog, w, &recs[k]), &recs[k], w,
+                                                 g_ba);
+      waves += compute;
+    }
     i = j;
   }
   return waves;
@@ -941,14 +988,15 @@ static void dcc_native_check(void) {
 }
 
 /* Records [0, nc) are the compute block in rec_cmp order. Each group's stream is what that
- * group emits alone, and the streams are merged a command at a time, the channel innermost
- * as in their generators, since their frontend issues one trace in order. */
+ * group emits alone, and the streams are merged segment by segment, the channel innermost
+ * within one as in their generators, since their frontend issues one trace in order. A
+ * segment one group leaves empty, as GPOS does a channel's MACs, is the others' alone. */
 static void emit_compute(size_t nc) {
   if (g_dcc_native) dcc_native_check();
   uint64_t g_ba = bank_bytes();
   int n = banks_per_channel(), G = g_groups;
-  char *buf[16] = {0};
-  size_t len[16] = {0};
+  seg_buf_t buf[16];
+  memset(buf, 0, sizeof buf);
   dcc_rec_t *mine = (dcc_rec_t *)malloc((nc + 1) * sizeof *mine);
   if (!mine) { fprintf(stderr, "[pim-runtime] ERROR: group record alloc\n"); exit(1); }
   uint64_t waves = 0;
@@ -963,32 +1011,28 @@ static void emit_compute(size_t nc) {
       }
       if (ch == g) mine[m++] = g_recs[k];
     }
-    FILE *out = open_memstream(&buf[g], &len[g]);
-    if (!out) { fprintf(stderr, "[pim-runtime] ERROR: group stream alloc\n"); exit(1); }
-    if (g_dcc_native) {
-      uint64_t w = nat_emit_group(mine, m, out);
-      if (w > waves) waves = w;
-    } else {
-      for (size_t k = 0; k < m; k++)
-        fprintf(out, "%s 0x%08llx\n", mine[k].op, (unsigned long long)mine[k].addr);
-    }
-    fclose(out);
+    uint64_t w = nat_emit_group(mine, m, &buf[g]);
+    if (w > waves) waves = w;
   }
   free(mine);
   g_dcc_waves += waves;
   size_t at[16] = {0};
-  for (int left = 1; left;) {
-    left = 0;
-    for (int g = 0; g < G; g++) {
-      if (at[g] >= len[g]) continue;
-      const char *nl = memchr(buf[g] + at[g], '\n', len[g] - at[g]);
-      size_t e = nl ? (size_t)(nl - buf[g]) + 1 : len[g];
-      fwrite(buf[g] + at[g], 1, e - at[g], trace_fp);
-      at[g] = e;
-      left = 1;
+  for (;;) {
+    uint64_t lo = UINT64_MAX;
+    for (int g = 0; g < G; g++)
+      if (at[g] < buf[g].n && buf[g].e[at[g]].key < lo) lo = buf[g].e[at[g]].key;
+    if (lo == UINT64_MAX) break;
+    for (int left = 1; left;) {
+      left = 0;
+      for (int g = 0; g < G; g++)
+        if (at[g] < buf[g].n && buf[g].e[at[g]].key == lo) {
+          fwrite(buf[g].txt + buf[g].e[at[g]].off, 1, buf[g].e[at[g]].len, trace_fp);
+          at[g]++;
+          left = 1;
+        }
     }
   }
-  for (int g = 0; g < G; g++) free(buf[g]);
+  for (int g = 0; g < G; g++) { free(buf[g].e); free(buf[g].txt); }
 }
 
 uint64_t pim_dcc_addr_order_mismatch(void) { return stat_addr_order_mismatch; }
@@ -997,6 +1041,7 @@ uint64_t pim_dcc_addr_mapped(void) { return stat_addr_mapped; }
 uint64_t pim_dcc_ret_refused(void) { return stat_ret_refused; }
 uint64_t pim_dcc_acc_unstated(void) { return stat_acc_unstated; }
 uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
+uint64_t pim_dcc_tile_issued(void) { return stat_tile_issued; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
 
@@ -1572,6 +1617,7 @@ void pim_init(const char *trace_file) {
                   "trace through THEIR Ramulator, not ours.\n");
   g_dcc_native = 0;
   stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
+  stat_tile_issued = 0;
   stat_addr_unmapped = stat_addr_mapped = stat_ret_refused = 0;
   stat_acc_unstated = 0;
   {
@@ -1774,7 +1820,9 @@ static void apply_compiler_layout(int tensor_id) {
         int vpc = _t->values_per_col > 0 ? _t->values_per_col : 16;
         long cpr = vpr / vpc;
         int share = _t->bank_replicated >= 1 ? _t->num_elements
+                    : g_sized ? g_sized_share[tensor_id]
                     : (_t->num_elements + all_banks - 1) / all_banks;
+        if (share < 1) share = 1;
         int cols = (share + vpc - 1) / vpc;
         if (g_pack_col_top < 0)
           g_pack_col_top = (long)cfg_num_sa * cfg_num_rows * cpr;
@@ -1980,6 +2028,23 @@ void pim_finalize(void) {
     return;
 
   finalized = 1;
+  if (g_sizing) {
+    for (int i = 0; i < num_tensors && i < 16; i++) {
+      int most = 0;
+      for (int l = 0; l < MAX_BANKS; l++)
+        if (tensors[i].lane_ord[l] > most) most = tensors[i].lane_ord[l];
+      g_sized_share[i] = most;
+    }
+    g_sizing = 0;
+    g_sized = 1;
+    cov_reset();
+    for (int p = 0; p < DP_N; p++) { free(dp_buf[p]); dp_buf[p] = NULL; dp_len[p] = dp_cap[p] = 0; }
+    free(g_recs); g_recs = NULL; g_rec_n = g_rec_cap = 0;
+    if (trace_fp) { fclose(trace_fp); trace_fp = NULL; }
+    destroy_dedup_state();
+    initialized = 0;
+    return;
+  }
 
   /* The check is lazy, on the first compute-phase load of a non-accumulator tensor. A
    * kernel with no such load would otherwise never be judged, so a run can never end
@@ -2201,6 +2266,16 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
     return;
   }
   tensor_info_t *t = &tensors[tidx];
+  if (g_sizing) {
+    int es = t->elem_size > 0 ? t->elem_size : 1;
+    for (uint64_t i = 0; i < (size ? size / (uint64_t)es : 1); i++) {
+      uint64_t ea = base_addr + i * (uint64_t)es;
+      int k = find_tensor(ea);
+      pim_phys_loc_t loc;
+      if (k >= 0) resolve_access_location(&tensors[k], ea, &loc);
+    }
+    return;
+  }
   t->range_calls++;
 
   /* Track program-id boundaries so the dedup table is reset per tile. */
@@ -2327,7 +2402,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
  * this lane, each a tree of `steps`. One instruction per lane, so it collapses across
  * bank replicas like an access. DCC prices each step as a PIM_MAC_OP1 in the bank. */
 void __pim_trace_fold(int64_t steps, int64_t outputs) {
-  if (!trace_fp || cur_phase != PIM_PHASE_COMPUTE || steps <= 0 || outputs <= 0)
+  if (!trace_fp || g_sizing || cur_phase != PIM_PHASE_COMPUTE || steps <= 0 || outputs <= 0)
     return;
   advance_program_epoch_if_needed();
   access_ord_next();
