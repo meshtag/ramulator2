@@ -29,9 +29,7 @@
  * survived a width change once and silently read num_axes as bank_replicated. */
 #define PIM_LW_OPERAND_ARG 0
 #define PIM_LW_BANK_REPLICATED 1
-#define PIM_LW_NUM_AXES 2
 #define PIM_LW_IS_STORE 3
-#define PIM_LW_AXES_BASE 4
 
 /* Weak DEFINITIONS, not weak references. A weak reference does not link on Mach-O when
  * nothing defines the symbol, which is the normal case whenever
@@ -65,7 +63,7 @@ __attribute__((weak)) extern const int32_t __pim_persistent;
 __attribute__((weak)) extern const int32_t __pim_dq_bits;
 
 /* Lanes the kernel was compiled for (threadsPerWarp = num_banks). Lane placement puts
- * lane b in bank b, so this must equal the bank count. 0 = the kernel did not say. */
+ * lane b in bank b, so it may not exceed a group's banks. 0 = the kernel did not say. */
 __attribute__((weak)) extern const int32_t __pim_lanes;
 
 /* Cells ONE LANE keeps live across a reduction: the widest loop-carried accumulator, as
