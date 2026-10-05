@@ -165,6 +165,10 @@ typedef struct {
   /* __pim_dcc_return_from: the input this tensor's return stage is sized from, -1 none,
    * and under RET the columns per bank that return stage spans. */
   int ret_src, ret_cols;
+  /* __pim_mac_first: reduce stride and extent, 0 when unstated, and per channel the
+   * dispatch and output column of the last issued product. */
+  int64_t mf_kstride, mf_kext, mf_group[16];
+  uint64_t mf_disp[16];
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -883,6 +887,67 @@ static int dcc_fan_kept(int b, int ch) {
   if (!(g_dcc_native & NAT_GPOS)) return dcc_addressed(b);
   return ((b / 2) * g_groups + ch) % 2 == 0;
 }
+/* im-acc-init-fold: the product read at reduce coordinate 0 issues as PIM_MUL_OP1, which
+ * writes its accumulator entry, so the entry's reset goes wherever that MUL lands. Each
+ * output column of a dispatch has to open with its MUL and hold no other, per channel;
+ * anything else is counted and the reading refuses it. */
+static const char *const OP_MUL = "PIM_MUL_OP1";
+static uint64_t stat_fold_mul = 0, stat_fold_order = 0, stat_fold_bw = 0;
+static uint64_t stat_fold_mul_lines = 0, stat_fold_reset_dropped = 0, stat_fold_reset_kept = 0;
+/* (dispatch, channel) of every MUL record, sorted, built when the compute block is emitted. */
+static uint64_t *g_fold_keys = NULL;
+static size_t g_fold_nkeys = 0;
+
+static int fold_mul(tensor_info_t *t, int e, int ch) {
+  if (!t || t->mf_kext <= 0 || e < 0) return 0;
+  int64_t s = t->mf_kstride, k = (e / s) % t->mf_kext;
+  int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
+  int64_t group = ((e / (s * t->mf_kext)) * s + e % s) / vpc;
+  int c = ch & 15;
+  int opens = t->mf_disp[c] != cur_dispatch + 1 || t->mf_group[c] != group;
+  if (opens != (k == 0)) stat_fold_order++;
+  t->mf_disp[c] = cur_dispatch + 1;
+  t->mf_group[c] = group;
+  if (k) return 0;
+  stat_fold_mul++;
+  return 1;
+}
+
+/* A folded reset goes where a MUL of its own dispatch landed: with FAN the banks the MUL fans
+ * to, else every bank of the MUL's channel, a collapsed MUL standing for all of its lanes. A
+ * bank no MUL reaches keeps its reset. */
+static int fold_reset(const dcc_rec_t *r) {
+  return r->phase == DP_RESET && r->tid >= 0 && r->tid < num_tensors &&
+         tensors[r->tid].acc_reset == 2;
+}
+static int u64_cmp(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : x > y;
+}
+static void fold_index(const dcc_rec_t *recs, size_t nc, uint64_t g_ba, int n) {
+  free(g_fold_keys);
+  g_fold_keys = NULL;
+  g_fold_nkeys = 0;
+  size_t cap = 0;
+  for (size_t i = 0; i < nc; i++) {
+    if (recs[i].op != OP_MUL) continue;
+    if (g_fold_nkeys == cap) {
+      cap = cap ? cap * 2 : 256;
+      g_fold_keys = (uint64_t *)realloc(g_fold_keys, cap * sizeof *g_fold_keys);
+      if (!g_fold_keys) { fprintf(stderr, "[pim-runtime] ERROR: fold index alloc\n"); exit(1); }
+    }
+    g_fold_keys[g_fold_nkeys++] = recs[i].dispatch << 4 | (uint64_t)((recs[i].addr / g_ba / n) & 15);
+  }
+  if (g_fold_nkeys) qsort(g_fold_keys, g_fold_nkeys, sizeof *g_fold_keys, u64_cmp);
+}
+static int fold_covered(int gb, int n, uint64_t disp) {
+  if ((g_dcc_native & NAT_FAN) && !(gb % n < group_lanes() && dcc_fan_kept(gb % n, gb / n)))
+    return 0;
+  uint64_t key = disp << 4 | (uint64_t)((gb / n) & 15);
+  return g_fold_nkeys &&
+         bsearch(&key, g_fold_keys, g_fold_nkeys, sizeof key, u64_cmp) != NULL;
+}
+
 static uint64_t dcc_epoch(const dcc_rec_t *r) {
   return __pim_persistent ? r->dispatch >> PIM_TILE_BITS : r->dispatch;
 }
@@ -922,9 +987,16 @@ static void nat_print(seg_buf_t *out, uint64_t key, const dcc_rec_t *r, int wave
     if (gb % n != 0 && wave <= 0) stat_native_off_bank0++;  /* once per record, not per wave */
     uint64_t off = r->addr % g_ba, base = (uint64_t)(gb / n) * (uint64_t)n;
     for (int b = 0; b < group_lanes(); b++)
-      if (dcc_fan_kept(b, gb / n) && (wave < 0 || (b & 1) == wave))
+      if (dcc_fan_kept(b, gb / n) && (wave < 0 || (b & 1) == wave)) {
         seg_push(out, key, r->op, off + (base + (uint64_t)b) * g_ba);
+        stat_fold_mul_lines += r->op == OP_MUL;
+      }
     return;
+  }
+  if (fold_reset(r)) {
+    if (wave >= 0 && (gb & 1) != wave) return;
+    if (fold_covered(gb, n, r->dispatch)) { stat_fold_reset_dropped++; return; }
+    stat_fold_reset_kept++;
   }
   if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
     const tensor_info_t *t = r->tid >= 0 && r->tid < num_tensors ? &tensors[r->tid] : NULL;
@@ -939,6 +1011,7 @@ static void nat_print(seg_buf_t *out, uint64_t key, const dcc_rec_t *r, int wave
   }
   if (wave >= 0 && (gb & 1) != wave) return;
   seg_push(out, key, r->op, r->addr);
+  stat_fold_mul_lines += r->op == OP_MUL;
 }
 
 /* One group's compute records, in rec_cmp order. Returns the waves it ran. */
@@ -951,8 +1024,18 @@ static uint64_t nat_emit_group(const dcc_rec_t *recs, size_t nc, seg_buf_t *out)
     for (; j < nc && dcc_epoch(&recs[j]) == ep; j++)
       if (recs[j].phase == DP_MAC) compute = 1;
     if (!g_dcc_native) {
-      for (size_t k = i; k < j; k++) seg_push(out, seg_key(prog, -1, &recs[k]), recs[k].op,
-                                              recs[k].addr);
+      int n = banks_per_channel();
+      for (size_t k = i; k < j; k++) {
+        if (fold_reset(&recs[k])) {
+          if (fold_covered((int)(recs[k].addr / g_ba), n, recs[k].dispatch)) {
+            stat_fold_reset_dropped++;
+            continue;
+          }
+          stat_fold_reset_kept++;
+        }
+        seg_push(out, seg_key(prog, -1, &recs[k]), recs[k].op, recs[k].addr);
+        stat_fold_mul_lines += recs[k].op == OP_MUL;
+      }
     } else if (!(g_dcc_native & NAT_WAVE)) {
       for (size_t k = i; k < j; k++) nat_print(out, seg_key(prog, -1, &recs[k]), &recs[k], -1,
                                                g_ba);
@@ -993,8 +1076,15 @@ static void dcc_native_check(void) {
  * segment one group leaves empty, as GPOS does a channel's MACs, is the others' alone. */
 static void emit_compute(size_t nc) {
   if (g_dcc_native) dcc_native_check();
+  if ((stat_fold_bw > 0) != (stat_fold_mul > 0)) {
+    fprintf(stderr, "[pim-runtime] ERROR: %llu folded resets against %llu MULs, the fold "
+                    "needs both\n", (unsigned long long)stat_fold_bw,
+            (unsigned long long)stat_fold_mul);
+    exit(1);
+  }
   uint64_t g_ba = bank_bytes();
   int n = banks_per_channel(), G = g_groups;
+  fold_index(g_recs, nc, g_ba, n);
   seg_buf_t buf[16];
   memset(buf, 0, sizeof buf);
   dcc_rec_t *mine = (dcc_rec_t *)malloc((nc + 1) * sizeof *mine);
@@ -1044,6 +1134,12 @@ uint64_t pim_dcc_tile_absorbed(void) { return stat_tile_absorbed; }
 uint64_t pim_dcc_tile_issued(void) { return stat_tile_issued; }
 uint64_t pim_dcc_waves(void) { return g_dcc_waves; }
 uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
+uint64_t pim_dcc_fold_mul(void) { return stat_fold_mul; }
+uint64_t pim_dcc_fold_order(void) { return stat_fold_order; }
+uint64_t pim_dcc_fold_resets(void) { return stat_fold_bw; }
+uint64_t pim_dcc_fold_mul_lines(void) { return stat_fold_mul_lines; }
+uint64_t pim_dcc_fold_reset_dropped(void) { return stat_fold_reset_dropped; }
+uint64_t pim_dcc_fold_reset_kept(void) { return stat_fold_reset_kept; }
 
 /* RET: the positions past a tensor's own columns, position outer and bank inner over the
  * banks it stored to, each at the next column away from the input. Not coverage: no kernel
@@ -1079,8 +1175,10 @@ static void dcc_return_stage(void) {
 }
 
 /* A map's results sit in GRF_B until its stores, one entry per output column per lane, so a
- * round may store at most GRF_B_ENTRIES columns per bank. Flagged like grf_b_check and never
- * re-blocked, since the strip is the program's. */
+ * round may store at most GRF_B_ENTRIES columns per bank. A strip the compiler jammed wider
+ * keeps them in place over its operand registers, which ADD and MOV may write in either
+ * file, so both files bound it. Flagged like grf_b_check and never re-blocked, since the
+ * strip is the program's. */
 static int map_rec_cmp(const void *a, const void *b) {
   const dcc_rec_t *x = *(const dcc_rec_t *const *)a, *y = *(const dcc_rec_t *const *)b;
   uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
@@ -1242,7 +1340,9 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                                       bank);
         if (their) a = their;
       }
-      dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", a);
+      dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU"
+                        : fold_mul((tensor_info_t *)t_emit, g_emit_elem, ch) ? OP_MUL
+                        : "PIM_MAC_OP1", a);
     }
     g_last_mac = a;
   } else if (!strcmp(op, "W")) {                 /* operand staged once, then into the GRF */
@@ -1266,6 +1366,7 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
       stat_dcc_free_acc_ops += 2;
     } else {
       dp_record(DP_RESET, "PIM_ACC_RESET", a);
+      stat_fold_bw += t_emit && t_emit->acc_reset == 2;
       if (g_open_valid && g_open_lane == phys_lane() &&
           (g_open_disp != cur_dispatch || g_open_rnd != g_rnd)) {
         g_recs[g_rec_n - 1].dispatch = g_open_disp;
@@ -1622,6 +1723,11 @@ void pim_init(const char *trace_file) {
   stat_tile_issued = 0;
   stat_addr_unmapped = stat_addr_mapped = stat_ret_refused = 0;
   stat_acc_unstated = 0;
+  stat_fold_mul = stat_fold_order = stat_fold_bw = 0;
+  stat_fold_mul_lines = stat_fold_reset_dropped = stat_fold_reset_kept = 0;
+  free(g_fold_keys);
+  g_fold_keys = NULL;
+  g_fold_nkeys = 0;
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
@@ -1738,6 +1844,19 @@ static void apply_dcc_tile_mac(int tensor_id) {
     }
 }
 
+static void apply_mac_first(int tensor_id) {
+  tensor_info_t *t = &tensors[tensor_id];
+  t->mf_kstride = t->mf_kext = 0;
+  memset(t->mf_group, 0, sizeof t->mf_group);
+  memset(t->mf_disp, 0, sizeof t->mf_disp);
+  int n = (int)__pim_mac_first_count;
+  for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
+    if (__pim_mac_first[3 * i] == tensor_id) {
+      t->mf_kstride = __pim_mac_first[3 * i + 1];
+      t->mf_kext = __pim_mac_first[3 * i + 2];
+    }
+}
+
 static void apply_dcc_acc(int tensor_id) {
   tensor_info_t *t = &tensors[tensor_id];
   t->acc_reset = t->acc_wb = -1;
@@ -1766,6 +1885,7 @@ static void apply_dcc_return_from(int tensor_id) {
 
 static void apply_compiler_layout(int tensor_id) {
   apply_dcc_tile_mac(tensor_id);
+  apply_mac_first(tensor_id);
   apply_dcc_acc(tensor_id);
   apply_dcc_return_from(tensor_id);
   check_layout_rec_words();
