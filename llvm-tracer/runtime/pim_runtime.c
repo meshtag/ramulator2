@@ -162,7 +162,6 @@ typedef struct {
   size_t total_bytes;
   int elem_size;
   // The maximum number of dimensions is 4 for now.
-  int dims[4];
   int num_elements;
   pim_role_t role;
 
@@ -270,6 +269,10 @@ static int next_free_row[MAX_BANKS];
 /* Statistics */
 static uint64_t stat_bank_reads = 0;
 static uint64_t stat_bank_writes = 0;
+/* Operand deliveries NOT charged because the compiler said the value is replicated over
+ * only some of the banks. 0 whenever every split is single-axis, which is every mapping
+ * our own picker emits. */
+static uint64_t stat_operand_repl_skips = 0;
 static uint64_t stat_reads = 0;
 static uint64_t stat_writes = 0;
 static uint64_t stat_ignored = 0;
@@ -405,48 +408,6 @@ static uint64_t stat_acc_spill_emitted = 0;
 static int g_lockstep_enabled = 1;
 static uint64_t stat_lockstep_skips = 0;
 
-/* Per-program-id store dedup for ACCUMULATOR tensors.
- *
- * Modeling assumption:
- *   A Triton program-id is one logical unit of work (one output tile). In the
- *   common kernels we model here (matvec/matmul/conv/elemwise), the tile's
- *   partial sums live in registers during COMPUTE and are materialized to the
- *   ACCUMULATOR tensor once at the end of that program-id. Under that
- *   write-once-per-output-tuple model, multiple IR-level stores that resolve
- *   to the same physical (global_bank, linear_row, col) within one program-id
- *   are redundant from the DRAM-trace point of view and should count as one
- *   BW emission.
- *
- * Why duplicates happen even when the kernel is logically "write once":
- *   - Scalarization/vectorization can expose multiple IR stores that still
- *     target one physical column.
- *   - Adjacent vector lanes may collapse to the same physical tuple when
- *     values_per_col > 1.
- *   - A later store instruction in the same program-id may revisit a tuple a
- *     previous store instruction already materialized.
- *
- * What this does:
- *   The first store to a tuple in a program-id emits BW; later stores to that
- *   same tuple in the same program-id are dropped.
- *
- * When this is safe:
- *   For the current benchmark kernels, the kernels compute one output tile per
- *   program-id, keep the accumulator live, then drain it. They do not
- *   intentionally perform two semantically distinct writes to the same output
- *   tuple within one program-id.
- *
- * When this would be wrong:
- *   If a future kernel intentionally writes the same physical output location
- *   twice within one program-id and both writes should incur DRAM cost
- *   separately, this dedup would undercount. Examples include explicit
- *   spill/reload/drain patterns, multi-phase in-place updates, atomics, or any
- *   kernel whose memory semantics are not "final output materialization".
- *
- * Reset cadence:
- *   Reset on any program-id axis change (same cadence as g_dedup, the
- *   per-program-id load state).
- */
-
 /* The dispatch this runtime is currently seeing, taken from __pim_program_epoch.
  *
  * It is part of the lockstep KEY rather than a signal to reset the table. Those are
@@ -470,58 +431,37 @@ static int g_dispatch_shift = 15;
 #define PIM_TILE_BITS 10
 static int g_warned_dispatch_overflow = 0;
 
+/* OPTIPIM'S codegen_new, NATIVELY (PIM_OPT_NATIVE=1, default off).
+ *
+ * Their HBM-PIM codegen (OptiPIM simulator fimdram.cpp:219-322 with single_bank_opt)
+ * charges every temporal step of a mapping for the leader bank alone:
+ *   W   E per bank to the first L banks, only when the step's input is new to the leader
+ *   BR  E at the leader, a fresh row per step, columns 0..E-1
+ *   R   E at the leader's base address
+ * E = ceil(C/n): C is the contraction's iteration points per lane per step, charged by
+ * position rather than by any tensor's footprint, n values per DQ word. L = min(active
+ * banks, banks per pseudochannel). Here a step is one of OUR dispatches and novelty is the
+ * leader lane's own input loads, so the step count and the novel steps come from the
+ * kernel that ran. C and the roles are the compiler's (__pim_opt_*). Nothing else is
+ * emitted while this is on. */
+enum { OPT_NONE = 0, OPT_INPUT = 1, OPT_WEIGHT = 2, OPT_OUTPUT = 3 };
+/* fp: the leader lane's distinct elements this step, indexed by role (input and weight
+ * loaded, output stored), so the harness can hold the per-axis tile to their mapping. */
+typedef struct { uint64_t epoch; int novel; int fp[4]; } opt_step_t;
+static int g_opt_native = 0;
+static int g_opt_role[MAX_TENSORS];
+static uint8_t *g_opt_seen[MAX_TENSORS];   /* input elements the leader already holds */
+static uint32_t *g_opt_stamp[MAX_TENSORS]; /* step that last touched each element */
+static int stat_opt_fp_min[4], stat_opt_fp_max[4];
+static uint8_t g_opt_active[MAX_BANKS];
+static opt_step_t *g_opt_steps = NULL;
+static size_t g_opt_n = 0, g_opt_cap = 0;
+static uint64_t stat_opt_novel = 0, stat_opt_cmds = 0;
+static int stat_opt_lanes = 0;
+
 /* ================================================================
  *  Helpers
  * ================================================================ */
-
-/* ============================================================================
- * OPTIPIM ADDRESSING: MEASURED, DOCUMENTED, AND NOT ADOPTED (reverted 2026-09-18).
- * Adopted on an explicit decision (2026-09-18) so the cross-stack comparison runs on
- * OptiPIM's own peer-reviewed model end to end. Documented here rather than buried.
- *
- * WHAT THEY DO. Their reachable codegen (alloc_method "new" -> codegen_new,
- * fimdram.cpp:23-77) computes a real row and column for every access --
- *     int row_addr = row.first % m_rows_per_bank;
- *     source_addr[row] = row_addr;  source_addr[column] = col.first;
- * -- then uses them for the WEIGHT tensor only. For the output it pushes `base_addr`
- * (:44) and for the input `bank_base_addr[...]` (:69), discarding the row and column
- * computed three lines above in the same scope.
- *
- * WHY WE CALL IT A DEFECT. Their own MILP emits per-tensor address coefficients in the
- * descriptor it hands the simulator (Coeff_P2,P0,P1: 256,1,32 and Coeff_R2,R0,R1:
- * 16,1,16 on matmul_256x512x64), so the MODEL knows where the data lives; the codegen
- * does not apply it for two of three tensors. Measured consequence: all 32,768 of their
- * output reads land on ONE (bank,row,col) tuple, 0.003% of a 1 MB output tensor, and
- * their input writes on ~32, 1.6% of the input. One address means the row buffer is
- * always already open, so those streams pay no activations. On our side, with faithful
- * addressing, row activations were 77% of our cycles (9,216 x 24 = 221,184 of 286,597).
- *
- * WHAT ADOPTING IT COSTS. Our trace no longer states where our data is. Correctness is
- * unaffected -- _verify_correctness compares computed values, not addresses -- but the
- * emitted stream stops describing the memory behaviour of the computation, which is the
- * property that makes every other number in this repo checkable. EVERY figure produced
- * in this tree must carry that disclosure.
- *
- * SCOPE. This tree only (PIM_COST_MODEL=optipim-parity). The default OptiPIM path and
- * the DCC tree keep faithful addressing and are untouched.
- * ============================================================================ */
-/* OPERAND RESIDENCY, OPTIPIM COST MODEL, THIS TREE ONLY.
- *
- * Their codegen gates the operand write on first_time_in_col (fimdram.cpp:58): an operand
- * column is written into each receiving bank ONCE and reused across every temporal step.
- * Verified on matmul_1024x512x32, where their writes are banks x columns exactly.
- *
- * So: delivery is PER RECEIVING BANK (no collapse -- that would be a second amortisation
- * they do not take, measured 32x too generous) and residency is UNBOUNDED across programs.
- *
- * NEITHER SIDE MODELS THE REGISTER FILE HERE, deliberately. Their MILP has no
- * register-file term (ten arch fields, all DRAM geometry), and holding an operand this
- * long needs 8,192 fp16 per PE against Aquabolt-XL's 128-value GRF_A -- 64x over. We adopt
- * their model so the comparison is on their terms rather than ours. REQUIRED DISCLOSURE on
- * every number from this tree; it is optimistic for BOTH stacks symmetrically. The default
- * path and the DCC tree keep the per-dispatch model and are untouched. */
-static addr_dedup_state_t *g_op_resident = NULL;
-static uint64_t stat_op_resident_hits = 0;
 
 static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
                        int sa, int row, int col) {
@@ -761,7 +701,7 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   }
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
    * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x. */
-  int key_lane = (t->bank_replicated == 1) ? 0 : lane;
+  int key_lane = (t->bank_replicated >= 1) ? 0 : lane;
   int inserted = 0;
   int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
                                      t->lane_ord[key_lane], &inserted);
@@ -855,42 +795,40 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * own single_bank_opt floor, and OptiPIM has no all-bank command to match it
          * (its broadcast shortcut is commented out). The BCAST_W path added
          * 2026-09-04 was that forbidden option and is reverted here (2026-09-05). */
+        /* HOW MANY BANKS ACTUALLY RECEIVE IT. bank_replicated is the compiler's count:
+         * 1 means every bank (a scalar splat, or an artifact built before the count
+         * existed), >1 means exactly that many. A value occupying one lane axis of a
+         * multi-axis split is replicated only along the axes it misses, so charging one
+         * write per replay lane billed OptiPIM's own 2-on-M-by-16-on-N mapping 16x over.
+         * Identical to the old behaviour whenever the split has a single axis. */
+        int all_b = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+        int recv = (t->bank_replicated > 1 && t->bank_replicated < all_b)
+                       ? t->bank_replicated : all_b;
+        int stride = (recv > 0) ? (all_b / recv) : 1;
+        if (stride > 1 && (__pim_get_bank_id() % stride) != 0) {
+          stat_operand_repl_skips++;
+          break;
+        }
         int dch, dpch, dbg, dbank;
         decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
-        /* Charged once per (bank, row, col) for the whole kernel: their first_time_in_col. */
-        if (!g_op_resident) g_op_resident = addr_dedup_create(65536);
-        if (!addr_dedup_check_and_mark(
-                g_op_resident,
-                /* per-BANK namespace: fields packed tight, widest last, 16 bits total */
-                (((uint64_t)(t - tensors) & 0xFULL)
-                 | (((uint64_t)dch & 0x3ULL) << 4)
-                 | (((uint64_t)dpch & 0x3ULL) << 6)
-                 | (((uint64_t)dbg & 0x7ULL) << 8)
-                 | (((uint64_t)dbank & 0xFULL) << 11)),
-                (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row,
-                (uint64_t)loc->col)) { stat_op_resident_hits++; break; }
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
         break;
       }
       case PIM_ROLE_ACCUMULATOR:
-        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
-        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa, loc->row, loc->col);
+        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                   loc->row, loc->col);
         stat_reads++;
         t->emitted_r++;
         break;
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
-        /* OPTIPIM CONVENTION, this tree only. They charge no accumulator write-back:
-         * their reachable codegen (fimdram.cpp:43-44, alloc_method "new") emits a plain
-         * `read` of partial sums and no bank-write anywhere. Charging BW against a
-         * baseline that emits none is bookkeeping, not compiler quality. */
-        /* OPTIPIM ADDRESSING, adopted deliberately; see the banner above emit_trace. */
-        emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa, loc->row, loc->col);
-        stat_reads++;
-        t->emitted_r++;
+        emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                   loc->row, loc->col);
+        stat_bank_writes++;
+        t->emitted_bw++;
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
@@ -915,6 +853,130 @@ static void emit_access_by_role_phase(tensor_info_t *t,
 /* ================================================================
  *  Public API
  * ================================================================ */
+
+static void opt_reset(void) {
+  for (int i = 0; i < MAX_TENSORS; i++) {
+    free(g_opt_seen[i]);
+    g_opt_seen[i] = NULL;
+    free(g_opt_stamp[i]);
+    g_opt_stamp[i] = NULL;
+    g_opt_role[i] = OPT_NONE;
+  }
+  memset(g_opt_active, 0, sizeof g_opt_active);
+  free(g_opt_steps);
+  g_opt_steps = NULL;
+  g_opt_n = g_opt_cap = 0;
+  stat_opt_novel = stat_opt_cmds = 0;
+  stat_opt_lanes = 0;
+  memset(stat_opt_fp_min, 0, sizeof stat_opt_fp_min);
+  memset(stat_opt_fp_max, 0, sizeof stat_opt_fp_max);
+}
+
+/* One instrumented access under PIM_OPT_NATIVE: open a step on a new dispatch, and mark
+ * it novel when the leader lane loads an input element it has not held before. Their
+ * memo is keyed per PE slot (fimdram.cpp:301-306); ours is per element, which agrees
+ * whenever a slot sees one element per step. A bank is in their mapping when it computes
+ * outputs, so a lane counts once it stores: a padded lane still loads a replicated input
+ * that has no axis to mask it by. */
+static void opt_note_range(tensor_info_t *t, uint64_t base, uint64_t size, int is_write) {
+  int lane = __pim_get_bank_id();
+  if (is_write && lane >= 0 && lane < MAX_BANKS)
+    g_opt_active[lane] = 1;
+  if (g_opt_n == 0 || g_opt_steps[g_opt_n - 1].epoch != __pim_program_epoch) {
+    if (g_opt_n == g_opt_cap) {
+      g_opt_cap = g_opt_cap ? 2 * g_opt_cap : 4096;
+      g_opt_steps = (opt_step_t *)realloc(g_opt_steps, g_opt_cap * sizeof *g_opt_steps);
+      if (!g_opt_steps) { fprintf(stderr, "[pim-runtime] ERROR: step alloc\n"); exit(1); }
+    }
+    g_opt_steps[g_opt_n++] = (opt_step_t){__pim_program_epoch, 0, {0, 0, 0, 0}};
+  }
+  int tid = (int)(t - tensors);
+  int role = g_opt_role[tid];
+  /* the leader's input and weight loads and its output stores */
+  if (lane != 0 || role == OPT_NONE || (role == OPT_OUTPUT) != (is_write != 0))
+    return;
+  if (!g_opt_stamp[tid]) {
+    g_opt_stamp[tid] = (uint32_t *)calloc((size_t)t->num_elements, sizeof(uint32_t));
+    if (!g_opt_stamp[tid]) { fprintf(stderr, "[pim-runtime] ERROR: stamp alloc\n"); exit(1); }
+  }
+  if (role == OPT_INPUT && !g_opt_seen[tid]) {
+    g_opt_seen[tid] = (uint8_t *)calloc((size_t)t->num_elements, 1);
+    if (!g_opt_seen[tid]) { fprintf(stderr, "[pim-runtime] ERROR: memo alloc\n"); exit(1); }
+  }
+  opt_step_t *st = &g_opt_steps[g_opt_n - 1];
+  uint32_t step = (uint32_t)g_opt_n;
+  int es = t->elem_size > 0 ? t->elem_size : 1;
+  uint64_t n = size / (uint64_t)es;
+  if (n == 0) n = 1;
+  for (uint64_t i = 0; i < n; i++) {
+    int64_t idx = (int64_t)((base + i * (uint64_t)es - (uint64_t)t->base_addr) / (uint64_t)es);
+    if (idx < 0 || idx >= t->num_elements)
+      continue;
+    if (g_opt_stamp[tid][idx] != step) {
+      g_opt_stamp[tid][idx] = step;
+      st->fp[role]++;
+    }
+    if (role == OPT_INPUT && !g_opt_seen[tid][idx]) {
+      g_opt_seen[tid][idx] = 1;
+      st->novel = 1;
+    }
+  }
+}
+
+/* Their per-step stream, in their order: the W block, the BR block, the R block. */
+static void opt_emit(void) {
+  int S = 0;
+  for (int b = 0; b < MAX_BANKS; b++)
+    S += g_opt_active[b];
+  int per_pch = cfg_num_bg * cfg_num_banks;
+  int L = S < per_pch ? S : per_pch;
+  int n = cfg_dq_bits / cfg_data_width_bits;
+  if (n < 1) n = 1;
+  int C = (int)__pim_opt_cells;
+  /* Their flush drops the slot that triggers it, which with one bank is the last. */
+  int kept = S > 1 ? C : C - 1;
+  int E = kept > 0 ? (kept + n - 1) / n : 0;
+  stat_opt_lanes = S;
+  stat_opt_cmds = (uint64_t)E;
+  for (int r = 1; r < 4; r++) {
+    stat_opt_fp_min[r] = g_opt_n ? g_opt_steps[0].fp[r] : 0;
+    stat_opt_fp_max[r] = stat_opt_fp_min[r];
+    for (size_t i = 1; i < g_opt_n; i++) {
+      int v = g_opt_steps[i].fp[r];
+      if (v < stat_opt_fp_min[r]) stat_opt_fp_min[r] = v;
+      if (v > stat_opt_fp_max[r]) stat_opt_fp_max[r] = v;
+    }
+  }
+  for (size_t i = 0; i < g_opt_n; i++) {
+    int row = (int)(i % (size_t)cfg_num_rows);
+    if (g_opt_steps[i].novel) {
+      stat_opt_novel++;
+      for (int b = 0; b < L; b++) {
+        int ch, pch, bg, ba;
+        decompose_global_bank(b, &ch, &pch, &bg, &ba);
+        for (int e = 0; e < E; e++)
+          emit_trace("W", ch, pch, bg, ba, 0, 0, 0);
+        stat_writes += (uint64_t)E;
+      }
+    }
+    for (int w = 0; w < E; w++)
+      emit_trace("BR", 0, 0, 0, 0, 0, row, w);
+    for (int w = 0; w < E; w++)
+      emit_trace("R", 0, 0, 0, 0, 0, 0, 0);
+    stat_bank_reads += (uint64_t)E;
+    stat_reads += (uint64_t)E;
+  }
+}
+
+uint64_t pim_opt_steps(void) { return (uint64_t)g_opt_n; }
+uint64_t pim_opt_novel(void) { return stat_opt_novel; }
+uint64_t pim_opt_lanes(void) { return (uint64_t)stat_opt_lanes; }
+uint64_t pim_opt_cmds(void) { return stat_opt_cmds; }
+uint64_t pim_opt_cells(void) { return (uint64_t)__pim_opt_cells; }
+uint64_t pim_opt_decided(void) { return (uint64_t)__pim_opt_decided; }
+/* The leader's distinct elements per step, fewest and most over the run, by role. */
+uint64_t pim_opt_fp_min(int role) { return role > 0 && role < 4 ? (uint64_t)stat_opt_fp_min[role] : 0; }
+uint64_t pim_opt_fp_max(int role) { return role > 0 && role < 4 ? (uint64_t)stat_opt_fp_max[role] : 0; }
 
 void pim_init(const char *trace_file) {
   /* If already initialized, close the existing trace and reinitialize. */
@@ -956,8 +1018,22 @@ void pim_init(const char *trace_file) {
     cfg_data_width_bits = atoi(v);
   if (cfg_data_width_bits < 1)
     cfg_data_width_bits = 1;
+  opt_reset();
+  g_opt_native = 0;
+  if ((v = getenv("PIM_OPT_NATIVE")) && atoi(v)) {
+    g_opt_native = atoi(v);
+    if (g_opt_native != 1) {
+      fprintf(stderr, "[pim-runtime] ERROR: PIM_OPT_NATIVE=%d, only 1 is defined\n",
+              g_opt_native);
+      exit(1);
+    }
+    if (__pim_opt_decided != 1 || __pim_opt_cells <= 0) {
+      fprintf(stderr, "[pim-runtime] ERROR: PIM_OPT_NATIVE needs the compiler's OptiPIM "
+                      "convention (im_optipim_conv); this kernel states none\n");
+      exit(1);
+    }
+  }
 
-  /* Reduction-col-axis lever (default OFF). */
 
   /* Bankgroup-interleave lever (default OFF). The compiler decides; the env var is an
    * ablation override. It used to win silently, which is the one compiler/host conflict
@@ -1057,8 +1133,6 @@ void pim_init(const char *trace_file) {
   }
 
   num_tensors = 0;
-  if (g_op_resident) { addr_dedup_destroy(g_op_resident); g_op_resident = NULL; }
-  stat_op_resident_hits = 0;
   cur_phase = PIM_PHASE_IDLE;
   memset(next_free_row, 0, sizeof(next_free_row));
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
@@ -1220,23 +1294,6 @@ void pim_init(const char *trace_file) {
 
 static int stat_layout_from_compiler = 0;
 
-/* Kernel scalar arguments, indexed the way the compiler numbers tt.func
- * arguments (pointers first, then scalars, no constexprs). Pointer slots go
- * unused. This is the host reporting its own launch, not deciding anything. */
-#define PIM_MAX_KERNEL_SCALARS 64
-static int32_t g_kernel_scalars[PIM_MAX_KERNEL_SCALARS];
-static int g_num_kernel_scalars = 0;
-
-void pim_set_kernel_scalars(const int32_t *vals, int n) {
-  if (!vals || n < 0)
-    return;
-  if (n > PIM_MAX_KERNEL_SCALARS)
-    n = PIM_MAX_KERNEL_SCALARS;
-  for (int i = 0; i < n; i++)
-    g_kernel_scalars[i] = vals[i];
-  g_num_kernel_scalars = n;
-}
-
 /* Honor the compiler's descriptor for one tensor. No-op if the kernel has none.
  */
 /* Refuse a descriptor whose record width is not the one we stride by. The compiler's
@@ -1320,7 +1377,7 @@ static void apply_compiler_layout(int tensor_id) {
       int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
       int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
       int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
-      int per_lane = _t->bank_replicated == 1 ? _t->num_elements
+      int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
                      : share2 > 65536 ? share2
                      : (_t->num_elements < 65536 ? _t->num_elements : 65536);
       int rows = (per_lane + vpr - 1) / vpr;
@@ -1377,6 +1434,10 @@ static void apply_compiler_layout(int tensor_id) {
 static int pim_finish_register(void) {
   int tid = num_tensors++;
   apply_compiler_layout(tid);
+  if (__pim_opt_decided == 1)
+    for (int i = 0; i < (int)__pim_opt_role_count && i < PIM_MAX_OPT_ROLES; i++)
+      if (__pim_opt_role[2 * i] == tid)
+        g_opt_role[tid] = (int)__pim_opt_role[2 * i + 1];
   return tid;
 }
 
@@ -1400,7 +1461,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
 
   int total = 1;
   for (int i = 0; i < ndims && i < 4; i++) {
-    t->dims[i] = dims[i];
     total *= dims[i];
   }
   t->num_elements = total;
@@ -1587,17 +1647,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
 /* (duplicate_bcast_tensor_per_bg removed 2026-06-22 with the row-duplicate
  * blank-dedup machinery.) */
 
-void pim_set_tensor_broadcast_scalar(int tensor_id, int on) {
-  /* REMOVED 2026-06-22: broadcast-scalar / row-duplicate was a blank reuse
-   * dedup (it modeled OptiPIM-style row_duplicate replication at trace level).
-   * Operand reuse is now realized in the IR (capacity-capped tiling) and the
-   * residual is charged by the faithful per-bank LRU + lockstep. This setter is
-   * a permanent no-op kept only for ABI compatibility with the harness bridge
-   * (pass_ablation.py wraps the call in try/except). */
-  (void)tensor_id;
-  (void)on;
-}
-
 void pim_set_phase(pim_phase_t phase) {
   const char *names[] = {"IDLE", "COMPUTE", "HOST"};
   if (phase <= PIM_PHASE_HOST) {
@@ -1613,6 +1662,25 @@ void pim_set_phase(pim_phase_t phase) {
       emit_acc_spill();
   }
   cur_phase = phase;
+}
+
+/* Arm the modelled spill. RESTORED 2026-09-22: the definition was lost in 36a995c,
+ * which deleted three neighbouring levers. emit_acc_spill() and its globals survived,
+ * so for two weeks IM_CHARGE_ACC_SPILL=1 charged nothing and an over-capacity tile was
+ * free again, which is the exact thing this mechanism exists to prevent. The host has
+ * called it the whole time and swallowed the AttributeError. */
+void pim_set_acc_spill(int tensor_id, int overflow_per_pe, int k_steps) {
+  if (tensor_id < 0 || tensor_id >= num_tensors || overflow_per_pe <= 0 ||
+      k_steps <= 0) {
+    g_acc_spill_tensor = -1;
+    return;
+  }
+  g_acc_spill_tensor = tensor_id;
+  g_acc_spill_overflow = overflow_per_pe;
+  g_acc_spill_ksteps = k_steps;
+  fprintf(stderr,
+          "[pim-runtime] accumulator spill armed: tensor %d, %d values/PE x %d K steps\n",
+          tensor_id, overflow_per_pe, k_steps);
 }
 
 /* Emit the modelled accumulator spill. Called once as COMPUTE ends, so it lands in
@@ -1650,10 +1718,16 @@ void pim_finalize(void) {
 
   finalized = 1;
 
+  if (trace_fp && g_opt_native)
+    opt_emit();
   if (trace_fp) {
     fclose(trace_fp);
     trace_fp = NULL;
   }
+  if (g_opt_native)
+    fprintf(stderr, "[pim-runtime] OptiPIM codegen_new: %zu steps, %" PRIu64 " novel, %d "
+                    "active banks, %" PRIu64 " commands per tensor per step (C=%d)\n",
+            g_opt_n, stat_opt_novel, stat_opt_lanes, stat_opt_cmds, (int)__pim_opt_cells);
 
   fprintf(stderr, "\n[pim-runtime] === PIM Trace Statistics ===\n");
   fprintf(stderr, "[pim-runtime]   Bank-reads  (BR): %" PRIu64 "\n",
@@ -1671,6 +1745,11 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 " (lockstep_collapse=%d)\n",
           stat_lockstep_skips, g_lockstep_enabled);
+  if (stat_operand_repl_skips)
+    fprintf(stderr,
+            "[pim-runtime]   Operand replication skips       : %" PRIu64
+            " (compiler said fewer banks receive it)\n",
+            stat_operand_repl_skips);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
@@ -1699,7 +1778,7 @@ void pim_finalize(void) {
   if (stat_coalesce_overflow)
     fprintf(stderr,
             "[pim-runtime]   WARN coalesce buffer overflow    : %" PRIu64
-            " (raise PIM_COALESCE_MAX)\n",
+            " (PIM_COALESCE_MAX is a compile-time #define, not an env var)\n",
             stat_coalesce_overflow);
 
   /* Per-tensor breakdown — Stage-0 diagnostics. Useful for figuring out
@@ -1760,7 +1839,8 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
   /* Operand register-residency reuse skip retired 2026-09-04: reuse is now the
    * kernel tile, and a broadcast operand collapses to one WB below. ACCUMULATOR
    * (psum) residency is realized in codegen (loop-carried SSA), never a runtime
-   * skip. Stores are handled by the per-program-id write-once model below. */
+   * skip. Stores go through the same lockstep collapse as loads; the separate
+   * per-program-id store write-once model was removed 2026-09-09. */
 
   /* Lockstep dedup: collapse bank-replicated events at the same
    * (tensor_id, sa, row, col) within a program-id. Models 1 SIMD
@@ -1777,29 +1857,32 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
    * STREAMED tensors (each PE reads its own bank-local slice via BR)
    * still collapse — those are genuine SIMD-bank-parallel bank-reads,
    * not bus broadcasts. */
-  /* EVERY operand load bypasses the collapse and pays its per-bank write, broadcasts
-   * included. Real HBM-PIM does have an all-bank GRF broadcast (Lee et al. ISCA'21
-   * III-A/III-B), so this is a SYMMETRY choice, not a hardware limit: OptiPIM prices
-   * input loading per PU inside its MILP objective, and taking the broadcast without
-   * re-solving their optimizer would charge us for a dispatch the baseline never
-   * gets. Both stacks now charge one write per receiving bank. */
-  /* OPTIPIM CONVENTION, this tree only: operand loads DO enter the collapse. Their
-   * config sets single_bank_opt, and fimdram.cpp:277-282 breaks out of the spatial loop
-   * after the leader bank, so their trace carries ONE bank's commands. The default tree
-   * exempts operand loads and charges one per receiving bank -- a 16x asymmetry on
-   * matmul 256x512x64 (their A writes 32,768 = 2x the tensor; ours were 524,288 = 32x).
-   * Stays DISPATCH-SCOPED via cur_dispatch in the key below: bank replicas fold, a later
-   * program instance re-delivering does not. Collapsing unscoped grants cross-pid operand
-   * residency the register file cannot provide (measured 18.8x FASTER than OptiPIM). */
-  /* Operand loads do NOT collapse across banks in this tree. Their model delivers the
-   * operand PER RECEIVING BANK and amortises it across temporal steps (first_time_in_col,
-   * fimdram.cpp:58) -- one amortisation, not two. Collapsing as well gave both and came
-   * out 32x too generous (geomean 6.33x, up to 14x). Arithmetic on matmul_256x512x64:
-   * A is 16,384 elements = 1,024 columns; 32 banks x 1,024 columns = 32,768, which is
-   * their measured write count exactly. */
-  int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
+  /* OPERAND LOADS NOW COLLAPSE. 2026-09-18.
+   *
+   * They used to bypass, paying one write per RECEIVING BANK (32x here), to stay
+   * "symmetric" with OptiPIM on the belief that "both stacks charge one write per
+   * receiving bank". THAT PREMISE IS FALSE, measured on 40 shapes. OptiPIM's shared
+   * config sets single_bank_opt, and their fimdram.cpp:277-282 breaks out of the spatial
+   * loop after the leader bank, so their trace carries ONE bank's commands and the other
+   * 31 are assumed to run in lockstep for free:
+   *   matmul_1024x512x32  their writes 16,384 = banks x columns EXACTLY
+   *   matmul_256x512x64   A is 16,384 elements, their writes 32,768 = ~2 per element
+   *   38 conv shapes      writes per input element 0.06x-2.3x, clustered near 0.5x
+   * Nothing near the 32x that per-receiving-bank charging produces.
+   *
+   * The hardware agrees with the collapse, not the exemption: real HBM-PIM has an
+   * all-bank GRF broadcast (Lee et al. ISCA'21 III-A/III-B), which the old comment
+   * conceded while giving it up anyway.
+   *
+   * Scope is unchanged and load-bearing: cur_dispatch rides in the key below, so bank
+   * replicas of ONE instruction fold while a later program instance re-delivering the
+   * same operand does not. Collapsing unscoped grants cross-pid operand residency the
+   * register file cannot provide (measured 18.8x FASTER than OptiPIM, an artifact). */
+  /* No operand exemption any more: the evidence above retired it, so every role
+     takes the collapse. The `&& !is_operand_load` term that used to sit here was a
+     hardcoded 0 and could not fire. */
   if (g_lockstep_enabled && g_lockstep_collapse &&
-      cur_phase == PIM_PHASE_COMPUTE && !is_operand_load) {
+      cur_phase == PIM_PHASE_COMPUTE) {
     /* Scope the collapse to ONE pseudochannel. An all-bank PIM command reaches the
      * banks of a single (ch,pch); replicas in a different pch or channel ride a
      * separate command bus and need their own event. Omitting them collapsed
@@ -1811,27 +1894,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * dispatch still collapse. Replaces resetting the table per program instance. */
     uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
     uint64_t key_col = (uint64_t)loc.col;
-    /* OPERAND RESIDENCY IS CROSS-PROGRAM IN THIS TREE, matching OptiPIM's cost model.
-     *
-     * Their codegen gates the operand write on first_time_in_col (fimdram.cpp:58), so an
-     * operand column is delivered ONCE and reused across every temporal step. Verified on
-     * matmul_1024x512x32: their writes are 16,384 = banks x columns exactly, not per
-     * temporal step and not per use. We charge per dispatch everywhere else, which is the
-     * per-pid model the default path keeps, and against a baseline that charges once that
-     * asymmetry is ours to eat.
-     *
-     * NEITHER SIDE MODELS THE REGISTER FILE HERE. Their MILP has no register-file term at
-     * all (ten arch fields, all DRAM geometry), and holding an operand across temporal
-     * steps needs 8,192 fp16 per PE against Aquabolt-XL's 128-value GRF_A -- 64x over. We
-     * adopt it anyway so the comparison is apples-to-apples on their cost model rather
-     * than ours. THIS IS A REQUIRED DISCLOSURE on any number from this tree: it is
-     * optimistic for BOTH stacks symmetrically, not for one.
-     *
-     * Scoped to operand loads. Streamed reads keep the dispatch in their key, because
-     * their weight load is ungated too (:37, the first_time_in_use is commented out), so
-     * re-streaming is already symmetric. */
-    if (!(t->role == PIM_ROLE_OPERAND && !is_write))
-      key_row |= cur_dispatch << g_dispatch_shift;
+    key_row |= cur_dispatch << g_dispatch_shift;
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key, key_row,
                                    key_col)) {
       stat_lockstep_skips++;
@@ -1877,6 +1940,11 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   /* Track program-id boundaries so the dedup table is reset per tile. */
   if (cur_phase == PIM_PHASE_COMPUTE) {
     advance_program_epoch_if_needed();
+  }
+  if (g_opt_native) {
+    if (cur_phase == PIM_PHASE_COMPUTE)
+      opt_note_range(t, base_addr, size, is_write);
+    return;
   }
 
   int elem_size = t->elem_size > 0 ? t->elem_size : 1;

@@ -99,6 +99,17 @@ __attribute__((weak)) extern const int32_t __pim_dq_bits;
  * configured bank count the charge shifts by their ratio. 0 = the kernel did not say. */
 __attribute__((weak)) extern const int32_t __pim_lanes;
 
+/* OptiPIM's codegen_new conventions (im_optipim_conv), stated for the kernel's one
+ * contraction: [arg, role] pairs, role 1 input (written over the bus), 2 weight
+ * (bank-read), 3 output (read back), as their tensor index fixes them (Inputs1,
+ * Inputs2/Filters, Outputs). cells is the contraction's iteration points per lane per
+ * step, which their codegen charges positionally. Read only when decided is 1. */
+#define PIM_MAX_OPT_ROLES 8
+__attribute__((weak)) extern const int32_t __pim_opt_role[2 * PIM_MAX_OPT_ROLES];
+__attribute__((weak)) extern const int32_t __pim_opt_role_count;
+__attribute__((weak)) extern const int32_t __pim_opt_cells;
+__attribute__((weak)) extern const int32_t __pim_opt_decided;
+
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
@@ -110,6 +121,10 @@ const int32_t __pim_persistent = 0;
 const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;
 const int32_t __pim_placement_align = 0;
+const int32_t __pim_opt_role[2 * PIM_MAX_OPT_ROLES] = {0};
+const int32_t __pim_opt_role_count = 0;
+const int32_t __pim_opt_cells = 0;
+const int32_t __pim_opt_decided = 0;
 #endif
 
 #endif /* PIM_LAYOUT_TABLE_H */
