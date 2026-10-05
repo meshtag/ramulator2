@@ -1107,11 +1107,13 @@ static void map_grf_b_check(void) {
     if (cur > most) most = cur;
   }
   free(v);
-  if (most > GRF_B_ENTRIES) {
-    g_grf_b_overflow = most - GRF_B_ENTRIES;
+  int in_place = __pim_map_strip_entries > GRF_B_ENTRIES;
+  int cap = in_place ? GRF_A_ENTRIES + GRF_B_ENTRIES : GRF_B_ENTRIES;
+  if (most > cap) {
+    g_grf_b_overflow = most - cap;
     fprintf(stderr, "[pim-runtime] ERROR: a map stores %d result columns per bank in one "
-                    "round, and GRF_B holds %d. Strip it in the kernel. Cycles from this run "
-                    "are NOT physical.\n", most, GRF_B_ENTRIES);
+                    "round, and %s holds %d. Strip it in the kernel. Cycles from this run "
+                    "are NOT physical.\n", most, in_place ? "GRF_A + GRF_B" : "GRF_B", cap);
   }
 }
 
