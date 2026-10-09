@@ -431,6 +431,40 @@ static int g_dispatch_shift = 15;
 #define PIM_TILE_BITS 10
 static int g_warned_dispatch_overflow = 0;
 
+/* Per-lane access ordinal within a dispatch. Lanes replay one instruction stream, so the
+ * k-th access of every lane is the same instruction. Without it the key cannot tell one
+ * instruction seen on 32 banks from 32 separate reads of one column, and the second case
+ * folds away: scalar loads then cost what a vector load costs and vectorization reads 1.00x.
+ * Advanced once per IR-level access, never per expanded element, so a 16-wide load keeps
+ * one ordinal while 16 scalar loads take 16. */
+static int g_ord_lane = -1;
+static uint64_t g_ord_disp = UINT64_MAX;
+static uint64_t g_access_ord = 0;
+
+static void access_ord_next(void) {
+  int lane = (int)__pim_get_bank_id();
+  if (lane != g_ord_lane || cur_dispatch != g_ord_disp) {
+    g_ord_lane = lane; g_ord_disp = cur_dispatch; g_access_ord = 0;
+  }
+  g_access_ord++;
+}
+
+/* The ordinal does not fit pack_keys' 16/32/16 layout beside row and col, so the five
+ * fields are hashed to 64 bits and split back across them; that split is bijective. */
+static inline uint64_t lk_mix(uint64_t x) {
+  x ^= x >> 33; x *= 0xFF51AFD7ED558CCDULL;
+  x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ULL;
+  return x ^ (x >> 33);
+}
+
+static uint64_t lockstep_key(uint64_t ns, uint64_t disp, uint64_t ord, uint64_t row,
+                             uint64_t col) {
+  uint64_t h = lk_mix(ns ^ 0x9E3779B97F4A7C15ULL);
+  h = lk_mix(h ^ disp);
+  h = lk_mix(h ^ ord);
+  return lk_mix(h ^ ((row << 16) | col));
+}
+
 /* ================================================================
  *  Helpers
  * ================================================================ */
@@ -1712,14 +1746,18 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
      * OUT of the key: collapsing those IS the all-bank SIMD model. */
     uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write);
-    /* The dispatch id rides in k2 above the linear row, so two dispatches touching
-     * the same physical tuple stay distinct while the 32 bank replays of ONE
-     * dispatch still collapse. Replaces resetting the table per program instance. */
+    /* Dispatch and lane ordinal ride in the key, so the 32 bank replays of ONE access
+     * collapse while two dispatches, or two accesses within a lane, stay distinct. */
     uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-    uint64_t key_col = (uint64_t)loc.col;
-    key_row |= cur_dispatch << g_dispatch_shift;
-    if (!addr_dedup_check_and_mark(g_lockstep_collapse, tensor_key, key_row,
-                                   key_col)) {
+    /* OPERANDS KEEP FOLDING WITHIN A DISPATCH. An operand is delivered into GRF and
+     * stays for the dispatch, so a second access to its column is a register hit, not a
+     * bus transaction; cur_dispatch already separates the re-delivery that IS physical.
+     * A streamed load is consumed, so each access is its own command and takes the
+     * ordinal. Without this split the ladder's operand writes rose 16x. */
+    uint64_t ord = (t->role == PIM_ROLE_OPERAND) ? 0 : g_access_ord;
+    uint64_t h = lockstep_key(tensor_key, cur_dispatch, ord, key_row,
+                              (uint64_t)loc.col);
+    if (!addr_dedup_check_and_mark(g_lockstep_collapse, h, h >> 16, h >> 48)) {
       stat_lockstep_skips++;
       t->dedup_skips++;
       return;
@@ -1760,9 +1798,11 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   tensor_info_t *t = &tensors[tidx];
   t->range_calls++;
 
-  /* Track program-id boundaries so the dedup table is reset per tile. */
+  /* Track program-id boundaries so the dedup table is reset per tile. The ordinal
+   * advance follows the epoch because it keys on cur_dispatch. */
   if (cur_phase == PIM_PHASE_COMPUTE) {
     advance_program_epoch_if_needed();
+    access_ord_next();
   }
 
   int elem_size = t->elem_size > 0 ? t->elem_size : 1;
