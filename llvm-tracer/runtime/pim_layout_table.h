@@ -109,6 +109,31 @@ __attribute__((weak)) extern const int32_t __pim_opt_role[2 * PIM_MAX_OPT_ROLES]
 __attribute__((weak)) extern const int32_t __pim_opt_role_count;
 __attribute__((weak)) extern const int32_t __pim_opt_cells;
 __attribute__((weak)) extern const int32_t __pim_opt_decided;
+/* Their lanes, stated by im-operand-residency-layout under im_optipim_conv. lane_rep is
+ * [arg, mask] pairs, bit d set when lanes differing only on store dim d see the same
+ * elements. lane_ext is the lane id as [store dim, lanes] pairs, fastest first. */
+#define PIM_MAX_OPT_LANE_AXES 8
+__attribute__((weak)) extern const int32_t __pim_opt_lane_rep[2 * PIM_MAX_OPT_ROLES];
+__attribute__((weak)) extern const int32_t __pim_opt_lane_rep_count;
+__attribute__((weak)) extern const int32_t __pim_opt_lane_ext[2 * PIM_MAX_OPT_LANE_AXES];
+__attribute__((weak)) extern const int32_t __pim_opt_lane_ext_count;
+/* Residency by place in the contraction (im_optipim_roles), [arg, residency] pairs: 1
+ * delivered to the PE, 2 resident in the bank, 3 drained by read-out. */
+__attribute__((weak)) extern const int32_t __pim_opt_residency[2 * PIM_MAX_OPT_ROLES];
+__attribute__((weak)) extern const int32_t __pim_opt_residency_count;
+/* im-optipim-mac (im_optipim_mac): MACs per contraction for each lane, count 0 when unstated.
+ * mac_geom is [values per MAC, row from t, row from j, column from t, column from j] for MAC
+ * j of step t, and step is t = [x, y, z, tile, constant] over the program ids and tile. */
+#define PIM_MAX_OPT_LANES 1024
+__attribute__((weak)) extern const int32_t __pim_opt_macs[PIM_MAX_OPT_LANES];
+__attribute__((weak)) extern const int32_t __pim_opt_macs_count;
+__attribute__((weak)) extern const int32_t __pim_opt_mac_geom[5];
+__attribute__((weak)) extern const int32_t __pim_opt_step[5];
+/* im_optipim_hold_input, their unbounded input memo reproduced (their bug): [arg, held program
+ * ids, bound x, y, z, tiles held]. The input is fresh only where each program id is below its
+ * bound (-1 none). count 0 when unstated. */
+__attribute__((weak)) extern const int32_t __pim_opt_hold[6];
+__attribute__((weak)) extern const int32_t __pim_opt_hold_count;
 
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
@@ -125,6 +150,18 @@ const int32_t __pim_opt_role[2 * PIM_MAX_OPT_ROLES] = {0};
 const int32_t __pim_opt_role_count = 0;
 const int32_t __pim_opt_cells = 0;
 const int32_t __pim_opt_decided = 0;
+const int32_t __pim_opt_lane_rep[2 * PIM_MAX_OPT_ROLES] = {0};
+const int32_t __pim_opt_lane_rep_count = 0;
+const int32_t __pim_opt_lane_ext[2 * PIM_MAX_OPT_LANE_AXES] = {0};
+const int32_t __pim_opt_lane_ext_count = 0;
+const int32_t __pim_opt_residency[2 * PIM_MAX_OPT_ROLES] = {0};
+const int32_t __pim_opt_residency_count = 0;
+const int32_t __pim_opt_macs[PIM_MAX_OPT_LANES] = {0};
+const int32_t __pim_opt_macs_count = 0;
+const int32_t __pim_opt_mac_geom[5] = {0};
+const int32_t __pim_opt_step[5] = {0};
+const int32_t __pim_opt_hold[6] = {0};
+const int32_t __pim_opt_hold_count = 0;
 #endif
 
 #endif /* PIM_LAYOUT_TABLE_H */
