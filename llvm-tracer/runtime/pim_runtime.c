@@ -140,6 +140,12 @@ static uint64_t g_interleaved_next_linear = 0;
  * grows from the bottom, and the two must never meet. */
 static int g_lane_row_top = -1;
 static uint64_t stat_lane_placed = 0;
+/* Banks per lane: 2 when the kernel has half as many lanes as the machine has banks,
+ * because an HBM-PIM PE serves an even/odd bank pair. Set in pim_init. */
+static int g_banks_per_lane = 1;
+/* Words one half of a pair takes before the other: Samsung's kernels run 8 columns on
+ * the even bank, then the same 8 on the odd one, one per GRF_A entry (PIMKernel.cpp). */
+#define PIM_PAIR_BLOCK_WORDS 8
 
 /* Compute log2(n) where n is a power of two. Returns -1 for n<=0. */
 static int ilog2_pow2(int n) {
@@ -215,24 +221,22 @@ typedef struct {
 static tensor_info_t tensors[MAX_TENSORS];
 static int num_tensors = 0;
 
-/* Namespace bits for the lockstep-collapse key.
- *
- * CRITICAL: im_addr_dedup's pack_keys() keeps only the LOW 16 BITS of k1 (k2 gets
- * 32, k3 gets 16). Anything above bit 15 here is silently dropped, so this must
- * stay inside 16 bits. tid < MAX_TENSORS(16) = 4b, ch < 32 = 5b, pch < 4 = 2b,
- * write = 1b, total 12b.
+/* Namespace bits for the lockstep-collapse key: tid 4b, ch 5b, pch 2b, write 1b,
+ * bank parity 1b. lockstep_key hashes all 64 bits.
  *
  * ch/pch are in the key because an all-bank PIM command reaches the banks of ONE
  * pseudochannel; replicas in another pch or channel ride a separate command bus.
  * Bank/bankgroup stay OUT: collapsing those IS the all-bank SIMD model.
  * The write bit separates stores from loads, without which an ACCUMULATOR load
  * (the read half of a read-modify-write drain) marks the key the store then
- * consults, making partial-sum write-back free. Both found 2026-09-05. */
+ * consults, making partial-sum write-back free. Both found 2026-09-05.
+ * Parity is 0 unless lanes own bank pairs: a PE reads one bank of its pair per
+ * command, and the pair's two halves share (row, col), so without it they fold. */
 static inline uint64_t lockstep_ns(const tensor_info_t *t, int ch, int pch,
-                                   int is_write) {
+                                   int is_write, int parity) {
   return ((uint64_t)(t - tensors) & 0xFULL) | (((uint64_t)ch & 0x1FULL) << 4) |
          (((uint64_t)pch & 0x3ULL) << 9) |
-         ((uint64_t)(is_write ? 1 : 0) << 11);
+         ((uint64_t)(is_write ? 1 : 0) << 11) | ((uint64_t)(parity & 1) << 12);
 }
 
 /* ================================================================
@@ -544,6 +548,12 @@ static void decompose_global_bank(int g, int *ch, int *pch, int *bg, int *bank) 
   *ch   = g;
 }
 
+/* Bank h of lane l's pair, or bank l itself when every bank has a PE. A pair stays
+ * inside one bank group because pim_init requires an even bank count per group. */
+static inline int lane_bank(int lane, int h) {
+  return lane * g_banks_per_lane + (g_banks_per_lane > 1 ? h : 0);
+}
+
 static void decode_flat_bank(int global_bank, int *ch, int *pch, int *bg,
                              int *bank) {
   int banks_per_pch = cfg_num_bg * cfg_num_banks;
@@ -688,7 +698,8 @@ typedef struct {
   int col;
 } pim_phys_loc_t;
 
-/* Banks are threads here: lane b is bank b's PE and may only touch bank b. The
+/* Lanes are threads here: lane l is the PE of bank l, or of banks 2l and 2l+1 when
+ * lanes own pairs, and may only touch its own banks. The
  * interleaved map changes bank every 512 elements while a lane's slab is 1024, so
  * lane 0's data sat in banks 0 and 1. Put the element in the executing lane's bank at
  * the next slot of that lane's slab (OptiPIM's alloc_col++ made explicit); the slot is
@@ -697,12 +708,13 @@ typedef struct {
  * with the bank bits dropped, which aliased 4-8 words onto one address. */
 static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   static int warned = 0;
-  int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+  int lanes = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
+              g_banks_per_lane;
   int lane = __pim_get_bank_id();
-  if (lane < 0 || lane >= all_banks || lane >= MAX_BANKS) {
+  if (lane < 0 || lane >= lanes || lane >= MAX_BANKS) {
     if (!warned++)
-      fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d banks; kept "
-                      "the interleaved home.\n", lane, all_banks);
+      fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d lanes; kept "
+                      "the interleaved home.\n", lane, lanes);
     return;
   }
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
@@ -721,7 +733,14 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
     t->lane_ord[key_lane]++;
   int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
   int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
-  int r = slot / vpr;
+  /* The halves of a pair take turns in blocks of words at matching (row, col). This is
+   * the runtime's convention, not a compiler statement, and the block size moves cycles. */
+  int w = slot / vpc;
+  int blk = g_banks_per_lane > 1 ? PIM_PAIR_BLOCK_WORDS : 1;
+  int h = (w / blk) % g_banks_per_lane;
+  int bw = (w / (blk * g_banks_per_lane)) * blk + w % blk;
+  int bslot = bw * vpc + slot % vpc;
+  int r = bslot / vpr;
   if (r >= t->lane_row_count) {
     if (!warned++)
       fprintf(stderr, "[pim-runtime] WARN tensor lane %d overflowed its %d-row slab; "
@@ -729,10 +748,10 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
     r = t->lane_row_count - 1;
   }
   int linear_row = t->lane_row_base + r;
-  decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
+  decompose_global_bank(lane_bank(lane, h), &loc->ch, &loc->pch, &loc->bg, &loc->bank);
   loc->sa = linear_row / cfg_num_rows;
   loc->row = linear_row % cfg_num_rows;
-  loc->col = (slot % vpr) / vpc;
+  loc->col = (bslot % vpr) / vpc;
   stat_lane_placed++;
 }
 
@@ -806,17 +825,21 @@ static void emit_access_by_role_phase(tensor_info_t *t,
          * existed), >1 means exactly that many. A value occupying one lane axis of a
          * multi-axis split is replicated only along the axes it misses, so charging one
          * write per replay lane billed OptiPIM's own 2-on-M-by-16-on-N mapping 16x over.
-         * Identical to the old behaviour whenever the split has a single axis. */
-        int all_b = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-        int recv = (t->bank_replicated > 1 && t->bank_replicated < all_b)
-                       ? t->bank_replicated : all_b;
-        int stride = (recv > 0) ? (all_b / recv) : 1;
+         * Identical to the old behaviour whenever the split has a single axis.
+         * The count is in lanes, which is half the banks when lanes own pairs. */
+        int nl = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
+                 g_banks_per_lane;
+        int recv = (t->bank_replicated > 1 && t->bank_replicated < nl)
+                       ? t->bank_replicated : nl;
+        int stride = (recv > 0) ? (nl / recv) : 1;
         if (stride > 1 && (__pim_get_bank_id() % stride) != 0) {
           stat_operand_repl_skips++;
           break;
         }
         int dch, dpch, dbg, dbank;
-        decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+        /* The pair half that holds the word, so W lands on the parity its key carries. */
+        decompose_global_bank(lane_bank(__pim_get_bank_id(), loc->bank & 1), &dch, &dpch,
+                              &dbg, &dbank);
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
@@ -1063,11 +1086,20 @@ void pim_init(const char *trace_file) {
    * for model. Set PIM_LOCKSTEP_COLLAPSE=0 to disable for ablation. */
   const char *lockstep_env = getenv("PIM_LOCKSTEP_COLLAPSE");
   g_lockstep_enabled = (lockstep_env && lockstep_env[0] == '0') ? 0 : 1;
-  if (__pim_lanes > 0 &&
-      (int)__pim_lanes != cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks)
-    fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, machine has %d "
-                    "banks; lane placement puts lane b in bank b and assumes they agree.\n",
-            (int)__pim_lanes, cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks);
+  {
+    /* Half as many lanes as banks is HBM-PIM's PE per bank pair (Lee et al. ISCA'21).
+     * This line must not say WARN: invariant 6 fails on any. */
+    int banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    g_banks_per_lane = 1;
+    if (__pim_lanes > 0 && 2 * (int)__pim_lanes == banks && cfg_num_banks % 2 == 0) {
+      g_banks_per_lane = 2;
+      fprintf(stderr, "[pim-runtime] bank pairs: %d lanes on %d banks, lane l owns banks "
+                      "2l and 2l+1\n", (int)__pim_lanes, banks);
+    } else if (__pim_lanes > 0 && (int)__pim_lanes != banks)
+      fprintf(stderr, "[pim-runtime] WARN kernel compiled for %d lanes, machine has %d "
+                      "banks; lane placement puts lane b in bank b and assumes they agree.\n",
+              (int)__pim_lanes, banks);
+  }
   stat_lockstep_skips = 0;
   stat_coalesce_overflow = 0;
   fprintf(stderr,
@@ -1241,13 +1273,22 @@ static void apply_compiler_layout(int tensor_id) {
        * used to keep the source word's (sa,row,col) and drop its bank bits, which
        * aliased 4-8 distinct words onto one address (matmul A: 8,192 writes, 2,048
        * addresses). When the rows do not fit, keep the interleaved home and say so. */
-      int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+      int lanes = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
+                  g_banks_per_lane;
       int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
-      int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
+      int share2 = 2 * ((_t->num_elements + lanes - 1) / lanes);
       int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
                      : share2 > 65536 ? share2
                      : (_t->num_elements < 65536 ? _t->num_elements : 65536);
       int rows = (per_lane + vpr - 1) / vpr;
+      if (g_banks_per_lane > 1) {
+        /* Rows are per bank, and each bank of a pair holds every other block of words. */
+        int vpc = _t->values_per_col > 0 ? _t->values_per_col : 16;
+        int span = PIM_PAIR_BLOCK_WORDS * g_banks_per_lane;
+        int bank_words = ((per_lane + vpc - 1) / vpc + span - 1) / span *
+                         PIM_PAIR_BLOCK_WORDS;
+        rows = (bank_words * vpc + vpr - 1) / vpr;
+      }
       if (rows < 1) rows = 1;
       if (g_lane_row_top < 0)
         g_lane_row_top = cfg_num_sa * cfg_num_rows;
@@ -1559,11 +1600,14 @@ static void emit_acc_spill(void) {
   if (banks > MAX_BANKS)
     banks = MAX_BANKS;
   long long pairs = (long long)g_acc_spill_overflow * g_acc_spill_ksteps;
-  for (int b = 0; b < banks; b++) {
+  /* The overflow is per PE, so a lane that owns a bank pair spills once, over both. */
+  int pes = banks / g_banks_per_lane;
+  for (int b = 0; b < pes; b++) {
     int ch, pch, bg, bank;
-    decompose_global_bank(b, &ch, &pch, &bg, &bank);
     for (long long i = 0; i < pairs; i++) {
-      int elem = (int)((i * banks + b) % (t->num_elements > 0 ? t->num_elements : 1));
+      decompose_global_bank(lane_bank(b, (int)(i % g_banks_per_lane)), &ch, &pch, &bg,
+                            &bank);
+      int elem = (int)((i * pes + b) % (t->num_elements > 0 ? t->num_elements : 1));
       int e_ch, e_pch, e_bg, e_bank, sa, row, col;
       map_element(t, elem, &e_ch, &e_pch, &e_bg, &e_bank, &sa, &row, &col);
       emit_trace("BW", ch, pch, bg, bank, sa, row, col);
@@ -1615,9 +1659,10 @@ void pim_finalize(void) {
     tensor_info_t *t = &tensors[i];
     if (t->bank_replicated < 0 || t->lane_row_base < 0)
       continue;
-    int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
+    int lanes = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
+                g_banks_per_lane;
     fprintf(stderr, "[pim-runtime]   tensor %d slab slots per lane:", i);
-    for (int l = 0; l < all_banks && l < MAX_BANKS; l++)
+    for (int l = 0; l < lanes && l < MAX_BANKS; l++)
       fprintf(stderr, " %d", t->lane_ord[l]);
     fprintf(stderr, "  (rows %d..%d)\n", t->lane_row_base,
             t->lane_row_base + t->lane_row_count - 1);
@@ -1745,7 +1790,8 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
      * separate command bus and need their own event. Omitting them collapsed
      * across independent buses and under-charged (2026-09-05 audit). Bank/bg stay
      * OUT of the key: collapsing those IS the all-bank SIMD model. */
-    uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write);
+    uint64_t tensor_key = lockstep_ns(t, loc.ch, loc.pch, is_write,
+                                      g_banks_per_lane > 1 ? (loc.bank & 1) : 0);
     /* Dispatch and lane ordinal ride in the key, so the 32 bank replays of ONE access
      * collapse while two dispatches, or two accesses within a lane, stay distinct. */
     uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
