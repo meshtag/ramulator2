@@ -129,11 +129,22 @@ __attribute__((weak)) extern const int32_t __pim_opt_macs[PIM_MAX_OPT_LANES];
 __attribute__((weak)) extern const int32_t __pim_opt_macs_count;
 __attribute__((weak)) extern const int32_t __pim_opt_mac_geom[5];
 __attribute__((weak)) extern const int32_t __pim_opt_step[5];
+/* im_optipim_vertical: rows per value of their SIMDRAM's vertical layout, 0 when horizontal. */
+__attribute__((weak)) extern const int32_t __pim_opt_vertical;
 /* im_optipim_hold_input, their unbounded input memo reproduced (their bug): [arg, held program
  * ids, bound x, y, z, tiles held]. The input is fresh only where each program id is below its
  * bound (-1 none). count 0 when unstated. */
 __attribute__((weak)) extern const int32_t __pim_opt_hold[6];
 __attribute__((weak)) extern const int32_t __pim_opt_hold_count;
+/* im_optipim_memo, their memo's hash of a step as their simulator reads the MILP's coefficients
+ * (their bug): (bound, weight) pairs per temporal loop, slowest first. count 0 when unstated. */
+#define PIM_MAX_OPT_MEMO 16
+__attribute__((weak)) extern const int32_t __pim_opt_memo[2 * PIM_MAX_OPT_MEMO];
+__attribute__((weak)) extern const int32_t __pim_opt_memo_count;
+/* im_bank_active: [store dim, active lanes] per lane axis of lane_ext where their mapping leaves
+ * lanes idle. The active lanes take banks 0..S-1 in lane order. count 0 when unstated. */
+__attribute__((weak)) extern const int32_t __pim_opt_lane_on[2 * PIM_MAX_OPT_LANE_AXES];
+__attribute__((weak)) extern const int32_t __pim_opt_lane_on_count;
 
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
@@ -160,8 +171,13 @@ const int32_t __pim_opt_macs[PIM_MAX_OPT_LANES] = {0};
 const int32_t __pim_opt_macs_count = 0;
 const int32_t __pim_opt_mac_geom[5] = {0};
 const int32_t __pim_opt_step[5] = {0};
+const int32_t __pim_opt_vertical = 0;
 const int32_t __pim_opt_hold[6] = {0};
 const int32_t __pim_opt_hold_count = 0;
+const int32_t __pim_opt_memo[2 * PIM_MAX_OPT_MEMO] = {0};
+const int32_t __pim_opt_memo_count = 0;
+const int32_t __pim_opt_lane_on[2 * PIM_MAX_OPT_LANE_AXES] = {0};
+const int32_t __pim_opt_lane_on_count = 0;
 #endif
 
 #endif /* PIM_LAYOUT_TABLE_H */

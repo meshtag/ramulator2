@@ -192,6 +192,7 @@ typedef struct {
   int lane_row_count;
   int lane_ord[MAX_BANKS];  /* next free value slot per lane */
   slot_map_t *lane_slot;    /* (lane, elem) -> slot, partitioned tensors only */
+  int lane_ring;            /* a drained slab of the rows left, placed by element index */
   /* __pim_opt_lane_rep and __pim_opt_lane_ext, read by the counters and the native bug bits
    * to tell dropped slices apart, never to decide a count. -1 not stated. */
   int opt_lane_rep;
@@ -739,6 +740,44 @@ typedef struct {
   int col;
 } pim_phys_loc_t;
 
+/* Their codegen numbers a mapping's PUs 0..S-1 (fimdram.cpp:262-264), where a split padded to
+ * powers of two leaves idle lanes between active ones. Under im_bank_active (__pim_opt_lane_on)
+ * the active lanes take banks 0..S-1 in lane order and the idle ones the banks after. Without
+ * it lane b is bank b. */
+static int g_lane_bank[MAX_BANKS], g_lane_on[MAX_BANKS], g_lane_bank_n = 0;
+
+static void lane_bank_init(void) {
+  g_lane_bank_n = 0;
+  int n_ax = (int)__pim_opt_lane_on_count, lanes = 1;
+  if (n_ax <= 0) return;
+  int ok = n_ax == (int)__pim_opt_lane_ext_count && n_ax <= PIM_MAX_OPT_LANE_AXES;
+  for (int i = 0; ok && i < n_ax; i++) {
+    ok = __pim_opt_lane_on[2 * i] == __pim_opt_lane_ext[2 * i];
+    lanes *= __pim_opt_lane_ext[2 * i + 1];
+  }
+  if (!ok || lanes > MAX_BANKS) {
+    fprintf(stderr, "[pim-runtime] ERROR: the active lanes (im_bank_active) do not follow the "
+                    "lane decomposition, or it needs more than %d banks\n", MAX_BANKS);
+    exit(1);
+  }
+  int next = 0;
+  for (int pass = 0; pass < 2; pass++)
+    for (int l = 0; l < lanes; l++) {
+      int rem = l, on = 1;
+      for (int i = 0; i < n_ax; i++) {
+        on &= rem % __pim_opt_lane_ext[2 * i + 1] < __pim_opt_lane_on[2 * i + 1];
+        rem /= __pim_opt_lane_ext[2 * i + 1];
+      }
+      g_lane_on[l] = on;
+      if (on == !pass) g_lane_bank[l] = next++;
+    }
+  g_lane_bank_n = lanes;
+}
+
+static int lane_bank(int lane) {
+  return lane >= 0 && lane < g_lane_bank_n ? g_lane_bank[lane] : lane;
+}
+
 /* Banks are threads here: lane b is bank b's PE and may only touch bank b. The
  * interleaved map changes bank every 512 elements while a lane's slab is 1024, so
  * lane 0's data sat in banks 0 and 1. Put the element in the executing lane's bank at
@@ -746,6 +785,10 @@ typedef struct {
  * remembered so a re-read lands on the same address. A replicated tensor gets the same
  * treatment: its copy in bank b is a full slab, not the source word's (sa,row,col)
  * with the bank bits dropped, which aliased 4-8 words onto one address. */
+static int has_slab(const tensor_info_t *t) {
+  return t->bank_replicated >= 0 && (t->lane_slot || t->lane_ring) && t->lane_row_base >= 0;
+}
+
 static int lane_slab_place(tensor_info_t *t, pim_phys_loc_t *loc) {
   static int warned = 0;
   int all_banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
@@ -755,6 +798,16 @@ static int lane_slab_place(tensor_info_t *t, pim_phys_loc_t *loc) {
       fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d banks; kept "
                       "the interleaved home.\n", lane, all_banks);
     return 0;
+  }
+  if (t->lane_ring) {
+    int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
+    int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
+    int linear_row = t->lane_row_base + (int)((loc->elem_idx / vpr) % t->lane_row_count);
+    decompose_global_bank(lane_bank(lane), &loc->ch, &loc->pch, &loc->bg, &loc->bank);
+    loc->sa = linear_row / cfg_num_rows;
+    loc->row = linear_row % cfg_num_rows;
+    loc->col = (loc->elem_idx % vpr) / vpc;
+    return 1;
   }
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
    * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x.
@@ -782,7 +835,7 @@ static int lane_slab_place(tensor_info_t *t, pim_phys_loc_t *loc) {
     r = t->lane_row_count - 1;
   }
   int linear_row = t->lane_row_base + r;
-  decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
+  decompose_global_bank(lane_bank(lane), &loc->ch, &loc->pch, &loc->bg, &loc->bank);
   loc->sa = linear_row / cfg_num_rows;
   loc->row = linear_row % cfg_num_rows;
   loc->col = (slot % vpr) / vpc;
@@ -796,19 +849,27 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
 
 /* Their alloc new as im-optipim-mac states it (__pim_opt_mac_geom): MAC j of step t sits at one
  * slot of the lane's own bank, the same for every tensor. 0 for a slot the bank lacks, so E
- * above the columns of a row is refused, never wrapped, and 2 where sa0 moved the row. */
-static int arranged_place(int lane, int64_t t, int64_t j, int sa0, pim_phys_loc_t *loc) {
+ * above the columns of a row is refused, never wrapped, and 2 where sa0 moved the row. A
+ * drained slot, an input written or a partial read out within its own step, reuses the bank's
+ * rows past its last, while a weight keeps one row per step: -1 where that row is past the
+ * bank, a reading their layout cannot give without SA0. */
+static int arranged_place(int lane, int64_t t, int64_t j, int sa0, int drained,
+                          pim_phys_loc_t *loc) {
   const int32_t *g = __pim_opt_mac_geom;
   int64_t row = (int64_t)g[1] * t + (int64_t)g[2] * j;
   int64_t col = (int64_t)g[3] * t + (int64_t)g[4] * j;
   /* SA0, theirs: the row wraps at count[row], a subarray, not rows per bank (fimdram.cpp:294). */
   int moved = sa0 && row >= cfg_num_rows;
   if (moved) row %= cfg_num_rows;
+  if (drained && row >= 0) row %= (int64_t)cfg_num_sa * cfg_num_rows;
   int banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-  if (t < 0 || lane < 0 || lane >= banks || row < 0 ||
-      row >= (int64_t)cfg_num_sa * cfg_num_rows || col < 0 || col >= cfg_num_cols)
+  if (t < 0 || lane < 0 || lane_bank(lane) >= banks || row < 0 || col < 0 ||
+      col >= cfg_num_cols)
     return 0;
-  decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
+  /* Their weight row t past the bank: without SA0's wrap their layout has no such row. */
+  if (row >= (int64_t)cfg_num_sa * cfg_num_rows)
+    return -1;
+  decompose_global_bank(lane_bank(lane), &loc->ch, &loc->pch, &loc->bg, &loc->bank);
   loc->elem_idx = -1;
   loc->sa = (int)(row / cfg_num_rows);
   loc->row = (int)(row % cfg_num_rows);
@@ -837,8 +898,7 @@ static int resolve_access_location(tensor_info_t *t, uint64_t addr,
   loc->elem_idx = elem_idx;
   map_element(t, elem_idx, &loc->ch, &loc->pch, &loc->bg, &loc->bank, &loc->sa,
               &loc->row, &loc->col);
-  if (cur_phase == PIM_PHASE_COMPUTE && t->bank_replicated >= 0 && t->lane_slot &&
-      t->lane_row_base >= 0)
+  if (cur_phase == PIM_PHASE_COMPUTE && has_slab(t))
     place_in_lane_slab(t, loc);
   return 1;
 }
@@ -1044,7 +1104,7 @@ static void ctr_call(uint64_t base_addr, uint64_t size, int is_write) {
     pim_phys_loc_t pl;
     pl.elem_idx = elem;
     map_element(t, elem, &pl.ch, &pl.pch, &pl.bg, &pl.bank, &pl.sa, &pl.row, &pl.col);
-    if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
+    if (has_slab(t))
       lane_slab_place(t, &pl);
     ctr_add(t, is_write, CC_ELEMS);
     int gb = compute_global_bank(pl.ch, pl.pch, pl.bg, pl.bank);
@@ -1169,6 +1229,9 @@ uint64_t pim_opt_mac_unordered(void) { return g_mac_unordered; }
  * every input element loaded and every output stored, which correct:true misses when the
  * reference equals the initial buffer. */
 static uint8_t *g_cov[MAX_TENSORS][2];
+/* Elements an input's operator reads where that is not all of it, as a strided window leaves
+ * the border of its input unread; -1 is every element. */
+static int g_cov_expect[MAX_TENSORS];
 static int g_cov_failures = -1;
 static uint64_t g_cov_drops = 0;   /* COMPUTE stores to an input, a failure as in the dcc tree */
 
@@ -1196,7 +1259,7 @@ static void cov_report(void) {
     if (n <= 0) continue;
     int rd = cov_count(g_cov[i][0], n), wr = cov_count(g_cov[i][1], n);
     int acc = t->role == PIM_ROLE_ACCUMULATOR;
-    int ok = acc ? wr == n : rd == n;
+    int ok = acc ? wr == n : rd == (g_cov_expect[i] >= 0 ? g_cov_expect[i] : n);
     fprintf(stderr, "[pim-runtime] coverage tensor %d %s: %d/%d read, %d/%d written%s\n",
             i, acc ? "accumulator" : "input", rd, n, wr, n, ok ? "" : "  NOT COVERED");
     g_cov_failures += !ok;
@@ -1211,14 +1274,19 @@ static void cov_report(void) {
 
 /* A run that never reached finalize must not leave its bits for the next one. */
 static void cov_reset(void) {
-  for (int i = 0; i < MAX_TENSORS; i++)
+  for (int i = 0; i < MAX_TENSORS; i++) {
     for (int w = 0; w < 2; w++) { free(g_cov[i][w]); g_cov[i][w] = NULL; }
+    g_cov_expect[i] = -1;
+  }
   g_cov_failures = -1;
   g_cov_drops = 0;
 }
 
 /* -1 before any finalize, else the number of tensors the run left uncovered. */
 int pim_opt_coverage_failures(void) { return g_cov_failures; }
+void pim_opt_cov_expect(int tid, int reads) {
+  if (tid >= 0 && tid < MAX_TENSORS) g_cov_expect[tid] = reads;
+}
 
 /* THE NATIVE EMITTER (PIM_OPT_NATIVE = OPT_EMIT | NE_ bits). One command per placed word a load
  * or store issued, W, BR or R by the residency stamp, or under NE_MAC the transfers of each
@@ -1234,12 +1302,21 @@ enum {
   NE_CAP16 = 524288,      /* theirs: input to banks below 16, no pseudo-channel level (:227-233) */
   NE_LEADER_CH = 1048576, /* theirs: bank 0's bank reads stand for the channel (:274-283) */
   NE_R0 = 2097152,        /* theirs: only the leader's partials read out (:41-44,277-283) */
-  NE_BUGS = NE_PEBASE | NE_SA0 | NE_FAN | NE_CAP16 | NE_LEADER_CH | NE_R0,
+  NE_STRIDE = 8388608,    /* theirs: the memo hashes by misread strides (layout.h:196-200) */
+  NE_BUGS = NE_PEBASE | NE_SA0 | NE_FAN | NE_CAP16 | NE_LEADER_CH | NE_R0 | NE_STRIDE,
   /* The machine's all-bank write, which their codegen never issues (Lee ISCA'21 III-A): lanes of
    * one pseudo-channel holding one input slice take one write. FAN overrides it. */
   NE_BCAST = 4194304,
-  NE_BITS = NE_ORDER | NE_MAC | NE_BUGS | NE_BCAST
+  /* Their SIMDRAM (PIM_OPT_CODEGEN=SimDRAM): the leader's read-out and MAJ stand for every PU
+   * (simdram.cpp:136-142), and a MUL is 7n^2+1 MAJ where SIMDRAM counts 11n^2-5n-1 (:58). */
+  NE_SD_LEADER = 16777216,
+  NE_SD_MUL7 = 33554432,
+  NE_SD_BITS = NE_SD_LEADER | NE_SD_MUL7,
+  NE_BITS = NE_ORDER | NE_MAC | NE_BUGS | NE_BCAST | NE_SD_BITS
 };
+/* Their machine's codegen, FimDRAM or SimDRAM, from the harness's record of their machine. */
+static int g_ne_simdram = 0;
+static int64_t g_sd_next_row = 0;
 enum { NE_IN, NE_MAC_PH, NE_OUT };   /* phases within a dispatch: input, MAC, read-out */
 enum { NC_DISP, NC_LANE, NC_TID, NC_WRITE, NC_CALLS, NC_WORDS, NC_EMITTED, NC_FOLDED,
        NC_REFUSED, NC_DROPPED, NC_FIELDS };
@@ -1255,7 +1332,8 @@ enum { MC_DISP, MC_LANE, MC_MACS, MC_STAMP, MC_UNORDERED, MC_IN, MC_WT, MC_OUT, 
 /* Signed: an arranged counter, transfers less words absorbed, goes negative where a lane issued
  * more words than it ran MACs. */
 enum { NM_MACS, NM_UNORDERED, NM_OFF_STAMP, NM_NO_WEIGHT, NM_UNABSORBED_W, NM_UNABSORBED_BR,
-       NM_UNABSORBED_R, NM_UNPLACED, NM_ARRANGED_W, NM_ARRANGED_BR, NM_ARRANGED_R, NM_FIELDS };
+       NM_UNABSORBED_R, NM_UNPLACED, NM_ARRANGED_W, NM_ARRANGED_BR, NM_ARRANGED_R, NM_BEYOND,
+       NM_FIELDS };
 /* Lane transfers before any fold, not lines. Per bug bit, those it dropped and how many held a
  * slice no kept transfer of the dispatch holds, a BR or R slice being the MAC's work. PEBASE and
  * SA0 drop nothing, and their moved count every line they place, already there or not. FAN
@@ -1280,14 +1358,20 @@ static uint64_t g_ne_stat[NS_FIELDS];
 static int64_t g_ne_mstat[NM_FIELDS], g_ne_bstat[NB_FIELDS];
 static uint64_t g_ne_epoch0 = 0, g_ne_prog = UINT64_MAX, g_ne_disp_key = UINT64_MAX;
 static uint32_t g_ne_disp = 0, g_ne_seq = 0;
-/* im_optipim_hold_input, their unbounded input memo (their bug, disclosed): the input goes out
- * only where every held program id is below its bound. Honoured only on a walk with the held
- * ids slowest over exactly the stamped tiles, so every held tile was delivered fresh before. */
-enum { NH_DROPPED, NH_HELD, NH_FRESH, NH_PROGRAMS, NH_FIELDS };
-static int g_ne_hold = 0, g_ne_hold_tid = -1, g_ne_walk_n = 0;
-static int64_t g_ne_hstat[NH_FIELDS], g_ne_walk[7];
-static int32_t g_ne_pid_max[3];
-static uint64_t g_ne_hold_prog = UINT64_MAX;
+/* im_optipim_hold_input, their unbounded input memo (their bug, disclosed): every PE slot keeps
+ * each input element it ever held, and a step sends the leader's whole input only when some slot
+ * meets one it never held (fimdram.cpp:58-75,301-306), though their config declares one register
+ * per PE. Modelled on the leader lane's own loads, a slot being an element's place in the lane's
+ * input of the dispatch. The first slot decides the step: with the input an affine map of step
+ * and slot every slot agrees, and a step on which they disagree is refused at the finish. */
+enum { NH_DROPPED, NH_HELD, NH_FRESH, NH_PROGRAMS, NH_DISAGREE, NH_FIELDS };
+static int g_ne_hold = 0, g_ne_hold_tid = -1, g_ne_memo_lane = -1, g_ne_memo_new = 0;
+static int64_t g_ne_hstat[NH_FIELDS];
+static uint64_t g_ne_hold_prog = UINT64_MAX, g_ne_memo_slot = 0;
+static uint32_t g_ne_memo_disp = UINT32_MAX;
+static ctr_map_t g_ne_memo_map;          /* (slot, element) pairs the leader's slots held */
+static uint8_t *g_ne_memo_step = NULL;   /* per dispatch: 0 undecided, 1 fresh, 2 held */
+static size_t g_ne_memo_cap = 0;
 
 static uint32_t *ne_row(ne_tab_t *t) {
   if (t->n == t->cap) {
@@ -1327,11 +1411,17 @@ static void ne_reset(int mask) {
   g_ne_epoch0 = __pim_program_epoch;
   g_ne_prog = g_ne_disp_key = UINT64_MAX;
   g_ne_disp = g_ne_seq = 0;
+  g_sd_next_row = 0;
   g_ne_hold = mask && __pim_opt_hold_count > 0;
-  g_ne_hold_tid = -1;
-  g_ne_walk_n = 0;
+  g_ne_hold_tid = g_ne_memo_lane = -1;
+  g_ne_memo_new = 0;
+  g_ne_memo_slot = 0;
+  g_ne_memo_disp = UINT32_MAX;
+  ne_map_free(&g_ne_memo_map);
+  free(g_ne_memo_step);
+  g_ne_memo_step = NULL;
+  g_ne_memo_cap = 0;
   memset(g_ne_hstat, 0, sizeof g_ne_hstat);
-  g_ne_pid_max[0] = g_ne_pid_max[1] = g_ne_pid_max[2] = -1;
   g_ne_hold_prog = UINT64_MAX;
   if (mask && !(g_ne_fold = addr_dedup_create(1 << 16))) {
     fprintf(stderr, "[pim-runtime] ERROR: native key table alloc\n");
@@ -1342,6 +1432,8 @@ static void ne_reset(int mask) {
 static int ne_cmp(const void *x, const void *y) {
   const ne_rec_t *a = (const ne_rec_t *)x, *b = (const ne_rec_t *)y;
   if (a->disp != b->disp) return a->disp < b->disp ? -1 : 1;
+  /* SIMDRAM's issue writes a dispatch in their order already. */
+  if (g_ne_simdram) return a->seq < b->seq ? -1 : a->seq > b->seq;
   if ((g_ne_mask & NE_ORDER) && a->ph != b->ph) return a->ph - b->ph;
   if (a->lane != b->lane) return a->lane < b->lane ? -1 : 1;
   return a->seq < b->seq ? -1 : a->seq > b->seq;
@@ -1384,6 +1476,7 @@ static void ne_residue(size_t lo, size_t hi) {
 }
 
 static void ne_mac_issue(void);
+static void ne_sd_issue(void);
 
 /* Whole-program hold, written dispatch-major: within a dispatch by phase under ORDER, then
  * lane, then program order. */
@@ -1391,7 +1484,7 @@ static void ne_flush(void) {
   if (!g_ne_mask) return;
   ne_residue(g_ne_cell0, g_ne_cells.n);
   g_ne_cell0 = g_ne_cells.n;
-  if (g_ne_mask & NE_MAC) ne_mac_issue();
+  if (g_ne_mask & NE_MAC) (g_ne_simdram ? ne_sd_issue : ne_mac_issue)();
   if (g_ne_n) qsort(g_ne_rec, g_ne_n, sizeof *g_ne_rec, ne_cmp);
   static const char *const op[3] = {"W", "BR", "R"};
   for (size_t i = 0; i < g_ne_n && trace_fp; i++) {
@@ -1410,69 +1503,77 @@ static void ne_flush(void) {
   addr_dedup_reset(g_ne_fold);
 }
 
-/* 1 when a held program id of the dispatch is at or past its bound, so the input stays put. */
-static int ne_held(uint32_t disp) {
-  if (g_ne_hold_tid < 0) return 0;
-  const uint32_t *r = g_ne_disps.row + (size_t)disp * ND_FIELDS;
-  for (int a = 0; a < 3; a++)
-    if (__pim_opt_hold[2 + a] >= 0 && (int32_t)r[ND_PID_X + a] >= __pim_opt_hold[2 + a])
-      return 1;
-  return 0;
-}
-
-/* The stamped tiles against the fresh programs walked and the launch grid's extent over the
- * ids the hold does not hold. The walk check keeps every fresh program before a held one. */
-static void ne_hold_tiles(void) {
-  int64_t tiles = __pim_opt_hold[5], grid = 1;
-  for (int a = 0; a < 3; a++)
-    if (!((__pim_opt_hold[1] >> a) & 1)) grid *= (int64_t)g_ne_pid_max[a] + 1;
-  if (g_ne_hstat[NH_PROGRAMS] == tiles && grid == tiles) return;
-  fprintf(stderr, "[pim-runtime] ERROR: the held input (im_optipim_hold_input) states %" PRId64
-                  " tiles, the launch delivered %" PRId64 " fresh programs over a grid of %"
-                  PRId64 " on the ids it does not hold\n", tiles, g_ne_hstat[NH_PROGRAMS], grid);
-  exit(1);
-}
-
-/* A new dispatch under the hold: the walk must rise in (held ids, other ids, tile), slowest
- * first, which their memo needs for a fresh predicate on the held ids alone. */
-static void ne_hold_dispatch(uint32_t disp, uint64_t ep, const int32_t p[3], uint64_t tile) {
-  if (g_ne_hold_tid < 0) {
-    /* The stamp's arg indexes tensors[] as the layout and residency records do. */
-    int arg = __pim_opt_hold[0];
-    if (arg < 0 || arg >= num_tensors || tensors[arg].opt_res != RES_DELIVERED) {
-      fprintf(stderr, "[pim-runtime] ERROR: the held input (im_optipim_hold_input) is arg %d, "
-                      "which is not the tensor stamped delivered\n", arg);
-      exit(1);
-    }
-    g_ne_hold_tid = arg;
-  }
-  int64_t k[7];
-  for (int a = 2, i = 0; a >= 0; a--, i++) {
-    int h = (__pim_opt_hold[1] >> a) & 1;
-    k[i] = h ? p[a] : 0;
-    k[3 + i] = h ? 0 : p[a];
-  }
-  k[6] = (int64_t)tile;
-  int cmp = !g_ne_walk_n;
-  for (int i = 0; i < 7 && !cmp; i++)
-    cmp = k[i] > g_ne_walk[i] ? 1 : k[i] < g_ne_walk[i] ? -1 : 0;
-  if (cmp <= 0) {
-    char ids[4] = {0};
-    for (int a = 2, n = 0; a >= 0; a--)
-      if ((__pim_opt_hold[1] >> a) & 1) ids[n++] = "xyz"[a];
-    fprintf(stderr, "[pim-runtime] ERROR: the held input (im_optipim_hold_input) is held across "
-                    "program id %s, walked slowest, and the walk reaches pid %d,%d,%d tile %"
-                    PRIu64 " out of that order\n", ids, p[0], p[1], p[2], tile);
+/* The stamp's arg indexes tensors[] as the layout and residency records do. */
+static void ne_hold_bind(void) {
+  int arg = __pim_opt_hold[0];
+  if (arg < 0 || arg >= num_tensors || tensors[arg].opt_res != RES_DELIVERED) {
+    fprintf(stderr, "[pim-runtime] ERROR: the held input (im_optipim_hold_input) is arg %d, "
+                    "which is not the tensor stamped delivered\n", arg);
     exit(1);
   }
-  memcpy(g_ne_walk, k, sizeof k);
-  g_ne_walk_n = 1;
-  for (int a = 0; a < 3; a++)
-    if (p[a] > g_ne_pid_max[a]) g_ne_pid_max[a] = p[a];
-  int held = ne_held(disp);
-  g_ne_hstat[held ? NH_HELD : NH_FRESH]++;
-  if (ep != g_ne_hold_prog && !held) g_ne_hstat[NH_PROGRAMS]++;
-  g_ne_hold_prog = ep;
+  g_ne_hold_tid = arg;
+}
+
+static uint8_t *ne_memo_step(uint32_t disp) {
+  if (disp >= g_ne_memo_cap) {
+    size_t cap = g_ne_memo_cap ? g_ne_memo_cap : 4096;
+    while (cap <= disp) cap *= 2;
+    g_ne_memo_step = (uint8_t *)realloc(g_ne_memo_step, cap);
+    if (!g_ne_memo_step) { fprintf(stderr, "[pim-runtime] ERROR: native memo alloc\n"); exit(1); }
+    memset(g_ne_memo_step + g_ne_memo_cap, 0, cap - g_ne_memo_cap);
+    g_ne_memo_cap = cap;
+  }
+  return &g_ne_memo_step[disp];
+}
+
+/* The leader's input of the last dispatch is complete: every slot agreed with the first. */
+static void ne_memo_close(void) {
+  if (g_ne_memo_disp == UINT32_MAX) return;
+  g_ne_hstat[NH_DISAGREE] += (*ne_memo_step(g_ne_memo_disp) == 1) != (g_ne_memo_new != 0);
+  g_ne_memo_disp = UINT32_MAX;
+}
+
+static void ne_memo_decide(uint8_t *s, int ins) {
+  uint64_t ep = __pim_program_epoch - g_ne_epoch0;
+  *s = ins ? 1 : 2;
+  g_ne_hstat[ins ? NH_FRESH : NH_HELD]++;
+  if (ins && ep != g_ne_hold_prog) g_ne_hstat[NH_PROGRAMS]++;
+  if (ins) g_ne_hold_prog = ep;
+}
+
+/* 1 when their memo keeps the held input in the PEs on this dispatch. Under STRIDE a step is
+ * keyed by their hash's step part (im_optipim_memo) at its stated step, their slots agreeing by
+ * linearity. Otherwise the first lane to load it in a dispatch is their leader, whose element
+ * at every slot goes into the memo. */
+static int ne_memo(uint32_t disp, int lane, int elem) {
+  uint8_t *s = ne_memo_step(disp);
+  if (g_ne_mask & NE_STRIDE) {
+    if (!*s) {
+      int32_t st = (int32_t)g_ne_disps.row[(size_t)disp * ND_FIELDS + ND_T];
+      int64_t t = st >= 0 ? st : (int64_t)disp, h = 0;
+      for (int i = (int)__pim_opt_memo_count - 1; i >= 0; i--) {
+        h += t % __pim_opt_memo[2 * i] * __pim_opt_memo[2 * i + 1];
+        t /= __pim_opt_memo[2 * i];
+      }
+      int ins;
+      ctr_map_get(&g_ne_memo_map, (uint64_t)h, 1, &ins);
+      ne_memo_decide(s, ins);
+    }
+    return *s == 2;
+  }
+  if (*s && (disp != g_ne_memo_disp || lane != g_ne_memo_lane)) return *s == 2;
+  if (disp != g_ne_memo_disp) {
+    ne_memo_close();
+    g_ne_memo_disp = disp;
+    g_ne_memo_lane = lane;
+    g_ne_memo_slot = 0;
+    g_ne_memo_new = 0;
+  }
+  int ins;
+  ctr_map_get(&g_ne_memo_map, (g_ne_memo_slot++ << 32) | (uint32_t)elem, 1, &ins);
+  g_ne_memo_new |= ins;
+  if (!*s) ne_memo_decide(s, ins);
+  return *s == 2;
 }
 
 /* The dispatch, (epoch, tile), numbered in replay order. Their step t is the compiler's affine
@@ -1508,10 +1609,7 @@ static uint32_t ne_dispatch(void) {
       g_ne_stat[NS_T_UNSTATED]++;
     }
     r[ND_T] = (uint32_t)t;
-    if (g_ne_hold) {
-      const int32_t p[3] = {px, py, pz};
-      ne_hold_dispatch(ord, ep, p, tile);
-    }
+    if (g_ne_hold && g_ne_hold_tid < 0) ne_hold_bind();
   }
   g_ne_disp = ord;
   return ord;
@@ -1667,7 +1765,7 @@ static int ne_put(int tid, uint32_t disp, int lane, int ph, pim_phys_loc_t *pl, 
     if ((uint32_t)lane < *last) g_ne_bstat[NB_LANE_ORDER]++;
     else *last = (uint32_t)lane;
   }
-  if (cap && lane >= per_pch) {
+  if (cap && lane_bank(lane) >= per_pch) {
     ne_drop(NB_CAP16_DROPPED, disp, ph, slice);
     return -1;
   }
@@ -1679,7 +1777,7 @@ static int ne_put(int tid, uint32_t disp, int lane, int ph, pim_phys_loc_t *pl, 
                             (uint32_t)lane, &ins);
   int held = ne_issue(ne_ns(tid, ph, pl, gb, bcast ? slice : -1), disp, lane, ph, pl);
   g_ne_bstat[NB_BCAST_FOLDED] += bcast && !held;
-  if (!held && chan && (ph == NE_OUT || lane / per_pch != lead / per_pch)) {
+  if (!held && chan && (ph == NE_OUT || lane_bank(lane) / per_pch != lane_bank(lead) / per_pch)) {
     ne_drop(ph == NE_OUT ? NB_R0_DROPPED : NB_LEADER_CH_DROPPED, disp, ph, slice);
     return -1;
   }
@@ -1744,7 +1842,6 @@ static void ne_access(uint64_t base, uint64_t size, int is_write) {
   int lane = __pim_get_bank_id();
   uint32_t *cell = ne_cell(disp, lane, tidx, is_write), *mcell = NULL;
   cell[NC_CALLS]++;
-  const int held = ne_held(disp);
   int cell_tid = tidx;
   uint64_t seen[NE_WORDS_MAX];
   int n_seen = 0;
@@ -1757,10 +1854,13 @@ static void ne_access(uint64_t base, uint64_t size, int is_write) {
     }
     int elem = (int)((a - (uint64_t)t->base_addr) / t->elem_size);
     if (elem < 0 || elem >= t->num_elements) continue;
+    /* Every element, before words fold: their memo keeps elements per slot. */
+    const int held = g_ne_hold && (int)(t - tensors) == g_ne_hold_tid &&
+                     ne_memo(disp, lane, elem);
     pim_phys_loc_t pl;
     pl.elem_idx = elem;
     map_element(t, elem, &pl.ch, &pl.pch, &pl.bg, &pl.bank, &pl.sa, &pl.row, &pl.col);
-    int placed = t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0 &&
+    int placed = has_slab(t) &&
                  lane_slab_place(t, &pl);
     int gb = compute_global_bank(pl.ch, pl.pch, pl.bg, pl.bank);
     uint64_t key = ((uint64_t)gb & 0xFFFFULL) | (((uint64_t)pl.sa & 0xFFULL) << 16) |
@@ -1781,7 +1881,7 @@ static void ne_access(uint64_t base, uint64_t size, int is_write) {
     int ph = t->opt_res == RES_DELIVERED ? NE_IN : t->opt_res == RES_RESIDENT ? NE_MAC_PH
              : t->opt_res == RES_DRAINED ? NE_OUT : -1;
     int bad = ph < 0 ? NS_UNSTATED : (ph == NE_OUT) != (is_write != 0) ? NS_CONFLICT
-              : !placed || gb != lane ? NS_OFFBANK : -1;
+              : !placed || gb != lane_bank(lane) ? NS_OFFBANK : -1;
     if (bad >= 0) {
       g_ne_stat[bad]++;
       cell[NC_REFUSED]++;
@@ -1789,7 +1889,7 @@ static void ne_access(uint64_t base, uint64_t size, int is_write) {
       continue;
     }
     /* Held, the whole input stays in every lane's PE, before any MAC absorbs it. */
-    if (held && tid == g_ne_hold_tid) {
+    if (held) {
       cell[NC_DROPPED]++;
       g_ne_hstat[NH_DROPPED]++;
       continue;
@@ -1854,13 +1954,14 @@ static void ne_mac_issue(void) {
           m[MC_W + ph]++;
           pim_phys_loc_t pl;
           int at = refuse || tid[ph] < 0 ? 0 : arranged_place(lane, t, j, ph == NE_MAC_PH &&
-                                                              (g_ne_mask & NE_SA0), &pl);
-          if (!at) {
+                                                              (g_ne_mask & NE_SA0),
+                                                              ph != NE_MAC_PH, &pl);
+          if (at <= 0) {
             m[MC_REFUSED]++;
-            g_ne_mstat[NM_UNPLACED] += !refuse;
+            g_ne_mstat[at < 0 ? NM_BEYOND : NM_UNPLACED] += !refuse;
             continue;
           }
-          int got = ne_put(tid[ph], disp, lane, ph, &pl, lane);
+          int got = ne_put(tid[ph], disp, lane, ph, &pl, lane_bank(lane));
           if (got > 0) {
             m[MC_W_EMITTED + ph]++;
             g_ne_bstat[NB_SA0_MOVED] += at == 2;
@@ -1876,16 +1977,110 @@ static void ne_mac_issue(void) {
   free(ix);
 }
 
+static void ne_sd_put(uint32_t disp, int lane, int ph, int bank, int row, int col,
+                      uint32_t *m) {
+  pim_phys_loc_t pl;
+  decompose_global_bank(bank, &pl.ch, &pl.pch, &pl.bg, &pl.bank);
+  pl.sa = 0;
+  pl.row = row;
+  pl.col = col;
+  ne_hold(disp, lane, ph, &pl);
+  m[MC_W + ph]++;
+  m[MC_W_EMITTED + ph]++;
+}
+
+/* codegen_simdram (simdram.cpp:79-165) for every dispatch of the program, from the MAC table: the
+ * lanes running MACs are their PUs, the lowest the leader, its MACs E words of dq bitlines with
+ * values pe_bits rows tall. Per step, the input's bit-rows to banks 0..L-1 where it is delivered,
+ * then per row of words the output's bit-rows read out and the MUL's MAJ as bank reads cycling
+ * those rows. Their per-bank input writes, the 16-bank cap and the synthetic rows are their
+ * codegen's own and always on. Refused: a lane off its stamp or out of turn, a word no MAC
+ * absorbs, and one PU, whose last slot their codegen drops (S1DROP, unbuilt). */
+static void ne_sd_issue(void) {
+  size_t lo = g_ne_mcell0, hi = g_ne_mcells.n;
+  g_ne_mcell0 = hi;
+  if (hi <= lo) return;
+  uint32_t *ix = (uint32_t *)malloc((hi - lo) * sizeof *ix);
+  if (!ix) { fprintf(stderr, "[pim-runtime] ERROR: native SIMDRAM alloc\n"); exit(1); }
+  for (size_t i = lo; i < hi; i++) ix[i - lo] = (uint32_t)i;
+  qsort(ix, hi - lo, sizeof *ix, ne_mcell_cmp);
+  const int nbit = cfg_data_width_bits, cols = cfg_num_cols;
+  const int per_pch = cfg_num_bg * cfg_num_banks;
+  const int64_t rows_per_bank = (int64_t)cfg_num_sa * cfg_num_rows;
+  const int maj = (g_ne_mask & NE_SD_MUL7) ? 7 * nbit * nbit + 1 : 11 * nbit * nbit - 5 * nbit - 1;
+  for (size_t i = 0; i < hi - lo;) {
+    uint32_t disp = g_ne_mcells.row[(size_t)ix[i] * MC_FIELDS + MC_DISP];
+    size_t j = i;
+    int pus = 0, refuse = 0;
+    uint32_t *lead = NULL;
+    for (; j < hi - lo; j++) {
+      uint32_t *m = g_ne_mcells.row + (size_t)ix[j] * MC_FIELDS;
+      if (m[MC_DISP] != disp) break;
+      if (!m[MC_MACS]) {
+        g_ne_mstat[NM_UNABSORBED_W] += m[MC_IN];
+        g_ne_mstat[NM_UNABSORBED_BR] += m[MC_WT];
+        g_ne_mstat[NM_UNABSORBED_R] += m[MC_OUT];
+        continue;
+      }
+      pus++;
+      if (!lead) lead = m;
+      else if (m[MC_MACS] != lead[MC_MACS]) g_ne_stat[NS_RESIDUE]++;
+      g_ne_mstat[NM_OFF_STAMP] += m[MC_MACS] != m[MC_STAMP];
+      if (!m[MC_WT]) g_ne_mstat[NM_NO_WEIGHT] += m[MC_MACS];
+      refuse |= m[MC_UNORDERED] || m[MC_MACS] != m[MC_STAMP] || !m[MC_WT];
+    }
+    if (pus == 1) {
+      g_ne_mstat[NM_UNPLACED] += lead[MC_MACS];
+      refuse = 1;
+    }
+    if (lead && !refuse) {
+      int E = (int)lead[MC_MACS], L = pus < per_pch ? pus : per_pch;
+      int blocks = (E + cols - 1) / cols;
+      int64_t cur = g_sd_next_row;
+      g_sd_next_row = cur + (int64_t)(blocks - 1) * nbit;
+      int lane0 = (int)lead[MC_LANE];
+      if (lead[MC_IN])
+        for (int b = 0; b < blocks; b++)
+          for (int bit = 0; bit < nbit; bit++)
+            for (int c = b * cols; c < E && c < (b + 1) * cols; c++)
+              for (int pu = 0; pu < L; pu++)
+                ne_sd_put(disp, lane0, NE_IN, pu, 0, 0, lead);
+      for (size_t k = i; k < j; k++) {
+        uint32_t *m = g_ne_mcells.row + (size_t)ix[k] * MC_FIELDS;
+        if (!m[MC_MACS] || ((g_ne_mask & NE_SD_LEADER) && m != lead)) continue;
+        int lane = (int)m[MC_LANE], bank = lane_bank(lane);
+        for (int b = 0; b < blocks; b++) {
+          int r = (int)((cur + (int64_t)b * nbit) % rows_per_bank);
+          for (int bit = 0; bit < nbit; bit++)
+            for (int c = b * cols; c < E && c < (b + 1) * cols; c++)
+              ne_sd_put(disp, lane, NE_OUT, bank, r + bit, c - b * cols, m);
+          for (int q = 0; q < maj; q++)
+            ne_sd_put(disp, lane, NE_MAC_PH, bank, r + q % nbit, 0, m);
+        }
+      }
+    }
+    i = j;
+  }
+  free(ix);
+}
+
 /* Flushes the last program and checks the two tallies: lines written against what the access
  * path and the MACs emitted. A difference, and a modelled spill, are commands nothing issued. */
 static void ne_finish(void) {
   ne_flush();
   if (g_ne_hold) {
-    ne_hold_tiles();
+    ne_memo_close();
     fprintf(stderr, "[pim-runtime] native hold: %" PRId64 " input words held on %" PRId64
-                    " dispatches, delivered on %" PRId64 ", %" PRId64 " fresh programs of %d "
-                    "tiles stated\n", g_ne_hstat[NH_DROPPED], g_ne_hstat[NH_HELD],
-            g_ne_hstat[NH_FRESH], g_ne_hstat[NH_PROGRAMS], (int)__pim_opt_hold[5]);
+                    " dispatches, delivered on %" PRId64 " over %" PRId64 " programs, %"
+                    PRId64 " where a slot disagreed with the first\n", g_ne_hstat[NH_DROPPED],
+            g_ne_hstat[NH_HELD], g_ne_hstat[NH_FRESH], g_ne_hstat[NH_PROGRAMS],
+            g_ne_hstat[NH_DISAGREE]);
+    if (g_ne_hstat[NH_DISAGREE]) {
+      fprintf(stderr, "[pim-runtime] ERROR: their memo decides a step by every slot, and the "
+                      "first slot alone decided %" PRId64 " steps the others would not\n",
+              g_ne_hstat[NH_DISAGREE]);
+      exit(1);
+    }
   }
   /* A key table that could not grow emits where it should have folded. */
   g_ne_stat[NS_OVERFLOW] += addr_dedup_saturations(g_ne_fold);
@@ -1915,11 +2110,12 @@ static void ne_finish(void) {
     fprintf(stderr, "[pim-runtime] native MACs: %" PRId64 " calls, %" PRId64 " out of turn, %"
                     PRId64 " lane-dispatches off the stamp, %" PRId64 " without a weight access, "
                     "unabsorbed words W %" PRId64 " BR %" PRId64 " R %" PRId64 ", %" PRId64
-                    " unplaced, arranged W %" PRId64 " BR %" PRId64 " R %" PRId64 "\n",
+                    " unplaced, %" PRId64 " past the bank, arranged W %" PRId64 " BR %" PRId64
+                    " R %" PRId64 "\n",
             g_ne_mstat[NM_MACS], g_ne_mstat[NM_UNORDERED], g_ne_mstat[NM_OFF_STAMP],
             g_ne_mstat[NM_NO_WEIGHT], g_ne_mstat[NM_UNABSORBED_W], g_ne_mstat[NM_UNABSORBED_BR],
-            g_ne_mstat[NM_UNABSORBED_R], g_ne_mstat[NM_UNPLACED], g_ne_mstat[NM_ARRANGED_W],
-            g_ne_mstat[NM_ARRANGED_BR], g_ne_mstat[NM_ARRANGED_R]);
+            g_ne_mstat[NM_UNABSORBED_R], g_ne_mstat[NM_UNPLACED], g_ne_mstat[NM_BEYOND],
+            g_ne_mstat[NM_ARRANGED_W], g_ne_mstat[NM_ARRANGED_BR], g_ne_mstat[NM_ARRANGED_R]);
   if (g_ne_mask & (NE_BUGS | NE_BCAST))
     fprintf(stderr, "[pim-runtime] native bug bits: dropped, distinct FAN %" PRId64 ", %" PRId64
                     " CAP16 %" PRId64 ", %" PRId64 " LEADER_CH %" PRId64 ", %" PRId64 " R0 %"
@@ -1953,7 +2149,8 @@ const char *pim_ne_mac_stat_name(int what) {
       [NM_NO_WEIGHT] = "no_weight", [NM_UNABSORBED_W] = "unabsorbed_W",
       [NM_UNABSORBED_BR] = "unabsorbed_BR", [NM_UNABSORBED_R] = "unabsorbed_R",
       [NM_UNPLACED] = "unplaced", [NM_ARRANGED_W] = "arranged_W",
-      [NM_ARRANGED_BR] = "arranged_BR", [NM_ARRANGED_R] = "arranged_R"};
+      [NM_ARRANGED_BR] = "arranged_BR", [NM_ARRANGED_R] = "arranged_R",
+      [NM_BEYOND] = "beyond_bank"};
   return what >= 0 && what < NM_FIELDS && names[what] ? names[what] : "";
 }
 int pim_ne_bit_stats(void) { return NB_FIELDS; }
@@ -1976,7 +2173,7 @@ int64_t pim_ne_hold_stat(int what) { return what >= 0 && what < NH_FIELDS ? g_ne
 const char *pim_ne_hold_stat_name(int what) {
   static const char *const names[NH_FIELDS] = {
       [NH_DROPPED] = "dropped", [NH_HELD] = "held", [NH_FRESH] = "fresh",
-      [NH_PROGRAMS] = "programs"};
+      [NH_PROGRAMS] = "programs", [NH_DISAGREE] = "disagree"};
   return what >= 0 && what < NH_FIELDS && names[what] ? names[what] : "";
 }
 int pim_ne_stats(void) { return NS_FIELDS; }
@@ -2050,7 +2247,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
           break;
         }
         int dch, dpch, dbg, dbank;
-        decompose_global_bank(__pim_get_bank_id(), &dch, &dpch, &dbg, &dbank);
+        decompose_global_bank(lane_bank(__pim_get_bank_id()), &dch, &dpch, &dbg, &dbank);
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
         stat_writes++;
         t->emitted_w++;
@@ -2484,6 +2681,7 @@ void pim_init(const char *trace_file) {
   if ((v = getenv("PIM_DQ_BITS")))
     cfg_dq_bits = atoi(v);
   check_compiler_dq_bits(cfg_dq_bits);
+  lane_bank_init();
   if ((v = getenv("PIM_DATA_WIDTH_BITS")))
     cfg_data_width_bits = atoi(v);
   if (cfg_data_width_bits < 1)
@@ -2496,8 +2694,24 @@ void pim_init(const char *trace_file) {
   mac_reset();
   stat_operand_repl_skips = stat_load_coalesced = 0;
   g_opt_native = 0;
+  g_ne_simdram = (v = getenv("PIM_OPT_CODEGEN")) && !strcmp(v, "SimDRAM");
   if ((v = getenv("PIM_OPT_NATIVE")) && atoi(v) && (atoi(v) & OPT_EMIT)) {
     g_opt_native = atoi(v);
+    /* Each codegen has its own departures: FimDRAM's bits mean nothing to SimDRAM's stream. */
+    if (g_ne_simdram ? (g_opt_native & ((NE_BUGS & ~NE_STRIDE) | NE_BCAST)) || !(g_opt_native & NE_MAC)
+                     : (g_opt_native & NE_SD_BITS)) {
+      fprintf(stderr, "[pim-runtime] ERROR: PIM_OPT_NATIVE=%d does not fit their %s codegen, "
+                      "whose readings are %s\n", g_opt_native, g_ne_simdram ? "SimDRAM" : "FimDRAM",
+              g_ne_simdram ? "NE_MAC readings with the SimDRAM bits and STRIDE"
+                           : "without the SimDRAM bits");
+      exit(1);
+    }
+    if (g_ne_simdram && __pim_opt_vertical != cfg_data_width_bits) {
+      fprintf(stderr, "[pim-runtime] ERROR: their SimDRAM stands a value %d rows tall in a "
+                      "bitline, and the kernel states %d (im_optipim_vertical)\n",
+              cfg_data_width_bits, (int)__pim_opt_vertical);
+      exit(1);
+    }
     if (g_opt_native & ~(OPT_EMIT | NE_BITS)) {
       fprintf(stderr, "[pim-runtime] ERROR: PIM_OPT_NATIVE=%d mixes the native emitter (%d) "
                       "with the replay, a conventions mask or an unknown bit\n",
@@ -2508,20 +2722,6 @@ void pim_init(const char *trace_file) {
       fprintf(stderr, "[pim-runtime] ERROR: the native emitter charges by the compiler's "
                       "residency stamps (im_optipim_roles); this kernel states none\n");
       exit(1);
-    }
-    if (__pim_opt_hold_count > 0) {
-      const int32_t *h = __pim_opt_hold;
-      int ok = h[1] > 0 && h[1] < 8 && h[5] > 0;
-      /* Bound 1 only. A higher bound delivers each tile more than once, which their memo
-       * never does. */
-      for (int a = 0; a < 3; a++)
-        ok &= (h[1] >> a) & 1 ? h[2 + a] == 1 : h[2 + a] == -1;
-      if (!ok) {
-        fprintf(stderr, "[pim-runtime] ERROR: the held input (im_optipim_hold_input) states "
-                        "held-id mask %d, bounds %d,%d,%d and %d tiles, which is no hold\n", h[1],
-                h[2], h[3], h[4], h[5]);
-        exit(1);
-      }
     }
     if ((g_opt_native & NE_R0) && !(g_opt_native & NE_LEADER_CH)) {
       fprintf(stderr, "[pim-runtime] ERROR: R0 (%d) reads out the channel leader's partials, "
@@ -2540,13 +2740,28 @@ void pim_init(const char *trace_file) {
       exit(1);
     }
     if ((g_opt_native & NE_MAC) &&
-        (__pim_opt_macs_count <= 0 || __pim_opt_mac_geom[0] != cfg_dq_bits / cfg_data_width_bits)) {
+        (__pim_opt_macs_count <= 0 ||
+         __pim_opt_mac_geom[0] != (g_ne_simdram ? cfg_dq_bits : cfg_dq_bits / cfg_data_width_bits))) {
       fprintf(stderr, "[pim-runtime] ERROR: NE_MAC (%d) issues the transfers of im-optipim-mac's "
                       "calls; this kernel states %d lanes of MACs of %d values, the word holds "
                       "%d\n", NE_MAC, (int)__pim_opt_macs_count, (int)__pim_opt_mac_geom[0],
-              cfg_dq_bits / cfg_data_width_bits);
+              g_ne_simdram ? cfg_dq_bits : cfg_dq_bits / cfg_data_width_bits);
       exit(1);
     }
+    if ((g_opt_native & NE_STRIDE) && __pim_opt_hold_count > 0 && __pim_opt_memo_count <= 0) {
+      fprintf(stderr, "[pim-runtime] ERROR: STRIDE (%d) hashes the held input as their simulator "
+                      "does, and the kernel states no such hash (im_optipim_memo)\n", NE_STRIDE);
+      exit(1);
+    }
+    /* Their PUs are the lanes with work, so the stated active lanes must be the ones the MAC
+     * lowering found cells on. */
+    for (int l = 0; (g_opt_native & NE_MAC) && l < g_lane_bank_n; l++)
+      if (g_lane_on[l] != (l < __pim_opt_macs_count && __pim_opt_macs[l] > 0)) {
+        fprintf(stderr, "[pim-runtime] ERROR: lane %d is %s under im_bank_active, and the MAC "
+                        "lowering states %d MACs on it\n", l, g_lane_on[l] ? "active" : "idle",
+                l < __pim_opt_macs_count ? (int)__pim_opt_macs[l] : -1);
+        exit(1);
+      }
   } else if (v && atoi(v)) {
     g_opt_native = atoi(v);
     int m = g_opt_native;
@@ -2820,12 +3035,14 @@ static int stat_layout_from_compiler = 0;
 /* The compiler bakes a bus width into every vector width it picks. Ours must match,
  * or the artifact was tuned for a machine this run is not modelling. */
 static void check_compiler_dq_bits(int cfg_bits) {
-  if (__pim_dq_bits && __pim_dq_bits != cfg_bits)
+  if (__pim_dq_bits && __pim_dq_bits != cfg_bits) {
     fprintf(stderr,
-            "[%s] WARN: bus-width disagreement. The compiler chose vector widths for "
-            "a %d-bit bus; this run models %d-bit. Vector accesses are priced against "
-            "a width the artifact never assumed.\n",
+            "[%s] ERROR: bus-width disagreement. The compiler chose vector widths for "
+            "a %d-bit bus; this run models %d-bit, so every word count would be priced "
+            "against a width the artifact never assumed.\n",
             "pim-runtime", (int)__pim_dq_bits, cfg_bits);
+    exit(1);
+  }
 }
 
 static void check_layout_rec_words(void) {
@@ -2843,6 +3060,14 @@ static void check_layout_rec_words(void) {
             emitted, PIM_LAYOUT_REC_WORDS);
     abort();
   }
+}
+
+/* The residency the compiler stamped on arg tid (__pim_opt_residency), -1 where none. */
+static int opt_res_of(int tid) {
+  for (int i = 0; i < (int)__pim_opt_residency_count && i < PIM_MAX_OPT_ROLES; i++)
+    if (__pim_opt_residency[2 * i] == tid)
+      return (int)__pim_opt_residency[2 * i + 1];
+  return -1;
 }
 
 static void apply_compiler_layout(int tensor_id) {
@@ -2902,6 +3127,15 @@ static void apply_compiler_layout(int tensor_id) {
       if (rows < 1) rows = 1;
       if (g_lane_row_top < 0)
         g_lane_row_top = cfg_num_sa * cfg_num_rows;
+      /* A drained tensor is read out within its step, and their codegen wraps a step's rows
+       * at the bank (simdram.cpp:29), so one too large for its slab rings the rows left. */
+      int ring = rows > g_lane_row_top && g_lane_row_top > 0 &&
+                 opt_res_of(tensor_id) == RES_DRAINED;
+      if (ring) {
+        fprintf(stderr, "[pim-runtime] tensor %d: drained, its lane slab of %d rows rings the "
+                        "%d rows left\n", tensor_id, rows, g_lane_row_top);
+        rows = g_lane_row_top;
+      }
       if (rows > g_lane_row_top) {
         fprintf(stderr, "[pim-runtime] WARN tensor %d: lane slab of %d rows does not fit "
                         "the %d rows left; placement stays on the interleaved map.\n",
@@ -2910,8 +3144,9 @@ static void apply_compiler_layout(int tensor_id) {
         g_lane_row_top -= rows;
         _t->lane_row_base = g_lane_row_top;
         _t->lane_row_count = rows;
-        _t->lane_slot = slot_map_create((size_t)per_lane / 2 + 1);
-        if (!_t->lane_slot) {
+        _t->lane_ring = ring;
+        _t->lane_slot = ring ? NULL : slot_map_create((size_t)per_lane / 2 + 1);
+        if (!ring && !_t->lane_slot) {
           _t->lane_row_base = -1;
           fprintf(stderr, "[pim-runtime] WARN tensor %d: slot map allocation failed; "
                           "placement stays on the interleaved map.\n", tensor_id);
@@ -2965,9 +3200,7 @@ static int pim_finish_register(void) {
     t->opt_lane_ext[i] = (int)__pim_opt_lane_ext[2 * i + 1];
     t->opt_lane_n = i + 1;
   }
-  for (int i = 0; i < (int)__pim_opt_residency_count && i < PIM_MAX_OPT_ROLES; i++)
-    if (__pim_opt_residency[2 * i] == tid)
-      t->opt_res = (int)__pim_opt_residency[2 * i + 1];
+  t->opt_res = opt_res_of(tid);
   return tid;
 }
 
@@ -2986,6 +3219,7 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   t->bank_replicated = -1;
   t->lane_row_base = -1;
   t->lane_row_count = 0;
+  t->lane_ring = 0;
   memset(t->lane_ord, 0, sizeof(t->lane_ord));
   t->opt_lane_rep = -1;
   t->opt_lane_n = 0;
@@ -3587,7 +3821,7 @@ static void pim_trace_access_emit(uint64_t base_addr, uint64_t size,
       pl.elem_idx = elem_idx;
       map_element(t, elem_idx, &pl.ch, &pl.pch, &pl.bg, &pl.bank, &pl.sa, &pl.row,
                   &pl.col);
-      if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
+      if (has_slab(t))
         place_in_lane_slab(t, &pl);
       int gb = compute_global_bank(pl.ch, pl.pch, pl.bg, pl.bank);
       uint64_t key = ((uint64_t)gb & 0xFFFFULL) |
