@@ -92,6 +92,10 @@ __attribute__((weak)) extern const int32_t __pim_dcc_acc_count;
 __attribute__((weak)) extern const int32_t __pim_dcc_grf_a[PIM_MAX_DCC_ACC];
 __attribute__((weak)) extern const int32_t __pim_dcc_grf_a_count;
 __attribute__((weak)) extern const int32_t __pim_dcc_decided;
+/* Stored arguments whose value is a map, in a module that also accumulates: their store is
+ * the result path, with no reset or write-back to charge, as a map module's every store. */
+__attribute__((weak)) extern const int32_t __pim_dcc_map[PIM_MAX_DCC_ACC];
+__attribute__((weak)) extern const int32_t __pim_dcc_map_count;
 
 /* DCC's MAC addressing (im_dcc_mac_addressing), [operand_arg, head stride, reduce stride,
  * reduce extent] per tensor in elements: the geometry their generator addresses a tile by. */
@@ -125,6 +129,8 @@ const int32_t __pim_dcc_acc_count = 0;
 const int32_t __pim_dcc_grf_a[PIM_MAX_DCC_ACC] = {0};
 const int32_t __pim_dcc_grf_a_count = 0;
 const int32_t __pim_dcc_decided = 0;
+const int32_t __pim_dcc_map[PIM_MAX_DCC_ACC] = {0};
+const int32_t __pim_dcc_map_count = 0;
 const int32_t __pim_dcc_mac_addr[4 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_mac_addr_count = 0;
 const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC] = {0};

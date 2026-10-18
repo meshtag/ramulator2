@@ -154,8 +154,9 @@ typedef struct {
    * surviving reads in the current dispatch. */
   int tile_mac_reads;
   uint64_t tile_ord, tile_disp;
-  /* __pim_dcc_acc: -1 when the compiler stated nothing for this tensor. */
-  int acc_reset, acc_wb;
+  /* __pim_dcc_acc: -1 when the compiler stated nothing for this tensor. dcc_map: listed in
+   * __pim_dcc_map, a map's store in a module that also accumulates. */
+  int acc_reset, acc_wb, dcc_map;
   /* __pim_dcc_mac_addr: head and reduce strides and the reduce extent, 0 when unstated;
    * addr_last is the previous kept tile's order key within addr_disp. */
   int64_t addr_head, addr_k, addr_kext, addr_last;
@@ -329,6 +330,33 @@ static void dcc_pick_grf_operand(void) {
 }
 static addr_dedup_state_t *g_dcc_staged = NULL;
 static uint64_t stat_dcc_staged = 0;
+
+/* The lane that wrote each element of a stored tensor this run, + 1 (0 none, -1 several).
+ * The writing lane reading it back reads its own bank, a bank read (PIM_RELU under the ReLU
+ * opcode, a MAC otherwise), not the accumulator path, which is for a value the kernel has
+ * not produced yet. */
+static int16_t *g_dcc_written[MAX_TENSORS];
+static uint64_t stat_dcc_rereads = 0, stat_dcc_reread_cross = 0;
+
+static void dcc_mark_written(const tensor_info_t *t, int64_t elem) {
+  int tid = (int)(t - tensors);
+  if (elem < 0 || elem >= t->num_elements) return;
+  if (!g_dcc_written[tid]) {
+    g_dcc_written[tid] = (int16_t *)calloc((size_t)t->num_elements, sizeof(int16_t));
+    if (!g_dcc_written[tid]) { fprintf(stderr, "[pim-runtime] ERROR: written map\n"); exit(1); }
+  }
+  int16_t w = (int16_t)(phys_lane() + 1), *p = &g_dcc_written[tid][elem];
+  *p = *p == 0 || *p == w ? w : -1;
+}
+
+/* 1 this lane wrote elem, 0 nothing wrote it, -1 another lane did. */
+static int dcc_reread(const tensor_info_t *t, int64_t elem) {
+  int tid = (int)(t - tensors);
+  if (t->role != PIM_ROLE_ACCUMULATOR || !g_dcc_written[tid] || elem < 0 ||
+      elem >= t->num_elements || !g_dcc_written[tid][elem])
+    return 0;
+  return g_dcc_written[tid][elem] == phys_lane() + 1 ? 1 : -1;
+}
 
 void pim_dcc_mark_activation(int tensor_id) {
   if (tensor_id >= 0 && tensor_id < MAX_TENSORS)
@@ -1296,13 +1324,17 @@ static int map_rec_cmp(const void *a, const void *b) {
 }
 
 static void map_grf_b_check(void) {
-  if (!(__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0) || !g_rec_n) return;
+  int all = __pim_acc_cells_per_lane == 0, any = all;
+  for (int i = 0; i < num_tensors && !any; i++) any = tensors[i].dcc_map;
+  if (!(__pim_layout_count > 0 && any) || !g_rec_n) return;
   uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
   const dcc_rec_t **v = (const dcc_rec_t **)malloc(g_rec_n * sizeof *v);
   if (!v) { fprintf(stderr, "[pim-runtime] ERROR: map GRF_B check alloc\n"); exit(1); }
   size_t n = 0;
   for (size_t q = 0; q < g_rec_n; q++)
-    if (g_recs[q].phase == DP_OUT) v[n++] = &g_recs[q];
+    if (g_recs[q].phase == DP_OUT &&
+        (all || (g_recs[q].tid >= 0 && tensors[g_recs[q].tid].dcc_map)))
+      v[n++] = &g_recs[q];
   qsort(v, n, sizeof *v, map_rec_cmp);
   int most = 0, cur = 0;
   for (size_t q = 0; q < n; q++) {
@@ -1470,7 +1502,7 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
       pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
       dcc_swap_res(t_emit, &l, &reset_at, &wb_at, &out_at);
     }
-    if (__pim_layout_count > 0 && __pim_acc_cells_per_lane == 0 &&
+    if (__pim_layout_count > 0 && (__pim_acc_cells_per_lane == 0 || t_emit->dcc_map) &&
         !((g_dcc_native & NAT_ACC) && t_emit->acc_wb > 0)) {
       stat_dcc_free_acc_ops += 2;
     } else {
@@ -1713,12 +1745,30 @@ static void emit_access_by_role_phase(tensor_info_t *t,
        * Our W count equals DCC's PIM_LD_OP1 count exactly. */
       break;
     }
-    case PIM_ROLE_ACCUMULATOR:
+    case PIM_ROLE_ACCUMULATOR: {
+      int rr = dcc_reread(t, loc->elem_idx);
+      if (rr < 0 && g_dcc_native) {
+        /* DCC reads no other bank's result, so no native stream has this read. */
+        fprintf(stderr, "[pim-runtime] ERROR: lane %d reads element %lld of tensor %d, "
+                        "which another lane wrote\n", phys_lane(), (long long)loc->elem_idx,
+                (int)(t - tensors));
+        exit(1);
+      }
+      stat_dcc_reread_cross += rr < 0;
+      if (rr > 0) {
+        emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
+                   loc->row, loc->col);
+        stat_bank_reads++;
+        stat_dcc_rereads++;
+        t->emitted_br++;
+        break;
+      }
       emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                  loc->row, loc->col);
       stat_reads++;
       t->emitted_r++;
       break;
+    }
     }
   } else {
     if (t->role == PIM_ROLE_ACCUMULATOR) {
@@ -1796,7 +1846,8 @@ static void ec_note(const tensor_info_t *t, const pim_phys_loc_t *loc, int is_wr
   } else if (t->role == PIM_ROLE_OPERAND) {
     ec_push(EC_W, phys_lane(), tid, lrow, loc->col, 0, 0, 0);
   } else {
-    ec_push(t->role == PIM_ROLE_STREAMED ? EC_BR : EC_R, loc->ch, tid, lrow, loc->col, 0, d, o);
+    ec_push(t->role == PIM_ROLE_STREAMED || dcc_reread(t, loc->elem_idx) > 0 ? EC_BR : EC_R,
+            loc->ch, tid, lrow, loc->col, 0, d, o);
   }
 }
 
@@ -1872,7 +1923,7 @@ static void emit_check(void) {
       break;
     case EC_BW:
       ec_slot(EO_ST, cb, lrow, col)->exp += distinct;
-      if (!map) {
+      if (!map && !tensors[tid].dcc_map) {
         ec_slot(EO_RESET, cb, lrow, col)->exp += distinct;
         ec_slot(EO_WB, cb, lrow, col)->exp += distinct;
       }
@@ -2116,6 +2167,8 @@ void pim_init(const char *trace_file) {
   g_cur_op = 0;
   if (g_dcc_staged) { addr_dedup_destroy(g_dcc_staged); g_dcc_staged = NULL; }
   stat_dcc_staged = stat_dcc_free_acc_ops = 0;
+  for (int i = 0; i < MAX_TENSORS; i++) { free(g_dcc_written[i]); g_dcc_written[i] = NULL; }
+  stat_dcc_rereads = stat_dcc_reread_cross = 0;
   stat_coalesce_overflow = 0;
 
   /* 136 entries per bank is only the starting size. The table grows on demand, so it
@@ -2209,12 +2262,16 @@ static void apply_mac_first(int tensor_id) {
 static void apply_dcc_acc(int tensor_id) {
   tensor_info_t *t = &tensors[tensor_id];
   t->acc_reset = t->acc_wb = -1;
+  t->dcc_map = 0;
   int n = __pim_dcc_decided ? (int)__pim_dcc_acc_count : 0;
   for (int i = 0; i < n && i < PIM_MAX_DCC_ACC; i++)
     if (__pim_dcc_acc[3 * i] == tensor_id) {
       t->acc_reset = __pim_dcc_acc[3 * i + 1];
       t->acc_wb = __pim_dcc_acc[3 * i + 2];
     }
+  int m = __pim_dcc_decided ? (int)__pim_dcc_map_count : 0;
+  for (int i = 0; i < m && i < PIM_MAX_DCC_ACC; i++)
+    t->dcc_map |= __pim_dcc_map[i] == tensor_id;
 }
 
 int pim_dcc_acc_decided(void) { return __pim_dcc_decided; }
@@ -2699,6 +2756,9 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     }
   }
   ec_note(t, &loc, is_write);
+  /* Before the collapse, which folds a store's bank replicas, so every written element is
+   * recorded. */
+  if (is_acc_store) dcc_mark_written(t, loc.elem_idx);
   if (g_lockstep_collapse && !is_operand_load) {
     /* Compute and streamed reads are group-level and span the CHANNEL (DCC's group).
      * The accumulator is bank-level in DCC's model, so it keeps the bank in its key --
@@ -2905,6 +2965,8 @@ void __pim_trace_op(int32_t op) { g_cur_op = op; }
 
 /* Fold commands emitted, so a harness can say which kernels owe one. */
 uint64_t pim_dcc_fold_cmds(void) { return stat_fold_cmds; }
+uint64_t pim_dcc_rereads(void) { return stat_dcc_rereads; }
+uint64_t pim_dcc_reread_cross(void) { return stat_dcc_reread_cross; }
 
 void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes) {
   if (!trace_fp)
