@@ -484,11 +484,11 @@ static void barrier_block(FILE *f) {
  * command that their model rejects.
  *
  * Commands are therefore bucketed at emission and flushed in their order: staging, then
- * one round per GRF block of (reset, operand load, MAC, write-back) with no barrier
- * between rounds, then every output store. That is their generator's structure, and
+ * one round per GRF block of (reset, operand load, MAC, register ReLU, write-back) with no
+ * barrier between rounds, then every output store. That is their generator's structure, and
  * within a phase their nesting too, position outer and bank inner. Any levers-on number
  * must be reported against this same baseline or the delta is not attributable. */
-enum { DP_STAGE = 0, DP_RESET, DP_LDOP, DP_MAC, DP_WB, DP_OUT };
+enum { DP_STAGE = 0, DP_RESET, DP_LDOP, DP_MAC, DP_RRELU, DP_WB, DP_OUT };
 static char  *stage_buf;
 static size_t stage_len, stage_cap;
 
@@ -635,7 +635,11 @@ static dcc_rec_t *g_recs = NULL;
 static size_t g_rec_n = 0, g_rec_cap = 0;
 
 static uint64_t g_last_mac = 0;       /* a fold step issues at the open row of the last MAC */
-static int32_t g_cur_op = 0;          /* im-relu-opcode: 1 while a ReLU-only load issues */
+static int32_t g_cur_op = 0;          /* im-relu-opcode: 1 while a ReLU-only load issues, 2
+                                       * while a store of a register ReLU does */
+/* As emitted, a register ReLU is one MOV per lockstep group and column, as a MAC is. */
+static addr_dedup_state_t *g_rrelu_seen = NULL;
+static uint64_t stat_reg_relu = 0;
 static uint64_t stat_fold_cmds = 0;  /* fold commands emitted after the collapse */
 
 static void dp_record_at(int phase, const char *op, uint64_t addr, uint64_t at) {
@@ -821,11 +825,13 @@ static int rec_cmp(const void *a, const void *b) {
  * as their RED sizes it from the input, walking away from the input in allocation order,
  * which mirrors their addresses, under row-pack placement only. SWAP, on top of ADDR, puts
  * the GEMV vector and result where their swapped call does from ADDR's MAC base (dcc_swap_*).
+ * MADDR issues a map's or a reduction's every command at the address their VA, RELU and RED
+ * generators give it (maddr_*).
  * A convention the runtime cannot apply is counted rather than fatal, so an in-process
  * harness survives and the reading refuses the stream. NAT_ALL leaves out bit 8, the
  * retired HOIST bit, so a mask carrying it is refused. */
 enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_RET = 64,
-       NAT_GPOS = 128, NAT_SWAP = 256, NAT_ALL = 503 };
+       NAT_GPOS = 128, NAT_SWAP = 256, NAT_MADDR = 512, NAT_ALL = 1015 };
 static int g_dcc_native = 0;
 static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed = 0;
 static uint64_t stat_tile_issued = 0;
@@ -981,6 +987,65 @@ static int dcc_swap_res(const tensor_info_t *t, const pim_phys_loc_t *loc, uint6
   return 1;
 }
 
+/* MADDR: their VA, RELU and RED generators lay each tensor's core slab from offset 0 of the
+ * bank in argument order (gen_trace_HBMPIM_VA.py:186-188, gen_trace_HBMPIM_RED.py:169-170),
+ * stage and return it a column at a time (VA :111-117, :136-140), and address every PIM
+ * command two bytes a column from the iteration's first value (VA :99-108), a convention of
+ * their trace as ADDR's is. RED's four in-register steps sit at the slab's first bytes and its
+ * partial at the iteration's first value of the result (RED :86-97). Row-pack placement only,
+ * on a kernel with no GEMV tile. */
+static int g_maddr = -1;  /* -1 undecided this kernel, 0 off, 1 on */
+static long g_maddr_base[MAX_TENSORS];
+static uint64_t g_ms_disp[MAX_TENSORS][MAX_BANKS];
+static long g_ms_first[MAX_TENSORS][MAX_BANKS];
+static long g_ms_in[MAX_BANKS];  /* the latest input slice's first column, per bank */
+static int g_last_mac_tid = -1;
+static pim_phys_loc_t g_last_mac_loc;
+
+static int maddr_on(void) {
+  if (g_maddr >= 0) return g_maddr;
+  g_maddr = 0;
+  if (!(g_dcc_native & NAT_MADDR) || cfg_place_align != PIM_ALIGN_ROW_PACK) return 0;
+  long base = 0;
+  for (int i = 0; i < num_tensors; i++) {
+    if (tensors[i].addr_head > 0 || tensors[i].pack_base_col < 0) return 0;
+    g_maddr_base[i] = base;
+    base += tensors[i].pack_cols;
+  }
+  return g_maddr = 1;
+}
+
+static int maddr_bank(const pim_phys_loc_t *loc) {
+  return (int)(dcc_addr(loc->ch, loc->pch, loc->bg, loc->bank, 0, 0, 0) / bank_bytes());
+}
+
+/* The column of tensor t's share `loc` holds, or -1 off it, which the reading refuses. */
+static long maddr_col(const tensor_info_t *t, const pim_phys_loc_t *loc) {
+  long c = dcc_lane_col(loc) - t->pack_base_col;
+  if (c < 0 || c >= t->pack_cols) {
+    stat_addr_unmapped++;
+    return -1;
+  }
+  stat_addr_mapped++;
+  return c;
+}
+
+static uint64_t maddr_at(const pim_phys_loc_t *loc, int tid, long byte) {
+  return dcc_swap_at(loc, g_maddr_base[tid] + byte / DCC_COL_BYTES, (int)(byte % DCC_COL_BYTES));
+}
+
+/* A PIM command's byte in tensor tid's slab, two a column from the slice's first value. A
+ * program walks its slice in order, so its first command opens the slice. */
+static long maddr_pim_byte(int tid, const tensor_info_t *t, int gb, long c) {
+  uint64_t d = cur_dispatch + 1;
+  if (g_ms_disp[tid][gb] != d) {
+    g_ms_disp[tid][gb] = d;
+    g_ms_first[tid][gb] = c;
+  }
+  long first = g_ms_first[tid][gb], vpc = t->values_per_col > 0 ? t->values_per_col : 16;
+  return 2 * (first * vpc + (c - first));
+}
+
 /* TILE: a stamped tensor issues one MAC per tile of surviving column reads. The reads it
  * absorbs still resolve, place, stage and count for coverage, so no later address moves.
  * A dispatch that ends mid-tile is refused: a DCC MAC cannot span one. */
@@ -1131,16 +1196,18 @@ static void nat_print(seg_buf_t *out, uint64_t key, const dcc_rec_t *r, int wave
     if (fold_covered(gb, n, r->dispatch)) { stat_fold_reset_dropped++; return; }
     stat_fold_reset_kept++;
   }
-  if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || r->phase == DP_WB)) {
+  /* A register ReLU goes where its write-back goes. */
+  int wb = r->phase == DP_WB || r->phase == DP_RRELU;
+  if ((g_dcc_native & NAT_ACC) && (r->phase == DP_RESET || wb)) {
     const tensor_info_t *t = r->tid >= 0 && r->tid < num_tensors ? &tensors[r->tid] : NULL;
     if (!t || t->acc_wb < 0) {  /* no convention stated: kept, counted, and refused */
-      stat_acc_unstated++;
+      stat_acc_unstated += r->phase != DP_RRELU;
       if (wave >= 0 && (gb & 1) != wave) return;
       seg_push(out, key, r->op, r->at);
       return;
     }
     if (r->phase == DP_RESET && t->acc_reset == 0) return;
-    if (r->phase == DP_WB && t->acc_wb == 2 && !dcc_addressed(gb)) return;
+    if (wb && t->acc_wb == 2 && !dcc_addressed(gb)) return;
   }
   if (wave >= 0 && (gb & 1) != wave) return;
   seg_push(out, key, r->op, r->at);
@@ -1301,9 +1368,13 @@ static void dcc_return_stage(void) {
         if (!stored[gb]) continue;
         int ch, pch, bg, bank;
         decompose_global_bank(gb, &ch, &pch, &bg, &bank);
-        fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)dcc_addr(
-                    ch, pch, bg, bank, linear_row / cfg_num_rows, linear_row % cfg_num_rows,
-                    (int)(lc % cpr)));
+        uint64_t at = dcc_addr(ch, pch, bg, bank, linear_row / cfg_num_rows,
+                               linear_row % cfg_num_rows, (int)(lc % cpr));
+        if (maddr_on()) {
+          pim_phys_loc_t l = {0, ch, pch, bg, bank, 0, 0, 0};
+          at = maddr_at(&l, t, (long)p * DCC_COL_BYTES);
+        }
+        fprintf(trace_fp, "ST 0x%08llx\n", (unsigned long long)at);
       }
     }
   }
@@ -1465,7 +1536,13 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
         for (int gb = ch * nb; gb < ch * nb + group_lanes(); gb++) {
           int c2, p2, g2, b2;
           decompose_global_bank(gb, &c2, &p2, &g2, &b2);
-          stage_record(tid, pos, gb, dcc_addr(c2, p2, g2, b2, sa, row, col));
+          uint64_t at = dcc_addr(c2, p2, g2, b2, sa, row, col);
+          if (maddr_on()) {
+            pim_phys_loc_t l = {g_emit_elem, c2, p2, g2, b2, sa, row, col};
+            long c = maddr_col(t_emit, &l);
+            if (c >= 0) at = maddr_at(&l, tid, c * DCC_COL_BYTES);
+          }
+          stage_record(tid, pos, gb, at);
           stat_dcc_staged++;
         }
       }
@@ -1475,6 +1552,18 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
         uint64_t their = dcc_mac_addr((tensor_info_t *)t_emit, g_emit_elem, ch, pch, bg,
                                       bank);
         if (their) a = their;
+      }
+      if (maddr_on()) {
+        int tid = (int)(t_emit - tensors);
+        pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
+        long c = maddr_col(t_emit, &l);
+        if (c >= 0) {
+          int gb = maddr_bank(&l);
+          a = maddr_at(&l, tid, maddr_pim_byte(tid, t_emit, gb, c));
+          g_ms_in[gb] = g_ms_first[tid][gb];
+          g_last_mac_tid = tid;
+          g_last_mac_loc = l;
+        }
       }
       dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU"
                         : fold_mul((tensor_info_t *)t_emit, g_emit_elem, ch) ? OP_MUL
@@ -1501,6 +1590,32 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
     if (g_dcc_native & NAT_SWAP) {
       pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
       dcc_swap_res(t_emit, &l, &reset_at, &wb_at, &out_at);
+    }
+    if (maddr_on()) {
+      /* A map writes its own slice back. A reduction's partial lands at the first value of
+       * the slice it summed. */
+      int tid = (int)(t_emit - tensors);
+      pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
+      long c = maddr_col(t_emit, &l);
+      if (c >= 0) {
+        int gb = maddr_bank(&l);
+        out_at = maddr_at(&l, tid, c * DCC_COL_BYTES);
+        int map = __pim_acc_cells_per_lane == 0 || t_emit->dcc_map;
+        wb_at = maddr_at(&l, tid, map ? maddr_pim_byte(tid, t_emit, gb, c)
+                                      : 2 * 16 * g_ms_in[gb]);
+      }
+    }
+    /* A stored register ReLU is a GRF->GRF MOV(ReLU) at the column of the register it
+     * moves, the write-back's, on every bank the write-back reaches (nat_print). */
+    if (g_cur_op == 2) {
+      uint64_t lrow = (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
+      uint64_t h = lockstep_key(channel_ns(t_emit, ch, 1), cur_dispatch, g_access_ord, lrow,
+                                (uint64_t)col);
+      if (!g_rrelu_seen) g_rrelu_seen = addr_dedup_create(4096);
+      if (g_dcc_native || addr_dedup_check_and_mark(g_rrelu_seen, h, h >> 16, h >> 48)) {
+        dp_record_at(DP_RRELU, "PIM_RELU", a, wb_at);
+        stat_reg_relu++;
+      }
     }
     if (__pim_layout_count > 0 && (__pim_acc_cells_per_lane == 0 || t_emit->dcc_map) &&
         !((g_dcc_native & NAT_ACC) && t_emit->acc_wb > 0)) {
@@ -1797,7 +1912,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
  * the commands it implies are recounted exactly under the lockstep model, and the closed trace
  * is read back against them. A native stream carries DCC's conventions and is checked against
  * their trace instead (dcc_convention.native_reading). */
-enum { EC_BR = 1, EC_R, EC_BW, EC_GRF, EC_W, EC_FOLD };
+enum { EC_BR = 1, EC_R, EC_BW, EC_GRF, EC_W, EC_FOLD, EC_RR };
 enum { EO_ST = 1, EO_LD, EO_LDOP, EO_C, EO_RESET, EO_WB, EO_N };
 static const char *const EO_NAME[EO_N] = {"", "ST", "LD", "PIM_LD_OP1", "compute", "PIM_ACC_RESET",
                                           "PIM_WB_ACC"};
@@ -1841,6 +1956,9 @@ static void ec_note(const tensor_info_t *t, const pim_phys_loc_t *loc, int is_wr
   uint64_t d = cur_dispatch, o = g_access_ord;
   if (is_write) {
     if (t->role == PIM_ROLE_ACCUMULATOR) ec_push(EC_BW, gb, tid, lrow, loc->col, 0, d, o);
+    /* A register ReLU's MOV, one per lockstep group as a MAC is. */
+    if (t->role == PIM_ROLE_ACCUMULATOR && g_cur_op == 2)
+      ec_push(EC_RR, loc->ch, tid, lrow, loc->col, 0, d, o);
   } else if (t->role != PIM_ROLE_ACCUMULATOR && g_dcc_grf_operand[tid]) {
     ec_push(EC_GRF, gb, tid, lrow, loc->col, 0, 0, 0);
   } else if (t->role == PIM_ROLE_OPERAND) {
@@ -1937,6 +2055,9 @@ static void emit_check(void) {
     case EC_FOLD:
       fold += distinct;
       break;
+    case EC_RR:
+      ec_slot(EO_C, cb, lrow, col)->exp += distinct;
+      break;
     }
     i = j;
   }
@@ -2030,7 +2151,8 @@ static void emit_check(void) {
 }
 
 /* Each tensor's column share per bank, so a harness can tell a fused kernel's commands apart
- * by the tensor they touch. SWAP moves the GEMV vector and result off their shares. */
+ * by the tensor they touch. SWAP moves the GEMV vector and result off their shares. MADDR
+ * addresses a tensor from its own base, so the as-emitted stream keeps emitted_base_col. */
 static void layout_sidecar(void) {
   char side[sizeof g_trace_path + 32];
   snprintf(side, sizeof side, "%s.layout.json", g_trace_path);
@@ -2040,9 +2162,10 @@ static void layout_sidecar(void) {
           DCC_ROWS_PER_BANK);
   for (int i = 0; i < num_tensors; i++) {
     const tensor_info_t *t = &tensors[i];
-    fprintf(js, "%s{\"tid\": %d, \"role\": %d, \"base_col\": %ld, \"cols\": %d, "
-                "\"activation\": %d, \"grf\": %d, \"elements\": %d}", i ? ", " : "", i,
-            (int)t->role, t->pack_base_col, t->pack_cols, (int)g_dcc_activation[i],
+    fprintf(js, "%s{\"tid\": %d, \"role\": %d, \"base_col\": %ld, \"emitted_base_col\": %ld, "
+                "\"cols\": %d, \"activation\": %d, \"grf\": %d, \"elements\": %d}",
+            i ? ", " : "", i, (int)t->role, maddr_on() ? g_maddr_base[i] : t->pack_base_col,
+            (long)t->pack_base_col, t->pack_cols, (int)g_dcc_activation[i],
             (int)g_dcc_grf_operand[i], t->num_elements);
   }
   fprintf(js, "]}\n");
@@ -2128,6 +2251,9 @@ void pim_init(const char *trace_file) {
   free(g_fold_keys);
   g_fold_keys = NULL;
   g_fold_nkeys = 0;
+  g_maddr = -1;
+  g_last_mac_tid = -1;
+  memset(g_ms_disp, 0, sizeof g_ms_disp);
   {
     const char *nat = getenv("PIM_DCC_NATIVE");
     if (nat && *nat) {
@@ -2135,7 +2261,8 @@ void pim_init(const char *trace_file) {
       if ((g_dcc_native & ~NAT_ALL) ||
           ((g_dcc_native & (NAT_WAVE | NAT_GPOS)) && !(g_dcc_native & NAT_FAN)) ||
           ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE)) ||
-          ((g_dcc_native & NAT_SWAP) && !(g_dcc_native & NAT_ADDR))) {
+          ((g_dcc_native & NAT_SWAP) && !(g_dcc_native & NAT_ADDR)) ||
+          ((g_dcc_native & NAT_MADDR) && (g_dcc_native & (NAT_ADDR | NAT_TILE)))) {
         fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
                         "trace format\n", nat);
         exit(1);
@@ -2166,6 +2293,8 @@ void pim_init(const char *trace_file) {
   g_last_mac = 0;
   g_cur_op = 0;
   if (g_dcc_staged) { addr_dedup_destroy(g_dcc_staged); g_dcc_staged = NULL; }
+  if (g_rrelu_seen) { addr_dedup_destroy(g_rrelu_seen); g_rrelu_seen = NULL; }
+  stat_reg_relu = 0;
   stat_dcc_staged = stat_dcc_free_acc_ops = 0;
   for (int i = 0; i < MAX_TENSORS; i++) { free(g_dcc_written[i]); g_dcc_written[i] = NULL; }
   stat_dcc_rereads = stat_dcc_reread_cross = 0;
@@ -2610,8 +2739,9 @@ void pim_finalize(void) {
   fprintf(stderr,
           "[pim-runtime]   DCC activation staging commands : %" PRIu64 "\n"
           "[pim-runtime]   DCC zero-cost acc ops omitted   : %" PRIu64 "\n"
-          "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 "\n",
-          stat_dcc_staged, stat_dcc_free_acc_ops, stat_lockstep_skips);
+          "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 "\n"
+          "[pim-runtime]   Register ReLU MOVs recorded     : %" PRIu64 "\n",
+          stat_dcc_staged, stat_dcc_free_acc_ops, stat_lockstep_skips, stat_reg_relu);
   fprintf(stderr,
           "[pim-runtime]   GRF_A operand loads / refetches : %" PRIu64 " / %" PRIu64 "\n"
           "[pim-runtime]   GRF_A reloads within one dispatch: %" PRIu64 " (charged)\n"
@@ -2954,7 +3084,10 @@ void __pim_trace_fold(int64_t steps, int64_t outputs) {
         if (!addr_dedup_check_and_mark(g_lockstep_collapse, h, h >> 16, h >> 48))
           continue;
       }
-      dp_record(DP_MAC, "PIM_MAC_OP1", g_last_mac);
+      uint64_t at = g_last_mac;
+      if (maddr_on() && g_last_mac_tid >= 0)
+        at = maddr_at(&g_last_mac_loc, g_last_mac_tid, 2 * k);
+      dp_record(DP_MAC, "PIM_MAC_OP1", at);
       stat_fold_cmds++;
     }
 }
@@ -2965,6 +3098,7 @@ void __pim_trace_op(int32_t op) { g_cur_op = op; }
 
 /* Fold commands emitted, so a harness can say which kernels owe one. */
 uint64_t pim_dcc_fold_cmds(void) { return stat_fold_cmds; }
+uint64_t pim_dcc_reg_relu(void) { return stat_reg_relu; }
 uint64_t pim_dcc_rereads(void) { return stat_dcc_rereads; }
 uint64_t pim_dcc_reread_cross(void) { return stat_dcc_reread_cross; }
 
