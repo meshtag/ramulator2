@@ -36,7 +36,9 @@
  *
  * Accumulator read-out is emitted once per (lane, cell): a loop-carried value is
  * resident in its own bank after the first touch, and the slot's marker bit says so.
- * That is residency the compiler states, not an address-collapse heuristic.
+ * That is residency the compiler states, not an address-collapse heuristic. A cell
+ * never loaded is read out at its store, with every partial sum a split-K reduce
+ * combined, since the host does that sum (simdram_read_out_cell).
  *
  * Note: this differs from OptiPIM's SimDRAMCodeGen, which emits a
  * single fixed-length block of 7*pe_bits^2+1 BR ops per output cell
@@ -141,6 +143,10 @@ typedef struct {
    * this covers only the sharing that never reaches memory, such as matmul's b[k,n] being
    * multiplied into every row of the tile. 1 until the artifact says otherwise. */
   int cell_fanout;
+  /* Partial sums a store's cell combined, from the compiler's LIVE_SPLIT word: SPLIT_K on
+   * a split-K store, 1 on every other. The host reads all of them out. */
+  int live_split;
+  slot_map_t *readout_cols; /* (lane, partial column) already read out */
 
   /* Per-tensor DRAM-opcode counters. Each emission in the trace file is
    * attributed to exactly one tensor by the call site (compute_trace BRs
@@ -781,6 +787,8 @@ static void simdram_check_compiler_role(int tensor_id, simdram_role_t host_role)
     tensors[tensor_id].bank_replicated = (int)br;
     int32_t cf = rec[PIM_LW_CELL_FANOUT];
     tensors[tensor_id].cell_fanout = cf > 0 ? (int)cf : 1;
+    int32_t ls = rec[PIM_LW_LIVE_SPLIT];
+    tensors[tensor_id].live_split = ls > 0 ? (int)ls : 1;
     /* THE ROLE IS THE COMPILER'S, same rule as pim_runtime.c: is_store -> ACCUMULATOR,
      * replicated -> OPERAND (pre-stored, free, symmetric with simdram.cpp's weight),
      * partitioned -> STREAMED. The host string is checked, not obeyed. This used to
@@ -823,6 +831,7 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   t->elem_size = elem_size;
   t->role = role;
   t->cell_fanout = 1;
+  t->live_split = 1;
   t->emitted_R = t->emitted_W = 0;
   t->emitted_BR = 0;
   t->dedup_skips = 0;
@@ -844,6 +853,7 @@ int simdram_register_tensor(void *ptr, const int *dims, int ndims,
   memset(t->lane_ord, 0, sizeof(t->lane_ord));
   memset(t->lane_flushed, 0, sizeof(t->lane_flushed));
   if (t->lane_slot) { slot_map_destroy(t->lane_slot); t->lane_slot = NULL; }
+  if (t->readout_cols) { slot_map_destroy(t->readout_cols); t->readout_cols = NULL; }
   /* After num_elements and the fields above: the check stores the compiler's
    * partition bit and sizes the per-lane slab from the element count. */
   simdram_check_compiler_role(num_tensors, role);
@@ -1119,6 +1129,44 @@ static void note_epoch_change(void) {
   g_last_epoch = e;
 }
 
+/* The host reads out every partial sum it combines, as OptiPIM's codegen reads the
+ * output's partials (simdram.cpp:39-43): pe_bits bit-rows per DRAM column, so values
+ * sharing a column share its reads. SIMDRAM cannot add across bitlines (SIMDRAM, Sec.
+ * 5.6), so a split-K cell sends all live_split partials, packed after the cell's slot.
+ * A cell is read out once, here or at its first load (the slot's bit 30). */
+static void simdram_read_out_cell(tensor_info_t *t, int elem_idx) {
+  int lane = __pim_get_bank_id();
+  if (!t->lane_slot || slot_map_test_and_set(t->lane_slot, lane, elem_idx, 30) != 0)
+    return;
+  int32_t slot = slot_map_peek(t->lane_slot, lane, elem_idx);
+  if (slot < 0)
+    return;
+  if (!t->readout_cols)
+    t->readout_cols = slot_map_create(64);
+  if (!t->readout_cols)
+    return;
+  int64_t s = t->live_split > 0 ? t->live_split : 1;
+  int64_t first = (int64_t)slot * s / cfg_dq_bits;
+  int64_t last = ((int64_t)slot * s + s - 1) / cfg_dq_bits;
+  int ch, pch, bg, bank;
+  decompose_global_bank(lane, &ch, &pch, &bg, &bank);
+  for (int64_t c = first; c <= last; c++) {
+    int inserted = 0;
+    if (slot_map_get_or_put(t->readout_cols, lane, (int)c, 0, &inserted) < 0 || !inserted)
+      continue;
+    int rgp = lane_rg_for(t, (int)(c / cfg_num_cols));
+    if (rgp < 0)
+      return;
+    int linear_row = rgp * cfg_pe_bits;
+    int sa = linear_row / cfg_data_rows_per_sa;
+    int base_row = linear_row % cfg_data_rows_per_sa;
+    for (int bit = 0; bit < cfg_pe_bits; bit++) {
+      emit_trace("R", ch, pch, bg, bank, sa, base_row + bit, (int)(c % cfg_num_cols));
+      stat_reads++; t->emitted_R++;
+    }
+  }
+}
+
 static void simdram_trace_access(uint64_t addr, int is_write) {
   if (cur_phase == SIMDRAM_PHASE_IDLE) {
     stat_ignored++;
@@ -1204,7 +1252,10 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
     } else {
       /* ACCUMULATOR store. SIMDRAM keeps results in-subarray after MAJ;
        * a store doesn't emit. We just track the location so that the
-       * downstream __compute_trace knows where the accumulator lives. */
+       * downstream __compute_trace knows where the accumulator lives. The result
+       * goes to the host from here, so its partials are read out. */
+      if (t->role == SIMDRAM_ROLE_ACCUMULATOR)
+        simdram_read_out_cell(t, elem_idx);
       if (t->role == SIMDRAM_ROLE_ACCUMULATOR && t->acc_tracker_idx >= 0) {
         acc_tracker_t *at = &acc_trackers[t->acc_tracker_idx];
         at->ch = ch; at->pch = pch; at->bg = bg; at->bank = bank;
