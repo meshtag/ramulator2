@@ -12,12 +12,14 @@ namespace Ramulator {
 struct Request { 
   Addr_t    addr = -1;
   AddrVec_t addr_vec {};
-  std::string op;
 
   // Basic request id convention
   // 0 = Read, 1 = Write. The device spec defines all others
   struct Type {
-    enum : int { Read = 0, Write, Compute, SARead, SAWrite, BKRead, BKWrite };
+    enum : int {
+      Read = 0, 
+      Write,
+    };
   };
 
   int type_id = -1;    // An identifier for the type of the request
@@ -38,7 +40,6 @@ struct Request {
 
   Request(Addr_t addr, int type);
   Request(AddrVec_t addr_vec, int type);
-  Request(AddrVec_t addr_vec, std::string opstr);
   Request(Addr_t addr, int type, int source_id, std::function<void(Request&)> callback);
 };
 

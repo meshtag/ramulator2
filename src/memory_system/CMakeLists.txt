@@ -8,7 +8,6 @@ target_sources(
   impl/bh_DRAM_system.cpp
   impl/dummy_memory_system.cpp
   impl/generic_DRAM_system.cpp
-  impl/pim_DRAM_system.cpp
 )
 
 target_link_libraries(
