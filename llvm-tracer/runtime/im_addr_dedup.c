@@ -2,21 +2,18 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 typedef struct {
   uint64_t key;
-  uint32_t epoch;
+  uint32_t epoch; /* cur_epoch once claimed, 0 empty */
 } dedup_slot_t;
 
 struct addr_dedup_state {
   dedup_slot_t *slots;
   int capacity;       /* power of two */
   int mask;           /* capacity - 1 */
-  uint32_t cur_epoch; /* 0 reserved as "empty"/uninitialized */
-  uint64_t hits;
-  int live;           /* slots claimed at cur_epoch */
-  uint64_t grows;     /* doublings; a nonzero value means the create() hint was low */
+  uint32_t cur_epoch; /* always 1, this tree has no reset, so epoch is an occupied flag */
+  int live;           /* slots claimed */
   uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
 
@@ -58,16 +55,14 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
   }
   s->capacity = capacity;
   s->mask = capacity - 1;
-  s->cur_epoch = 1; /* epoch 0 reserved as "empty" */
-  s->hits = 0;
+  s->cur_epoch = 1; /* epoch 0 is an empty slot */
   s->live = 0;
-  s->grows = 0;
   s->saturations = 0;
   return s;
 }
 
-/* Double the table, rehashing only the entries live at cur_epoch (older epochs are
- * logically empty). Returns 0 if the allocation fails, leaving the table untouched.
+/* Double the table, rehashing the claimed entries. Returns 0 if the allocation fails,
+ * leaving the table untouched.
  *
  * WHY THIS EXISTS: the capacity used to be fixed at create() from a caller hint, and
  * a full table falls back to "treat as new". The lockstep hint was sized to the PE
@@ -97,7 +92,6 @@ static int addr_dedup_grow(addr_dedup_state_t *s) {
   s->slots = ns;
   s->capacity = newcap;
   s->mask = newmask;
-  s->grows++;
   return 1;
 }
 
@@ -113,22 +107,16 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
   for (int probe = 0; probe < s->capacity; probe++) {
     dedup_slot_t *slot = &s->slots[idx];
     if (slot->epoch == s->cur_epoch) {
-      if (slot->key == key) {
-        s->hits++;
-        return 0; /* already seen this epoch */
-      }
-      /* live collision — keep probing */
+      if (slot->key == key)
+        return 0; /* already seen */
+      /* another key holds it, keep probing */
     } else {
-      /* empty or stale slot — claim it, growing first if we are at the load target */
+      /* empty slot, claim it, growing first if we are at the load target */
       if (s->live + 1 > s->capacity / 2 && addr_dedup_grow(s)) {
         idx = (int)(h & (uint64_t)s->mask);
         for (;;) {
           dedup_slot_t *g = &s->slots[idx];
           if (g->epoch == s->cur_epoch) {
-            if (g->key == key) { /* cannot happen: we probed to a free slot */
-              s->hits++;
-              return 0;
-            }
             idx = (idx + 1) & s->mask;
             continue;
           }
@@ -147,34 +135,14 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
   }
 
   /* No room and growth failed (allocation refused). Fall back to "new": over-emit,
-   * never under-emit. Counted, and both runtimes print the count, because a silent
+   * never under-emit. Counted, and pim_runtime prints the count, because a silent
    * fallback here reads as a faithful trace while the collapse has stopped working. */
   s->saturations++;
   return 1;
 }
 
-void addr_dedup_reset(addr_dedup_state_t *s) {
-  if (!s)
-    return;
-  s->cur_epoch++;
-  if (s->cur_epoch == 0) {
-    /* wraparound: physically wipe and restart epoch counter */
-    memset(s->slots, 0, (size_t)s->capacity * sizeof(dedup_slot_t));
-    s->cur_epoch = 1;
-  }
-  s->live = 0;
-}
-
-uint64_t addr_dedup_hits(const addr_dedup_state_t *s) {
-  return s ? s->hits : 0;
-}
-
 uint64_t addr_dedup_saturations(const addr_dedup_state_t *s) {
   return s ? s->saturations : 0;
-}
-
-int addr_dedup_capacity(const addr_dedup_state_t *s) {
-  return s ? s->capacity : 0;
 }
 
 void addr_dedup_destroy(addr_dedup_state_t *s) {
@@ -206,14 +174,6 @@ slot_map_t *slot_map_create(size_t hint) {
   m->vals = (int32_t *)calloc(cap, sizeof(int32_t));
   if (!m->keys || !m->vals) { free(m->keys); free(m->vals); free(m); return NULL; }
   return m;
-}
-
-void slot_map_clear(slot_map_t *m) {
-  if (!m)
-    return;
-  memset(m->keys, 0, m->cap * sizeof(*m->keys));
-  memset(m->vals, 0, m->cap * sizeof(*m->vals));
-  m->n = 0;
 }
 
 void slot_map_destroy(slot_map_t *m) {

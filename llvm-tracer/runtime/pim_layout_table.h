@@ -22,8 +22,8 @@
 #define PIM_MAX_FP_AXES 3
 #define PIM_MAX_STRIDE_ARGS 3
 #define PIM_FP_AXIS_WORDS (2 + PIM_MAX_STRIDE_ARGS)
-/* 4 fixed words then the footprint axes. Two words left on 2026-09-10
- * (reduction_col_axis and layout_kind); is_store arrived 2026-09-10 because nothing
+/* Four head words, the footprint axes, then two tail words. Two words left on
+ * 2026-09-10 (reduction_col_axis and layout_kind). is_store arrived 2026-09-10 because nothing
  * else says which tensor is the output once reuse_class stopped travelling, and the
  * SIMDRAM occupancy charge needs the OUTPUT footprint specifically. The drift check
  * below catches a half-rebuilt pair loudly. */
@@ -58,30 +58,11 @@ __attribute__((weak)) extern const int32_t __pim_layout_count;
  * carries no table; any other value must equal PIM_LAYOUT_REC_WORDS or the two
  * submodules have drifted and every record past the first is misread. */
 __attribute__((weak)) extern const int32_t __pim_layout_rec_words;
-/* Whole-kernel bank-group interleave decision, 0 when the compiler did not ask. */
-__attribute__((weak)) extern const int32_t __pim_bg_interleave;
-/* PLACEMENT POLICY, stated by the compiler so the choice lives in the artifact
- * instead of in a runtime default plus an env var. 0 means the kernel said nothing
- * and the runtime's default stands; the env vars then become overrides that warn.
- *
- *   __pim_layout_scheme    1 = striped (legacy compact/row-stripe), 2 = interleaved
- *   __pim_placement_align  1 = align each tensor to the DQ word only, so consecutive
- *                              tensors share rows but land on different banks
- *                          2 = align to a global-row boundary, so every tensor starts
- *                              at bank 0
- *
- * The alignment rule is not cosmetic: aligning to a global row hot-spots every tensor
- * on bank 0 and measured 3.2x worse on conv2d_1x8x16x16x3x3. That number used to
- * justify a hardcoded constant in the allocator. Naming it makes it a lever the
- * compiler picks and an ablation can vary. */
+/* Placement the compiler stated, 0 when the kernel said nothing. This runtime places
+ * interleaved (__pim_layout_scheme 2) at the DQ word (__pim_placement_align 1) and
+ * refuses any other stamp. */
 __attribute__((weak)) extern const int32_t __pim_layout_scheme;
 __attribute__((weak)) extern const int32_t __pim_placement_align;
-
-/* Values one DRAM row holds per bank, num_cols * dq_bits, AS THE COMPILER ASSUMED IT.
- * The SIMDRAM occupancy charge divides by this, so a machine whose row is a different
- * width would price passes the compiler never planned. 0 = the kernel did not say. */
-__attribute__((weak)) extern const int32_t __pim_row_values;
-
 /* 1 when the kernel loops over tiles inside one program instance. The trace
  * runtime needs it to pick how it packs its dispatch id: a persistent kernel has
  * few instances and many tiles, a gridded one has many instances and no tiles, and
@@ -103,11 +84,9 @@ __attribute__((weak)) extern const int32_t __pim_lanes;
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
 const int32_t __pim_layout_rec_words = 0;
-const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
 const int32_t __pim_lanes = 0;
 const int32_t __pim_persistent = 0;
-const int32_t __pim_row_values = 0;
 const int32_t __pim_layout_scheme = 0;
 const int32_t __pim_placement_align = 0;
 #endif

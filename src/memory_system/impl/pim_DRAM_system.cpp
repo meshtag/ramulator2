@@ -2,8 +2,6 @@
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
 
-#include <iostream>
-
 namespace Ramulator {
 
 class PimDRAMSystem final : public IMemorySystem, public Implementation {
@@ -58,21 +56,11 @@ public:
   void setup(IFrontEnd *frontend, IMemorySystem *memory_system) override {}
 
   bool send(Request req) override {
-    bool priority_cmd = false;
-    if (req.op == "priority-read") {
-      priority_cmd = true;
-      req.op = "read";
-    }
-    if (req.op == "priority-write") {
-      priority_cmd = true;
-      req.op = "write";
-    }
     req.type_id = m_dram->m_requests(req.op);
 
     int channel_id = req.addr_vec[0];
     bool is_success = false;
-    if ((req.type_id == m_tid_read || req.type_id == m_tid_write) &&
-        !priority_cmd) {
+    if (req.type_id == m_tid_read || req.type_id == m_tid_write) {
       is_success = m_controllers[channel_id]->send(req);
     } else {
       is_success = m_controllers[channel_id]->priority_send(req);

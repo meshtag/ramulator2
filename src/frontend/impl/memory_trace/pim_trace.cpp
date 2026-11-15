@@ -12,9 +12,8 @@ namespace fs = std::filesystem;
 /* PIM trace frontend (per-access mode).
  *
  * Each line is one DRAM request. Op tokens are R / W (regular
- * load/store), C (compute), SR / SW (subarray read/write, used by
- * SIMDRAM bit-serial codegen), BR / BW (bank-read / bank-write, used
- * when the PE register receives the value rather than the bus).
+ * load/store) and BR / BW (bank-read / bank-write, used when the PE
+ * register receives the value rather than the bus).
  * Address vector is comma-separated, one field per DRAM hierarchy
  * level.
  *
@@ -99,17 +98,8 @@ private:
       Trace entry;
       if      (tokens[0] == "R")  entry.op = "read";
       else if (tokens[0] == "W")  entry.op = "write";
-      else if (tokens[0] == "C")  entry.op = "compute";
-      else if (tokens[0] == "SR") entry.op = "subarray-read";
-      else if (tokens[0] == "SW") entry.op = "subarray-write";
       else if (tokens[0] == "BR") entry.op = "bank-read";
       else if (tokens[0] == "BW") entry.op = "bank-write";
-      /* WB = SIMDRAM broadcast write: one channel-bus dispatch
-       * delivers the value to all banks of the (ch, pch). Used to
-       * model the Ambit-style input-replication mechanism in the
-       * SIMDRAM hardware proposal. The bg/bank fields in the address
-       * vector are unused — only ch/pch/sa/row/col matter. */
-      else if (tokens[0] == "WB") entry.op = "broadcast-write";
       else
         throw ConfigurationError("PIM trace unknown op: '{}'", tokens[0]);
 

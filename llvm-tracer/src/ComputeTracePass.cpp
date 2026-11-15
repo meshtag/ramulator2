@@ -194,12 +194,6 @@ static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
   return nullptr;
 }
 
-/* The kernel pointer ARGUMENT a destination derives from, or nullptr. Strips GEPs,
- * casts, and the splat (insertelement / shufflevector) a vector-of-pointers GEP is
- * built on. An Argument dominates every instruction, and under lane placement its base
- * address resolves to the executing lane's bank, so passing it when the exact element
- * pointer cannot be passed keeps the compute charge in the right bank instead of
- * leaving the runtime to guess from the most recently touched accumulator. */
 /* Pointer-chasing half, no vector merging: used to decide whether two edges of a vector
  * build agree on their base argument. */
 static Value *argumentBaseOfSingle(Value *V) {
@@ -215,6 +209,12 @@ static Value *argumentBaseOfSingle(Value *V) {
   return nullptr;
 }
 
+/* The kernel pointer ARGUMENT a destination derives from, or nullptr. Strips GEPs,
+ * casts, and the splat (insertelement / shufflevector) a vector-of-pointers GEP is
+ * built on. An Argument dominates every instruction, and under lane placement its base
+ * address resolves to the executing lane's bank, so passing it when the exact element
+ * pointer cannot be passed keeps the compute charge in the right bank instead of
+ * leaving the runtime to guess from the most recently touched accumulator. */
 static Value *argumentBaseOf(Value *V) {
   SmallSet<Value *, 16> seen;
   while (V && seen.insert(V).second) {
@@ -312,9 +312,7 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
         // loop, so a K-deep MAC chain was charged like a single MAC and SIMDRAM
         // cost was independent of the arithmetic. dest_addr is passed only when it
         // dominates the BO; otherwise null, and the runtime attributes to
-        // current_acc. (void)Store keeps reachesDataStore as the "is this real PE
-        // work vs address math" filter.
-        (void)Store;
+        // current_acc.
         IRBuilder<> Builder(BO->getNextNode());
         Value *Dest = NullPtr;
         if (DestAddr) {

@@ -19,8 +19,7 @@ typedef enum {
 /* Computation phases */
 typedef enum {
   SIMDRAM_PHASE_IDLE,    /* No tracing */
-  SIMDRAM_PHASE_COMPUTE, /* SIMDRAM compute: loads/stores → W/R, arith → BR */
-  SIMDRAM_PHASE_HOST     /* Host-side: loads → R, stores → W */
+  SIMDRAM_PHASE_COMPUTE  /* SIMDRAM compute: loads/stores → W/R, arith → BR */
 } simdram_phase_t;
 
 /* Arithmetic opcodes — must match ComputeTracePass.cpp SimdramOp enum */
@@ -69,8 +68,6 @@ void simdram_set_phase(simdram_phase_t phase);
 void simdram_finalize(void);
 
 /* Called by MemTracePass instrumentation (same ABI as pim_runtime) */
-void __mem_trace_init(void);
-void __mem_trace_fini(void);
 void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes);
 void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes);
 

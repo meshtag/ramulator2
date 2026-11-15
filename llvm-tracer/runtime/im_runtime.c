@@ -16,11 +16,9 @@
  *                   __pim_set_bank_id(bank);
  *                   kernel(args...);
  *
- * No thread-local storage is needed because the CPU verification and
- * trace-generation harnesses call the kernel sequentially.
+ * No thread-local storage is needed because pass_ablation.py calls the
+ * kernel sequentially.
  */
-
-#include <stdio.h>
 
 #include "im_runtime.h"
 

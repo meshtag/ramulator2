@@ -17,7 +17,7 @@ struct Request {
   // Basic request id convention
   // 0 = Read, 1 = Write. The device spec defines all others
   struct Type {
-    enum : int { Read = 0, Write, Compute, SARead, SAWrite, BKRead, BKWrite };
+    enum : int { Read = 0, Write };
   };
 
   int type_id = -1;    // An identifier for the type of the request

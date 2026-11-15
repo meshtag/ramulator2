@@ -40,7 +40,6 @@ public:
       "ACT",   "PRE",   "PREASA", "PREA",  "RD",    "WR",
       "RDA",   "WRA",   "REFab",  "REFsb", "RFMab", "RFMsb",
       "PIMOp", "SASEL", "SARD",   "SAWR",  "BKRD",  "BKWR",
-      "BCAST_W",
   };
 
   inline static const ImplLUT m_command_scopes = LUT(m_commands, m_levels,
@@ -63,7 +62,6 @@ public:
                                                          {"SAWR", "column"},
                                                          {"BKRD", "column"},
                                                          {"BKWR", "column"},
-                                                         {"BCAST_W", "pseudochannel"},
                                                      });
 
   inline static const ImplLUT m_command_meta =
@@ -85,14 +83,13 @@ public:
                                         {"SARD", {false, false, true, false}},
                                         {"SAWR", {false, false, true, false}},
                                         {"BKRD", {false, false, true, false}},
-                                        {"BKWR", {false, false, true, false}},
-                                        {"BCAST_W", {false, false, true, false}}});
+                                        {"BKWR", {false, false, true, false}}});
 
   inline static constexpr ImplDef m_requests = {
       "read",          "write",          "all-bank-refresh",
       "compute",       "subarray-read",  "subarray-write",
       "bank-read",     "bank-write",     "per-bank-refresh",
-      "all-bank-rfm",  "per-bank-rfm",   "broadcast-write",
+      "all-bank-rfm",  "per-bank-rfm",
   };
 
   inline static const ImplLUT m_request_translations =
@@ -107,8 +104,7 @@ public:
            {"subarray-read", "SARD"},
            {"subarray-write", "SAWR"},
            {"bank-read", "BKRD"},
-           {"bank-write", "BKWR"},
-           {"broadcast-write", "BCAST_W"}});
+           {"bank-write", "BKWR"}});
 
   /************************************************
    *                   Timing
@@ -223,13 +219,6 @@ private:
     if (auto density = param_group("org").param<int>("density").optional()) {
       m_organization.density = *density;
     }
-
-    m_organization.m_pe_per_bankgroup =
-        param_group("org").param<int>("pe_per_bankgroup").default_val(2);
-    m_organization.m_reg_per_pe =
-        param_group("org").param<int>("reg_per_pe").default_val(2);
-    m_organization.m_pe_bits =
-        param_group("org").param<int>("pe_bits").default_val(16);
 
     size_t _density = size_t(m_organization.count[m_levels["pseudochannel"]]) *
                       size_t(m_organization.count[m_levels["bankgroup"]]) *
@@ -357,33 +346,6 @@ private:
                    .preceding = {"WR", "WRA"},
                    .following = {"WR", "WRA"},
                    .latency = V("nBL")},
-                  /* BCAST_W (SIMDRAM broadcast write): occupies the
-                   * pseudochannel bus for nBL cycles like a normal WR.
-                   * Models a single channel-bus dispatch that delivers
-                   * the same value to all banks in the (ch, pch) — used
-                   * to model SIMDRAM's Ambit-style cross-bank broadcast
-                   * during input setup. Per-bank execution latency
-                   * (nWR) overlaps across banks in parallel. */
-                  {.level = "pseudochannel",
-                   .preceding = {"BCAST_W"},
-                   .following = {"BCAST_W"},
-                   .latency = V("nBL")},
-                  {.level = "pseudochannel",
-                   .preceding = {"BCAST_W"},
-                   .following = {"WR", "WRA"},
-                   .latency = V("nBL")},
-                  {.level = "pseudochannel",
-                   .preceding = {"WR", "WRA"},
-                   .following = {"BCAST_W"},
-                   .latency = V("nBL")},
-                  {.level = "pseudochannel",
-                   .preceding = {"BCAST_W"},
-                   .following = {"RD", "RDA"},
-                   .latency = V("nCWL") + V("nBL") + V("nWTRS")},
-                  {.level = "pseudochannel",
-                   .preceding = {"RD", "RDA"},
-                   .following = {"BCAST_W"},
-                   .latency = V("nCL") + V("nBL") + 2 - V("nCWL")},
                   {.level = "pseudochannel",
                    .preceding = {"RD", "RDA"},
                    .following = {"RD", "RDA"},

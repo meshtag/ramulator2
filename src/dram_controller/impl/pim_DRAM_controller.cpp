@@ -84,11 +84,6 @@ public:
     return m_priority_buffer.enqueue(req);
   }
 
-  bool is_pending() const {
-    return m_active_buffer.size() || m_priority_buffer.size() ||
-           m_read_buffer.size() || m_write_buffer.size() || pending.size();
-  }
-
   void tick() override {
     m_clk++;
 
