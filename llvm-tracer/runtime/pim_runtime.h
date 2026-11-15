@@ -45,7 +45,7 @@ void pim_set_phase(pim_phase_t phase);
 /* Finalize: close trace file and print statistics */
 void pim_finalize(void);
 
-/* Called by the LLVM instrumentation pass (same ABI as trace_runtime) */
+/* Called by the LLVM instrumentation pass */
 void __mem_trace_init(void);
 void __mem_trace_fini(void);
 void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes);

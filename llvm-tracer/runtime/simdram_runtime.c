@@ -50,8 +50,8 @@
  */
 
 /* ================================================================
- *  HBM3_PIM organization constants — match simdram_hbm3.yaml
- *  Defaults match OptiPIM's simdram_config.yaml exactly.
+ *  HBM3_PIM organization constants. The defaults match OptiPIM's
+ *  simdram_config.yaml exactly.
  * ================================================================ */
 static int cfg_num_channels = 16;
 static int cfg_num_pch = 2; /* rank: 2 */

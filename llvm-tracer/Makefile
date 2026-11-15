@@ -12,8 +12,7 @@ BUILD_DIR := build
 .PHONY: all clean
 
 all: $(BUILD_DIR)/MemTracePass.dylib $(BUILD_DIR)/ComputeTracePass.dylib \
-     $(BUILD_DIR)/libtrace_runtime.dylib $(BUILD_DIR)/libim_runtime.dylib \
-     $(BUILD_DIR)/libsimdram_runtime.dylib
+     $(BUILD_DIR)/libim_runtime.dylib $(BUILD_DIR)/libsimdram_runtime.dylib
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -25,10 +24,6 @@ $(BUILD_DIR)/MemTracePass.dylib: src/MemTracePass.cpp | $(BUILD_DIR)
 # Pass plugin: arithmetic instrumentation for SIMDRAM
 $(BUILD_DIR)/ComputeTracePass.dylib: src/ComputeTracePass.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -shared -undefined dynamic_lookup -o $@ $<
-
-# Runtime library (linked into instrumented program)
-$(BUILD_DIR)/libtrace_runtime.dylib: runtime/trace_runtime.c | $(BUILD_DIR)
-	$(CC) -O2 -fPIC -shared -o $@ $<
 
 # IM execution-model runtime (bank-ID / program-ID primitives)
 $(BUILD_DIR)/libim_runtime.dylib: runtime/im_runtime.c | $(BUILD_DIR)
