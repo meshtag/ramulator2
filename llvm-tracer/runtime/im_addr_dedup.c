@@ -5,23 +5,20 @@
 
 typedef struct {
   uint64_t key;
-  uint32_t epoch;
+  uint32_t epoch; /* cur_epoch once claimed, 0 empty */
 } dedup_slot_t;
 
 struct addr_dedup_state {
   dedup_slot_t *slots;
   int capacity;       /* power of two */
   int mask;           /* capacity - 1 */
-  uint32_t cur_epoch; /* 0 reserved as "empty"/uninitialized */
-  int live;           /* slots claimed at cur_epoch */
+  uint32_t cur_epoch; /* always 1, this tree has no reset, so epoch is an occupied flag */
+  int live;           /* slots claimed */
   uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
 
-/* Pack three keys into one uint64. Layout (LSB→MSB):
- *   key1: 16 bits  (global_bank, max ~64k)
- *   key2: 32 bits  (sa*rows + row + optional bit, max ~4G)
- *   key3: 16 bits  (col)
- * Total: 64 bits. */
+/* Pack three keys into one uint64, LSB to MSB: key1 16 bits, key2 32 bits, key3 16 bits.
+ * Higher bits of each key are dropped. The lockstep callers pass one hash split there. */
 static inline uint64_t pack_keys(uint64_t k1, uint64_t k2, uint64_t k3) {
   return (k1 & 0xFFFFULL) | ((k2 & 0xFFFFFFFFULL) << 16) |
          ((k3 & 0xFFFFULL) << 48);
@@ -55,14 +52,14 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
   }
   s->capacity = capacity;
   s->mask = capacity - 1;
-  s->cur_epoch = 1; /* epoch 0 reserved as "empty" */
+  s->cur_epoch = 1; /* epoch 0 is an empty slot */
   s->live = 0;
   s->saturations = 0;
   return s;
 }
 
-/* Double the table, rehashing only the entries live at cur_epoch (older epochs are
- * logically empty). Returns 0 if the allocation fails, leaving the table untouched.
+/* Double the table, rehashing the claimed entries. Returns 0 if the allocation fails,
+ * leaving the table untouched.
  *
  * WHY THIS EXISTS: the capacity used to be fixed at create() from a caller hint, and
  * a full table falls back to "treat as new". The lockstep hint was sized to the PE
@@ -108,10 +105,10 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
     dedup_slot_t *slot = &s->slots[idx];
     if (slot->epoch == s->cur_epoch) {
       if (slot->key == key)
-        return 0; /* already seen this epoch */
-      /* live collision — keep probing */
+        return 0; /* already seen */
+      /* another key holds it, keep probing */
     } else {
-      /* empty or stale slot — claim it, growing first if we are at the load target */
+      /* empty slot, claim it, growing first if we are at the load target */
       if (s->live + 1 > s->capacity / 2 && addr_dedup_grow(s)) {
         idx = (int)(h & (uint64_t)s->mask);
         for (;;) {
@@ -206,7 +203,7 @@ int32_t slot_map_get_or_put(slot_map_t *m, int lane, int elem, int32_t fresh,
   uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
   size_t i = slot_hash(key) & (m->cap - 1);
   for (;;) {
-    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* slots are 24 bits */
+    if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* no flag bits in this tree */
     if (m->keys[i] == 0) { m->keys[i] = key; m->vals[i] = fresh; m->n++; *inserted = 1; return fresh; }
     i = (i + 1) & (m->cap - 1);
   }

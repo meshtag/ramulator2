@@ -21,7 +21,7 @@ typedef enum {
   PIM_PHASE_COMPUTE, /* PIM compute: loads/stores map to PE operations */
 } pim_phase_t;
 
-/* Initialize the PIM runtime, open the trace file. Exits unless PIM_TRACE_FORMAT=dcc. */
+/* Initialize the PIM runtime, open the trace file. */
 void pim_init(const char *trace_file);
 
 /*

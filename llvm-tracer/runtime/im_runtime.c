@@ -5,22 +5,14 @@
  * Each kernel invocation reads these via the __pim_get_*() calls that
  * the Triton IM backend emits as extern function calls in the LLVM IR.
  *
- * Sequential (CPU) execution model:
- *   for pid_z in 0 .. num_programs_z-1:        // optional 3D
- *       for pid_y in 0 .. num_programs_y-1:    // optional 2D
- *           for pid in 0 .. num_programs-1:
- *               for bank in 0 .. num_banks-1:  // parallel on real HBM-PIM
- *                   __pim_set_program_id(pid);
- *                   __pim_set_program_id_y(pid_y);
- *                   __pim_set_program_id_z(pid_z);
- *                   __pim_set_bank_id(bank);
- *                   kernel(args...);
+ * The replay loop (pass_ablation._run_pim_trace):
+ *   for pid_z: __pim_set_program_id_z(pid_z)
+ *     for pid_y: __pim_set_program_id_y(pid_y)
+ *       for pid: __pim_set_program_id(pid), __pim_set_group_id(instance % groups)
+ *         for bank: __pim_set_bank_id(bank), kernel(args...)
  *
- * No thread-local storage is needed because the CPU verification and
- * trace-generation harnesses call the kernel sequentially.
+ * No thread-local storage is needed because the harness calls the kernel sequentially.
  */
-
-#include <stdio.h>
 
 #include "im_runtime.h"
 

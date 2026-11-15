@@ -43,9 +43,6 @@ __attribute__((weak)) extern const int32_t __pim_layout_count;
  * carries no table; any other value must equal PIM_LAYOUT_REC_WORDS or the two
  * submodules have drifted and every record past the first is misread. */
 __attribute__((weak)) extern const int32_t __pim_layout_rec_words;
-/* Whole-kernel bank-group interleave decision, 0 when the compiler did not ask. This
- * runtime refuses anything but 0. */
-__attribute__((weak)) extern const int32_t __pim_bg_interleave;
 /* Placement alignment, stated by the compiler: 1 aligns each tensor to the DQ word only,
  * 3 row-packs the lane slabs, 0 means the kernel said nothing. */
 __attribute__((weak)) extern const int32_t __pim_placement_align;
@@ -82,8 +79,8 @@ __attribute__((weak)) extern const int32_t __pim_dcc_tile_mac[2 * PIM_MAX_TILE_M
 __attribute__((weak)) extern const int32_t __pim_dcc_tile_mac_count;
 
 /* DCC's accumulator convention per stored tensor (im_dcc_acc_grf), [operand_arg, reset,
- * wb] triples. reset 0 none, 1 every lane, 2 folded into a MUL (__pim_mac_first). wb 1
- * every lane, 2 the addressed bank of each PCU pair. __pim_dcc_grf_a lists the operands
+ * wb] triples. reset 0 none, 1 every lane. wb 1 every lane, 2 the addressed bank of each
+ * PCU pair. __pim_dcc_grf_a lists the operands
  * the compiler elected for GRF_A. Both count only when __pim_dcc_decided is 1, which the
  * compiler sets whenever it made the call. */
 #define PIM_MAX_DCC_ACC 16
@@ -108,16 +105,10 @@ __attribute__((weak)) extern const int32_t __pim_dcc_mac_addr_count;
 __attribute__((weak)) extern const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC];
 __attribute__((weak)) extern const int32_t __pim_dcc_return_from_count;
 
-/* im-acc-init-fold, [operand_arg, reduce stride, reduce extent] per product tensor: its read
- * at reduce coordinate (e / stride) % extent == 0 writes the accumulator entry, a MUL. */
-__attribute__((weak)) extern const int32_t __pim_mac_first[3 * PIM_MAX_TILE_MAC];
-__attribute__((weak)) extern const int32_t __pim_mac_first_count;
-
 #ifdef PIM_LAYOUT_TABLE_DEFINE
 const int32_t __pim_layout_table[PIM_LAYOUT_REC_WORDS] = {0};
 const int32_t __pim_layout_count = 0;
 const int32_t __pim_layout_rec_words = 0;
-const int32_t __pim_bg_interleave = 0;
 const int32_t __pim_dq_bits = 0;
 const int32_t __pim_lanes = 0;
 const int32_t __pim_acc_cells_per_lane = 0;
@@ -135,8 +126,6 @@ const int32_t __pim_dcc_mac_addr[4 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_mac_addr_count = 0;
 const int32_t __pim_dcc_return_from[2 * PIM_MAX_TILE_MAC] = {0};
 const int32_t __pim_dcc_return_from_count = 0;
-const int32_t __pim_mac_first[3 * PIM_MAX_TILE_MAC] = {0};
-const int32_t __pim_mac_first_count = 0;
 const int32_t __pim_persistent = 0;
 const int32_t __pim_placement_align = 0;
 #endif

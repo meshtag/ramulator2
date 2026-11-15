@@ -4,11 +4,8 @@
  * Provides the bank-ID and program-ID primitives that Triton's IM backend
  * emits as extern calls (__pim_get_bank_id / __pim_get_program_id).
  *
- * Two consumers:
- *   1. CPU functional verification  — verify_im_cpu.py sets these before
- *      each kernel invocation to emulate multi-bank SIMD execution.
- *   2. PIM trace generation — the trace harness iterates over banks,
- *      calling the kernel once per bank to collect per-bank memory traces.
+ * The trace harness (benchmarks/pass_ablation.py) iterates over banks, calling the
+ * kernel once per bank to collect per-bank memory traces.
  *
  * The "set" functions are called by the host driver; the "get" functions
  * are called from inside the compiled kernel.
