@@ -12,33 +12,12 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 
+/* simdram_op_t, the opcode numbering __compute_trace takes. */
+#include "../runtime/simdram_runtime.h"
+
 using namespace llvm;
 
 namespace {
-
-/*
- * Arithmetic opcode enum — must match simdram_runtime.h simdram_op_t.
- * Passed as the first argument to __compute_trace().
- */
-enum SimdramOp {
-  SIMDRAM_OP_ADD = 0,
-  SIMDRAM_OP_SUB,
-  SIMDRAM_OP_MUL,
-  SIMDRAM_OP_DIV,
-  SIMDRAM_OP_REM,
-  SIMDRAM_OP_AND,
-  SIMDRAM_OP_OR,
-  SIMDRAM_OP_XOR,
-  SIMDRAM_OP_SHL,
-  SIMDRAM_OP_LSHR,
-  SIMDRAM_OP_ASHR,
-  SIMDRAM_OP_FADD,
-  SIMDRAM_OP_FSUB,
-  SIMDRAM_OP_FMUL,
-  SIMDRAM_OP_FDIV,
-  SIMDRAM_OP_FREM,
-  SIMDRAM_OP_OTHER
-};
 
 static int mapOpcode(unsigned LLVMOp) {
   switch (LLVMOp) {
@@ -82,32 +61,17 @@ static int mapOpcode(unsigned LLVMOp) {
 }
 
 /*
- * Forward def-use walker: does a BinaryOperator's result flow into a genuine
- * DATA store? Returns the terminal store reached DFS-first (a StoreInst,
- * llvm.masked.store or llvm.masked.scatter) and sets DestAddr to its pointer
- * operand, which for masked.scatter is the pointer vector the caller strips to
- * the tensor argument.
+ * Forward def-use walk: does a BinaryOperator's result flow into a data store? Returns the
+ * first StoreInst reached and sets DestAddr to its pointer operand. Only a plain store
+ * counts, as in MemTracePass, since the IM backend lowers a masked store to a branch
+ * around one.
  *
- * W4 FIX (2026-07-01): returns nullptr for BinaryOperators whose value never
- * reaches a data store — i.e. pure ADDRESS/INDEX/LOOP-CONTROL arithmetic, which
- * flows only into GEPs (address computation), CmpInsts + PHIs (loop induction),
- * or int↔ptr casts, and NEVER into a stored data value. Previously such BOs
- * were still charged as PE compute via a null-dest fallback, so the SIMDRAM
- * compute column over-counted host loop-counter/address arithmetic as bit-serial
- * PE work (the reviewer's construct-validity + unroll-sensitivity bug). Charging
- * only value-producing compute that lands in a data store makes the compute count
- * proportional to actual output elements, hence unroll-invariant. Legitimate
- * INTEGER PE compute (bit-serial int8/int4 MAC) is preserved: it reaches a data
- * store, unlike index math which terminates at a GEP.
- *
- * Walks transparently through value-propagating ops (BinaryOperator, PHINode,
- * SelectInst, CastInst, vector shuffles, value-producing intrinsics like
- * fmuladd/vector reductions). Stops at LoadInst, GEPs, int↔ptr conversions, and
- * opaque calls — those don't propagate our value into a stored destination.
- *
- * Imprecision:
- *   - Vector BO: all lanes resolve to the vector store's tile-base pointer.
- *   - DAG fan-out (BO feeds multiple stores): first store reached.
+ * Arithmetic that reaches no store is address, index or loop-control math, host work that
+ * ends at GEPs, compares, induction PHIs or int/ptr casts, so it is not charged and the
+ * compute count stays proportional to the output whatever the unrolling. The walk passes
+ * through value-propagating ops and intrinsics and stops at loads, GEPs, int/ptr
+ * conversions and opaque calls. A vector BO resolves to its store's tile base, and a BO
+ * feeding several stores to the first one reached.
  */
 static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
   SmallVector<Value *, 16> worklist;
@@ -135,19 +99,6 @@ static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
       if (auto *Call = dyn_cast<CallInst>(U)) {
         if (auto *II = dyn_cast<IntrinsicInst>(Call)) {
           switch (II->getIntrinsicID()) {
-          // Masked vector stores are genuine data stores (vectorized epilogue).
-          case Intrinsic::masked_store:
-            if (II->getArgOperand(0) == cur) {   // (value, ptr, align, mask)
-              DestAddr = II->getArgOperand(1);
-              return II;
-            }
-            break;
-          case Intrinsic::masked_scatter:
-            if (II->getArgOperand(0) == cur) {   // (value, <vec ptr>, align, mask)
-              DestAddr = II->getArgOperand(1);    // vector of ptrs; emission strips it
-              return II;                          // to the tensor argument
-            }
-            break;
           case Intrinsic::fmuladd:
           case Intrinsic::fma:
           case Intrinsic::minnum:
@@ -191,27 +142,10 @@ static Instruction *reachesDataStore(BinaryOperator *BO, Value *&DestAddr) {
   return nullptr;
 }
 
-/* Pointer-chasing half, no vector merging: used to decide whether two edges of a vector
- * build agree on their base argument. */
-static Value *argumentBaseOfSingle(Value *V) {
-  SmallSet<Value *, 16> seen;
-  while (V && seen.insert(V).second) {
-    if (isa<Argument>(V))
-      return V;
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) { V = GEP->getPointerOperand(); continue; }
-    if (auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
-    if (auto *CE = dyn_cast<ConstantExpr>(V)) { V = CE->getOperand(0); continue; }
-    return nullptr;
-  }
-  return nullptr;
-}
-
-/* The kernel pointer ARGUMENT a destination derives from, or nullptr. Strips GEPs,
- * casts, and the splat (insertelement / shufflevector) a vector-of-pointers GEP is
- * built on. An Argument dominates every instruction, and under lane placement its base
- * address resolves to the executing lane's bank, so passing it when the exact element
- * pointer cannot be passed keeps the compute charge in the right bank instead of
- * leaving the runtime to guess from the most recently touched accumulator. */
+/* The kernel pointer argument a destination derives from through GEPs, casts and constant
+ * expressions, or nullptr. Under lane placement an argument's base address resolves to the
+ * executing lane's bank, so passing it keeps the charge in the right bank when the element
+ * pointer cannot be passed. */
 static Value *argumentBaseOf(Value *V) {
   SmallSet<Value *, 16> seen;
   while (V && seen.insert(V).second) {
@@ -219,24 +153,6 @@ static Value *argumentBaseOf(Value *V) {
       return V;
     if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) { V = GEP->getPointerOperand(); continue; }
     if (auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
-    /* Only when every lane of the vector comes from ONE base. Following operand 1 of a
-     * chain, or operand 0 of a two-source shuffle, otherwise names whichever argument
-     * happens to be on that edge and charges the compute to the wrong tensor. */
-    if (auto *IE = dyn_cast<InsertElementInst>(V)) {
-      Value *base = argumentBaseOfSingle(IE->getOperand(0));
-      Value *ins = argumentBaseOfSingle(IE->getOperand(1));
-      if (base && ins && base != ins)
-        return nullptr;
-      V = ins ? IE->getOperand(1) : IE->getOperand(0);
-      continue;
-    }
-    if (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
-      if (!isa<UndefValue, PoisonValue>(SV->getOperand(1)) &&
-          argumentBaseOfSingle(SV->getOperand(0)) != argumentBaseOfSingle(SV->getOperand(1)))
-        return nullptr;
-      V = SV->getOperand(0);
-      continue;
-    }
     if (auto *CE = dyn_cast<ConstantExpr>(V)) { V = CE->getOperand(0); continue; }
     return nullptr;
   }
@@ -247,13 +163,7 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     LLVMContext &Ctx = M.getContext();
 
-    // void __compute_trace(int32_t opcode, int32_t bit_width,
-    //                       void *dest_addr);
-    // dest_addr is the destination address that the BinaryOperator's
-    // result eventually flows into (via def-use chains). The runtime
-    // uses it to attribute compute to a specific output cell. A null
-    // dest_addr means "no destination determined" — the runtime falls
-    // back to current_acc-based addressing.
+    // void __compute_trace(int32_t opcode, int32_t lanes, void *dest_addr)
     PointerType *PtrTy = PointerType::get(Ctx, /*AddressSpace=*/0);
     FunctionType *TraceFnTy = FunctionType::get(
         Type::getVoidTy(Ctx),
@@ -270,10 +180,6 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
-      // Don't instrument our own runtime functions
-      if (F.getName().starts_with("__mem_trace") ||
-          F.getName().starts_with("__compute_trace"))
-        continue;
 
       // Collect arithmetic instructions to avoid iterator invalidation
       SmallVector<BinaryOperator *, 64> BinOps;
@@ -289,43 +195,35 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
       DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
       for (auto *BO : BinOps) {
-        // W4 FIX: only charge BinaryOperators whose value flows into a genuine
-        // DATA store as PE compute. BOs that never reach a data store are pure
-        // address/index/loop-control arithmetic (they terminate at GEPs, CmpInsts
-        // or int↔ptr casts) and are NOT bit-serial PE work — skipping them removes
-        // the host-arithmetic over-count and makes the compute cost unroll-invariant.
         Value *DestAddr = nullptr;
         Instruction *Store = reachesDataStore(BO, DestAddr);
         if (!Store)
           continue;
 
         int op = mapOpcode(BO->getOpcode());
-        unsigned bits = BO->getType()->getScalarSizeInBits();
+        unsigned lanes = 1;
+        if (auto *VT = dyn_cast<FixedVectorType>(BO->getType()))
+          lanes = VT->getNumElements();
         Value *opArg = ConstantInt::get(Type::getInt32Ty(Ctx), op);
-        Value *bitsArg = ConstantInt::get(Type::getInt32Ty(Ctx), bits);
+        Value *lanesArg = ConstantInt::get(Type::getInt32Ty(Ctx), lanes);
 
-        // Insert at the BO, so the call fires once per ARITHMETIC EXECUTION.
-        // Inserting at the store (the old behavior) put it OUTSIDE the reduction
-        // loop, so a K-deep MAC chain was charged like a single MAC and SIMDRAM
-        // cost was independent of the arithmetic. dest_addr is the scalar element
-        // pointer when it dominates the BO, else the tensor argument argumentBaseOf
-        // finds, else null, and the runtime then attributes to current_acc.
+        // Inserted at the BO, so the call fires once per arithmetic execution and a K-deep
+        // MAC chain pays K times. dest_addr is normally the tensor argument, because the
+        // accumulator is stored after the loop and its element pointer does not dominate
+        // the BO. The element pointer is passed when it dominates, and null when neither
+        // names a tensor.
         IRBuilder<> Builder(BO->getNextNode());
         Value *Dest = NullPtr;
         if (DestAddr) {
           auto *DestI = dyn_cast<Instruction>(DestAddr);
-          bool scalarPtr = !DestAddr->getType()->isVectorTy();
-          if (scalarPtr && (!DestI || DT.dominates(DestI, BO))) {
+          if (!DestI || DT.dominates(DestI, BO))
             Dest = DestAddr;
-            if (Dest->getType() != PtrTy)
-              Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
-          } else if (Value *Base = argumentBaseOf(DestAddr)) {
-            Dest = Base; // the tensor, when the element cannot be named
-            if (Dest->getType() != PtrTy)
-              Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
-          }
+          else if (Value *Base = argumentBaseOf(DestAddr))
+            Dest = Base;
+          if (Dest->getType() != PtrTy)
+            Dest = Builder.CreateBitOrPointerCast(Dest, PtrTy);
         }
-        Builder.CreateCall(ComputeFn, {opArg, bitsArg, Dest});
+        Builder.CreateCall(ComputeFn, {opArg, lanesArg, Dest});
         Modified = true;
       }
     }

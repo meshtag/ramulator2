@@ -9,7 +9,11 @@ namespace Ramulator {
 
 namespace fs = std::filesystem;
 
-/* PIM trace frontend (per-access mode).
+/* PIM trace frontend (per-access mode), OptiPIM's PimTrace
+ * (third_party/OptiPIM/simulator/src/frontend/impl/memory_trace/pim_trace.cpp) without its
+ * codegen path. The deltas: the codegen child, the conv2d and gemm kernel descriptors with
+ * their expansion, the C, SR and SW ops and the progress log are dropped, a line without an
+ * address throws, and is_finished also waits for the last line to be issued.
  *
  * Each line is one DRAM request. Op tokens are R / W (regular
  * load/store) and BR / BW (bank-read / bank-write, used when the PE
@@ -33,7 +37,6 @@ private:
   };
 
   std::vector<Trace> m_trace;
-  size_t m_trace_length = 0;
   size_t m_curr_trace_idx = 0;
 
   Logger_t m_logger;
@@ -51,12 +54,8 @@ public:
     m_logger->info("Loaded {} trace lines.", m_trace.size());
   };
 
-  void connect_memory_system(IMemorySystem *memory_system) override {
-    IFrontEnd::connect_memory_system(memory_system);
-  };
-
   void tick() override {
-    if (m_curr_trace_idx >= m_trace_length)
+    if (m_curr_trace_idx >= m_trace.size())
       return;
     const Trace &t = m_trace[m_curr_trace_idx];
     bool sent = m_memory_system->send({t.addr_vec, t.op});
@@ -65,12 +64,10 @@ public:
     }
   };
 
-  // [P0.2 drain-tail fix] Finish only when every trace request is issued AND the
-  // memory system has drained (mirrors OptiPIM PimTrace::is_finished, which returns
-  // m_memory_system->finished()). Previously finished at issue-complete, skipping the
-  // 33-942-cycle memory drain tail OptiPIM pays — which inflated near-1.0 ratios.
+  // Every line issued and the memory system drained. OptiPIM's is_finished checks the
+  // memory system alone.
   bool is_finished() override {
-    return m_curr_trace_idx >= m_trace_length && m_memory_system->finished();
+    return m_curr_trace_idx >= m_trace.size() && m_memory_system->finished();
   };
 
 private:
@@ -111,7 +108,6 @@ private:
       m_trace.push_back(entry);
     }
     trace_file.close();
-    m_trace_length = m_trace.size();
   };
 };
 

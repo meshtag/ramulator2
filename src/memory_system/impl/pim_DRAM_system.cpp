@@ -1,3 +1,8 @@
+/* OptiPIM's PIM memory system (third_party/OptiPIM/simulator/src/memory_system/impl/
+ * pim_DRAM_system.cpp), reformatted. The deltas: the address mapper, the priority-read and
+ * priority-write ops, the compute and subarray request counters and the startup banner are
+ * dropped with OptiPIM's codegen path, and requests are matched by the device's own ids
+ * for read, write, bank-read and bank-write rather than by Request::Type. */
 #include "dram/dram.h"
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
@@ -95,11 +100,9 @@ public:
 
   float get_tCK() override { return m_dram->m_timing_vals("tCK_ps") / 1000.0f; }
 
+  // Finished once every controller is clear, so the cycle count includes the drain that
+  // follows the last request.
   bool finished() override {
-    // [P0.2 drain-tail fix] terminate only once all controllers are drained
-    // (mirrors OptiPIM pim_DRAM_system::finished). Previously returned true
-    // unconditionally, under-counting cycles by the memory drain tail and
-    // inflating near-1.0 TritonIM/OptiPIM ratios.
     bool all_clear = true;
     for (auto controller : m_controllers) {
       all_clear &= controller->clear();

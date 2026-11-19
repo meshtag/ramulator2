@@ -22,7 +22,7 @@ typedef enum {
   SIMDRAM_PHASE_COMPUTE  /* SIMDRAM compute: loads/stores → W/R, arith → BR */
 } simdram_phase_t;
 
-/* Arithmetic opcodes — must match ComputeTracePass.cpp SimdramOp enum */
+/* Arithmetic opcodes. ComputeTracePass.cpp includes this header for them. */
 typedef enum {
   SIMDRAM_OP_ADD = 0,
   SIMDRAM_OP_SUB,
@@ -71,13 +71,10 @@ void simdram_finalize(void);
 void __mem_trace_load(void *addr, uint64_t size, uint64_t lanes);
 void __mem_trace_store(void *addr, uint64_t size, uint64_t lanes);
 
-/* Called by ComputeTracePass instrumentation. dest_addr is the
- * destination memory address that the BinaryOperator's result flows
- * into (found via forward def-use walk at IR-analysis time). Pass
- * NULL when no destination could be determined — the runtime falls
- * back to the current accumulator tracker (current_acc) for
- * backwards compatibility. */
-void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr);
+/* Called by ComputeTracePass instrumentation once per arithmetic execution. lanes is the
+ * operation's vector width. dest_addr is where the result is stored, normally the
+ * accumulator tensor's argument, and NULL when the pass names no tensor. */
+void __compute_trace(int32_t opcode, int32_t lanes, void *dest_addr);
 
 #ifdef __cplusplus
 }

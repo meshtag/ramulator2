@@ -5,18 +5,17 @@
  * Each kernel invocation reads these via the __pim_get_*() calls that
  * the Triton IM backend emits as extern function calls in the LLVM IR.
  *
- * Sequential (CPU) execution model:
- *   for pid_z in 0 .. num_programs_z-1:        // optional 3D
- *       for pid_y in 0 .. num_programs_y-1:    // optional 2D
- *           for pid in 0 .. num_programs-1:
- *               for bank in 0 .. num_banks-1:  // parallel on real HBM-PIM
- *                   __pim_set_program_id(pid);
- *                   __pim_set_program_id_y(pid_y);
- *                   __pim_set_program_id_z(pid_z);
- *                   __pim_set_bank_id(bank);
- *                   kernel(args...);
+ * The replay loop (pipeline.trace):
+ *   for pid_z: __pim_set_program_id_z(pid_z)
+ *     for pid_y: __pim_set_program_id_y(pid_y)
+ *       for pid: __pim_set_program_id(pid)
+ *         for bank: __pim_set_bank_id(bank), kernel(args...)
  *
- * No thread-local storage is needed because pass_ablation.py calls the
+ * The program ids are set once per instance, outside the bank loop, so the epoch stays the
+ * same across the banks of one instance. pim_runtime's lockstep collapse relies on that,
+ * since it folds only the replicas that share an epoch.
+ *
+ * No thread-local storage is needed because pipeline.py calls the
  * kernel sequentially.
  */
 
@@ -30,9 +29,8 @@ static int32_t current_program_id_z = 0;
 
 /* Program-instance epoch. Bumped by every program-id setter, i.e. exactly when the
  * host starts a new instance, and NOT by the bank setter, since the banks of one
- * instance are one all-bank command. The trace runtimes reset their per-instance
- * state when this changes, instead of diffing the three ids on the next access,
- * which was only correct while the replay loop stayed program-major. */
+ * instance are one all-bank command. pim_runtime keys its lockstep collapse on it, and
+ * simdram_runtime writes out and resets its streamed slabs when it changes. */
 uint64_t __pim_program_epoch = 0;
 
 /* Tile index within ONE bank replay, for persistent kernels.
@@ -83,8 +81,6 @@ void __pim_set_program_id_z(int32_t id) {
 /* Called by the kernel at the end of one tile of a persistent loop. */
 void __pim_tile_boundary(void) { current_tile_idx++; }
 
-/* Tile index within the current bank replay. A FACT, not a composed id: the
- * trace runtime packs this with the program epoch itself, because it is the one
- * that knows how many bits its collapse key has left. Summing them here was
- * wrong and lossy -- instance p tile 1 aliased instance p+1 tile 0. */
+/* Tile index within the current bank replay, which pim_runtime packs with the program
+ * epoch into its dispatch id. */
 uint64_t __pim_tile_index(void) { return current_tile_idx; }

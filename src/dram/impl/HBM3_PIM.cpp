@@ -1,3 +1,8 @@
+/* OptiPIM's HBM3_PIM device (third_party/OptiPIM/simulator/src/dram/impl/HBM3_PIM.cpp),
+ * reformatted. The deltas: the PIMOp, SARD, SAWR and PREASA commands, their requests and the
+ * HBM3_8Gb_new preset are dropped with OptiPIM's codegen path, as are the PE organization
+ * parameters and the unused tREFISB table. The Refreshing state and check_node_open come
+ * from upstream Ramulator2's HBM3. */
 #include "dram/dram.h"
 #include "dram/lambdas.h"
 
@@ -413,6 +418,8 @@ private:
                    .latency = V("nRRDL") - 1},
 
                   /*** Bank ***/
+                  // No bank-level ACT to ACT, ACT to PRE or PRE to ACT, as in OptiPIM,
+                  // because of subarray-level parallelism. The subarray level holds them.
                   {.level = "bank",
                    .preceding = {"ACT"},
                    .following = {"RD", "RDA", "BKRD"},
@@ -455,6 +462,8 @@ private:
                    .preceding = {"PRE"},
                    .following = {"ACT"},
                    .latency = V("nRP")},
+                  // OptiPIM's sibling latencies, taken from Ramulator-SALP:
+                  // nRA = nCL/2 = 3 and nWA = nCWL + nBL + nWR/2 = 12.
                   {.level = "subarray",
                    .preceding = {"RD", "RDA"},
                    .following = {"SASEL", "ACT", "RD", "RDA"},

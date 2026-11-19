@@ -4,9 +4,10 @@
  * Provides the bank-ID and program-ID primitives that Triton's IM backend
  * emits as extern calls (__pim_get_bank_id / __pim_get_program_id).
  *
- * benchmarks/pass_ablation.py compiles this file with every kernel. Its correctness
- * check and its trace run both set these before each call, calling the kernel once
- * per (program, bank) to emulate multi-bank SIMD execution.
+ * benchmarks/pipeline.py compiles this file with every kernel. Its correctness
+ * check and its trace run both call the kernel once per (program, bank) to emulate
+ * multi-bank SIMD execution, setting the program ids once per instance and the bank id
+ * before each call.
  *
  * The "set" functions are called by the host driver; the "get" functions
  * are called from inside the compiled kernel.

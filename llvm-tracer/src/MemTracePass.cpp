@@ -53,10 +53,6 @@ struct MemTracePass : public PassInfoMixin<MemTracePass> {
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
-      // Skip our own runtime helpers.
-      if (F.getName().starts_with("__mem_trace") ||
-          F.getName().starts_with("__pim_"))
-        continue;
 
       // Collect first to avoid iterator invalidation.
       SmallVector<LoadInst *, 64> Loads;

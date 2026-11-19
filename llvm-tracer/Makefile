@@ -19,7 +19,7 @@ $(BUILD_DIR)/MemTracePass.dylib: src/MemTracePass.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -shared -undefined dynamic_lookup -o $@ $<
 
 # Pass plugin: arithmetic instrumentation for SIMDRAM
-$(BUILD_DIR)/ComputeTracePass.dylib: src/ComputeTracePass.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/ComputeTracePass.dylib: src/ComputeTracePass.cpp runtime/simdram_runtime.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -shared -undefined dynamic_lookup -o $@ $<
 
 clean:

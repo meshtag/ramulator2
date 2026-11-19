@@ -1,3 +1,7 @@
+/* OptiPIM's PIM controller (third_party/OptiPIM/simulator/src/dram_controller/impl/
+ * pim_dram_controller.cpp), reformatted. The deltas: the plugin list is upstream's base
+ * class member rather than one of its own, and the unused row hit, miss and conflict
+ * counters and two empty branches are dropped. */
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
 
@@ -109,6 +113,8 @@ public:
         buffer->remove(req_it);
       } else {
         if (m_dram->m_command_meta(req_it->command).is_opening) {
+          // OptiPIM's behaviour, kept on purpose. The request leaves its buffer even when
+          // the active buffer refuses it, where upstream's controller checks the enqueue.
           m_active_buffer.enqueue(*req_it);
           buffer->remove(req_it);
         }
@@ -199,9 +205,7 @@ private:
     return request_found;
   }
 
-  // [P0.2 drain-tail fix] mirror OptiPIM pim_dram_controller.cpp::clear(): the
-  // controller is "clear" only when every queue is empty, so finished() waits
-  // for the memory drain tail (33-942 cyc) that TritonIM previously skipped.
+  // Clear once no buffer and no in-flight read holds a request.
   bool clear() override {
     bool no_pending = true;
     if (m_active_buffer.size()) no_pending = false;

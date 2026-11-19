@@ -59,14 +59,8 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
 }
 
 /* Double the table, rehashing the claimed entries. Returns 0 if the allocation fails,
- * leaving the table untouched.
- *
- * WHY THIS EXISTS: the capacity used to be fixed at create() from a caller hint, and
- * a full table falls back to "treat as new". The lockstep hint was sized to the PE
- * register file, which has nothing to do with how many distinct addresses one
- * program-id touches, so on large tiles the table filled partway through and the
- * collapse silently stopped collapsing. On matmul 128x3072x768 that inflated bank
- * reads 1,769,472 -> 2,668,032 and cycles 14,545,807 -> 21,150,357 (2026-09-10). */
+ * leaving the table untouched. The creation hint cannot know how many distinct keys a run
+ * marks, and a full table would stop the collapse built on it partway through. */
 static int addr_dedup_grow(addr_dedup_state_t *s) {
   int newcap = s->capacity * 2;
   if (newcap <= s->capacity)
