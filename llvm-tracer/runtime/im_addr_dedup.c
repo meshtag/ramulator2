@@ -17,11 +17,8 @@ struct addr_dedup_state {
   uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
 
-/* Pack three keys into one uint64. Layout (LSB→MSB):
- *   key1: 16 bits  (global_bank, max ~64k)
- *   key2: 32 bits  (sa*rows + row + optional bit, max ~4G)
- *   key3: 16 bits  (col)
- * Total: 64 bits. */
+/* Pack three keys into one uint64, LSB to MSB: key1 16 bits, key2 32 bits, key3 16 bits.
+ * Higher bits of each key are dropped. The lockstep caller passes one hash split there. */
 static inline uint64_t pack_keys(uint64_t k1, uint64_t k2, uint64_t k3) {
   return (k1 & 0xFFFFULL) | ((k2 & 0xFFFFFFFFULL) << 16) |
          ((k3 & 0xFFFFULL) << 48);

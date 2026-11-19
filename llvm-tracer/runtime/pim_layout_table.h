@@ -4,10 +4,10 @@
  * Kernel and runtime link into one dylib, so a runtime just reads them.
  *
  * Record: [operand_arg, bank_replicated, num_axes, is_store,
- * footprint...]. bank_replicated is the compiler-DERIVED role: 1 when every bank sees
- * the same elements (deliver to each PE), 0 when the tensor is bank-partitioned, -1
- * when the pass said nothing and the host's role stands. operand_arg == tensor id,
- * because pointer args are registered first and in signature order.
+ * footprint...]. bank_replicated is the compiler-derived receive count: 0 when the
+ * tensor is bank-partitioned, otherwise how many banks receive a copy, 1 meaning every
+ * bank, and -1 when the pass said nothing and the host's role stands. operand_arg ==
+ * tensor id, because pointer args are registered first and in signature order.
  *
  * TRAP: the widths below must equal kRecWords in TritonIMToLLVM.cpp, which lives in a
  * DIFFERENT submodule. Change one without the other and every record past the first is

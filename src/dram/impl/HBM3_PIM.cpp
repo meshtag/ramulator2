@@ -37,16 +37,14 @@ public:
    *             Requests & Commands
    ***********************************************/
   inline static constexpr ImplDef m_commands = {
-      "ACT",   "PRE",   "PREASA", "PREA",  "RD",    "WR",
-      "RDA",   "WRA",   "REFab",  "REFsb", "RFMab", "RFMsb",
-      "PIMOp", "SASEL", "SARD",   "SAWR",  "BKRD",  "BKWR",
+      "ACT",   "PRE",   "PREA",  "RD",    "WR",    "RDA",   "WRA",
+      "REFab", "REFsb", "RFMab", "RFMsb", "SASEL", "BKRD",  "BKWR",
   };
 
   inline static const ImplLUT m_command_scopes = LUT(m_commands, m_levels,
                                                      {
                                                          {"ACT", "row"},
                                                          {"PRE", "subarray"},
-                                                         {"PREASA", "bank"},
                                                          {"PREA", "channel"},
                                                          {"RD", "column"},
                                                          {"WR", "column"},
@@ -56,10 +54,7 @@ public:
                                                          {"REFsb", "bank"},
                                                          {"RFMab", "channel"},
                                                          {"RFMsb", "bank"},
-                                                         {"PIMOp", "row"},
                                                          {"SASEL", "row"},
-                                                         {"SARD", "column"},
-                                                         {"SAWR", "column"},
                                                          {"BKRD", "column"},
                                                          {"BKWR", "column"},
                                                      });
@@ -68,7 +63,6 @@ public:
       LUT<DRAMCommandMeta>(m_commands, {// open?   close?   access?  refresh?
                                         {"ACT", {true, false, false, false}},
                                         {"PRE", {false, true, false, false}},
-                                        {"PREASA", {false, true, false, false}},
                                         {"PREA", {false, true, false, false}},
                                         {"RD", {false, false, true, false}},
                                         {"WR", {false, false, true, false}},
@@ -78,16 +72,12 @@ public:
                                         {"REFsb", {false, false, false, true}},
                                         {"RFMab", {false, false, false, true}},
                                         {"RFMsb", {false, false, false, true}},
-                                        {"PIMOp", {false, true, false, false}},
                                         {"SASEL", {false, false, false, false}},
-                                        {"SARD", {false, false, true, false}},
-                                        {"SAWR", {false, false, true, false}},
                                         {"BKRD", {false, false, true, false}},
                                         {"BKWR", {false, false, true, false}}});
 
   inline static constexpr ImplDef m_requests = {
       "read",          "write",          "all-bank-refresh",
-      "compute",       "subarray-read",  "subarray-write",
       "bank-read",     "bank-write",     "per-bank-refresh",
       "all-bank-rfm",  "per-bank-rfm",
   };
@@ -100,9 +90,6 @@ public:
            {"per-bank-refresh", "REFsb"},
            {"all-bank-rfm", "RFMab"},
            {"per-bank-rfm", "RFMsb"},
-           {"compute", "PIMOp"},
-           {"subarray-read", "SARD"},
-           {"subarray-write", "SAWR"},
            {"bank-read", "BKRD"},
            {"bank-write", "BKWR"}});
 
@@ -462,28 +449,12 @@ private:
                    .latency = V("nRC")},
                   {.level = "subarray",
                    .preceding = {"ACT"},
-                   .following = {"SARD"},
-                   .latency = V("nRCDRD")},
-                  {.level = "subarray",
-                   .preceding = {"ACT"},
-                   .following = {"SAWR"},
-                   .latency = V("nRCDWR")},
-                  {.level = "subarray",
-                   .preceding = {"ACT"},
-                   .following = {"PRE", "SASEL", "PIMOp"},
+                   .following = {"PRE", "SASEL"},
                    .latency = V("nRAS")},
                   {.level = "subarray",
                    .preceding = {"PRE"},
                    .following = {"ACT"},
                    .latency = V("nRP")},
-                  {.level = "subarray",
-                   .preceding = {"SARD"},
-                   .following = {"PRE"},
-                   .latency = V("nRTPL")},
-                  {.level = "subarray",
-                   .preceding = {"SAWR"},
-                   .following = {"PRE"},
-                   .latency = V("nCWL") + V("nBL") + V("nWR")},
                   {.level = "subarray",
                    .preceding = {"RD", "RDA"},
                    .following = {"SASEL", "ACT", "RD", "RDA"},
@@ -504,8 +475,6 @@ private:
 
     m_actions[m_levels["channel"]][m_commands["PREA"]] =
         Lambdas::Action::Channel::PREab<HBM3_PIM>;
-    m_actions[m_levels["bank"]][m_commands["PREASA"]] =
-        Lambdas::Action::Bank::PREASA<HBM3_PIM>;
 
     m_actions[m_levels["subarray"]][m_commands["ACT"]] =
         Lambdas::Action::Subarray::ACT<HBM3_PIM>;
@@ -516,8 +485,6 @@ private:
     m_actions[m_levels["subarray"]][m_commands["RDA"]] =
         Lambdas::Action::Subarray::PRE<HBM3_PIM>;
     m_actions[m_levels["subarray"]][m_commands["WRA"]] =
-        Lambdas::Action::Subarray::PRE<HBM3_PIM>;
-    m_actions[m_levels["subarray"]][m_commands["PIMOp"]] =
         Lambdas::Action::Subarray::PRE<HBM3_PIM>;
   };
 
@@ -534,18 +501,10 @@ private:
         Lambdas::Preq::Subarray::RequireRowSelected<HBM3_PIM>;
     m_preqs[m_levels["subarray"]][m_commands["WR"]] =
         Lambdas::Preq::Subarray::RequireRowSelected<HBM3_PIM>;
-    m_preqs[m_levels["subarray"]][m_commands["SARD"]] =
-        Lambdas::Preq::Subarray::RequireRowOpen<HBM3_PIM>;
-    m_preqs[m_levels["subarray"]][m_commands["SAWR"]] =
-        Lambdas::Preq::Subarray::RequireRowOpen<HBM3_PIM>;
     m_preqs[m_levels["subarray"]][m_commands["BKRD"]] =
         Lambdas::Preq::Subarray::RequireRowSelected<HBM3_PIM>;
     m_preqs[m_levels["subarray"]][m_commands["BKWR"]] =
         Lambdas::Preq::Subarray::RequireRowSelected<HBM3_PIM>;
-    m_preqs[m_levels["subarray"]][m_commands["SASEL"]] =
-        Lambdas::Preq::Subarray::RequireRowOpen<HBM3_PIM>;
-    m_preqs[m_levels["subarray"]][m_commands["PIMOp"]] =
-        Lambdas::Preq::Subarray::RequireRowOpen<HBM3_PIM>;
   };
 
   void set_rowhits() {
@@ -560,12 +519,6 @@ private:
         Lambdas::RowHit::Subarray::RDWR<HBM3_PIM>;
     m_rowhits[m_levels["subarray"]][m_commands["BKWR"]] =
         Lambdas::RowHit::Subarray::RDWR<HBM3_PIM>;
-    m_rowhits[m_levels["subarray"]][m_commands["SARD"]] =
-        Lambdas::RowHit::Subarray::PIM<HBM3_PIM>;
-    m_rowhits[m_levels["subarray"]][m_commands["SAWR"]] =
-        Lambdas::RowHit::Subarray::PIM<HBM3_PIM>;
-    m_rowhits[m_levels["subarray"]][m_commands["PIMOp"]] =
-        Lambdas::RowHit::Subarray::PIM<HBM3_PIM>;
   }
 
   void set_rowopens() {
@@ -580,12 +533,6 @@ private:
         Lambdas::RowOpen::Subarray::RDWR<HBM3_PIM>;
     m_rowopens[m_levels["subarray"]][m_commands["BKWR"]] =
         Lambdas::RowOpen::Subarray::RDWR<HBM3_PIM>;
-    m_rowopens[m_levels["subarray"]][m_commands["SARD"]] =
-        Lambdas::RowOpen::Subarray::PIM<HBM3_PIM>;
-    m_rowopens[m_levels["subarray"]][m_commands["SAWR"]] =
-        Lambdas::RowOpen::Subarray::PIM<HBM3_PIM>;
-    m_rowopens[m_levels["subarray"]][m_commands["PIMOp"]] =
-        Lambdas::RowOpen::Subarray::PIM<HBM3_PIM>;
   }
 
   void create_nodes() {

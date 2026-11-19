@@ -1,9 +1,7 @@
 LLVM_CONFIG ?= /usr/local/bin/llvm-config
 
 CXX      := clang++
-CC       := clang
 CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags) -fPIC
-LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags)
 
 BUILD_DIR := build
 

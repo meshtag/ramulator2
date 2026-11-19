@@ -24,10 +24,10 @@
 /* ================================================================
  *  HBM3_PIM organization constants (must match config)
  * ================================================================ */
-static int cfg_num_channels = 1;
-static int cfg_num_pch = 2;
-static int cfg_num_bg = 4;
-static int cfg_num_banks = 4; /* per bank group */
+static const int cfg_num_channels = 1;
+static const int cfg_num_pch = 2;
+static const int cfg_num_bg = 4;
+static const int cfg_num_banks = 4; /* per bank group */
 /* HAND-COPY of the DRAM organization the SIMULATOR decodes with. The tracer builds
  * addresses from these; ramulator reads them from the org preset named in the shared
  * spec (HBM3_8Gb -> {1, 2, 4, 4, 64 subarrays, 512 rows, 64 cols} in
@@ -37,15 +37,15 @@ static int cfg_num_banks = 4; /* per bank group */
  * it stood, because the subarray count only sets the capacity ceiling below and takes
  * no part in the address slicing, but a tensor needing more than 16*512 rows per bank
  * was refused on a limit the machine does not have. */
-static int cfg_num_sa = 64;
-static int cfg_num_rows = 512;
+static const int cfg_num_sa = 64;
+static const int cfg_num_rows = 512;
 /* One column command moves internal_prefetch * dq = 2 * 128 = 256 bits on this part,
  * which is the HBM-PIM datapath, so the column index counts 256-bit words. Columns per
  * row halve to match, keeping the row at 8192 bits and the part's density unchanged.
  * These two MUST move together, and together with the simulator org (dq/column in the
  * rendered yaml), or the tracer addresses a row the machine does not have. */
-static int cfg_num_cols = 32;
-static int cfg_dq_bits = 256;
+static const int cfg_num_cols = 32;
+static const int cfg_dq_bits = 256;
 static void check_compiler_dq_bits(int cfg_bits);
 
 /* Width of one modelled DATA VALUE in bits. This is a HARDWARE property (the shared
@@ -54,7 +54,15 @@ static void check_compiler_dq_bits(int cfg_bits);
  * hardware: values_per_col = dq_bits / data_width. Deriving it from the numpy dtype
  * instead made us pack 4 int32 per column where the spec, and OptiPIM, pack 8, so we
  * paid double the bank-reads for the same tensor (2026-09-06). */
-static int cfg_data_width_bits = 16;
+static const int cfg_data_width_bits = 16;
+
+/* The interleaved map shifts by log2 of every level and of the values one column holds,
+ * so a count that is not a power of two would silently corrupt it. */
+#define PIM_POW2(v) ((v) > 0 && ((v) & ((v) - 1)) == 0)
+_Static_assert(PIM_POW2(cfg_num_channels) && PIM_POW2(cfg_num_pch) &&
+                   PIM_POW2(cfg_num_bg) && PIM_POW2(cfg_num_banks) &&
+                   PIM_POW2(cfg_num_cols) && PIM_POW2(cfg_dq_bits / cfg_data_width_bits),
+               "the interleaved map needs every level to be a power of two");
 
 /* From im_runtime: the replay lane of the current kernel call. */
 extern int32_t __pim_get_bank_id(void);
@@ -128,15 +136,14 @@ typedef struct {
 
   /* Offset of element 0 in the global bit-interleaved address space. */
   uint64_t layout_linear_base;
-  /* Compiler's partition bit: 1 replicated, 0 bank-partitioned, -1 not stated. Only 0
-   * changes anything: that tensor's accesses go to the executing lane's own bank at a
-   * per-lane slab address instead of the element's interleaved home, see
-   * place_in_lane_slab. The lockstep key drops bank, so counts do not move; addresses do. */
+  /* The record's receive count (pim_layout_table.h), -1 when the compiler stated nothing.
+   * Any stated value puts the tensor's accesses in the executing lane's slab, see
+   * place_in_lane_slab, instead of the element's interleaved home. */
   int bank_replicated;
   int lane_row_base;        /* first row of this tensor's per-lane slab, or -1 */
   int lane_row_count;
   int lane_ord[MAX_BANKS];  /* next free value slot per lane */
-  slot_map_t *lane_slot;    /* (lane, elem) -> slot, partitioned tensors only */
+  slot_map_t *lane_slot;    /* (lane, elem) -> slot, every tensor with a slab */
 } tensor_info_t;
 
 static tensor_info_t tensors[MAX_TENSORS];
@@ -314,13 +321,10 @@ static int compute_global_bank(int ch, int pch, int bg, int bank) {
 
 /* Inverse of compute_global_bank: flat replay bank id -> (ch,pch,bg,bank). */
 static void decompose_global_bank(int g, int *ch, int *pch, int *bg, int *bank) {
-  int nb = cfg_num_banks > 0 ? cfg_num_banks : 1;
-  int nbg = cfg_num_bg > 0 ? cfg_num_bg : 1;
-  int npch = cfg_num_pch > 0 ? cfg_num_pch : 1;
   if (g < 0) g = 0;
-  *bank = g % nb;  g /= nb;
-  *bg   = g % nbg; g /= nbg;
-  *pch  = g % npch; g /= npch;
+  *bank = g % cfg_num_banks; g /= cfg_num_banks;
+  *bg   = g % cfg_num_bg;    g /= cfg_num_bg;
+  *pch  = g % cfg_num_pch;   g /= cfg_num_pch;
   *ch   = g;
 }
 
@@ -336,7 +340,7 @@ static inline int lane_bank(int lane, int h) {
  * configuration via log2 of cfg_*. There is NO hardcoded bank count —
  * the field widths shift to match cfg_num_banks, cfg_num_bg, cfg_num_pch,
  * cfg_num_channels, cfg_num_cols, and values_per_col at runtime. All of
- * those must be powers of two, which pim_init enforces.
+ * those must be powers of two, which the _Static_assert after the constants enforces.
  *
  *   [ within-DQ | col | bank-within-BG | BG | pch | chan | linear_row ]
  *
@@ -344,23 +348,19 @@ static inline int lane_bank(int lane, int h) {
  * then advance through cols, then through banks within a BG, then BGs,
  * then pch, then channels, finally advancing linear_row (sa*num_rows + row).
  *
- * Worked example for the project's default 1-channel HBM3 config
- * (vpc=4, num_cols=64, cfg_num_banks=4 banks/BG, cfg_num_bg=4 BGs,
- *  cfg_num_pch=2, cfg_num_channels=1):
- *   bits 0..1   within-DQ (4 values per col)
- *   bits 2..7   col (64 cols)
- *   bits 8..9   bank within BG (4)
- *   bits 10..11 BG (4)
- *   bit  12     pch (2)
+ * Worked example for the constants above (vpc=16, num_cols=32, 4 banks/BG, 4 BGs,
+ * 2 pchs, 1 channel):
+ *   bits 0..3   within-DQ (16 values per 256-bit col)
+ *   bits 4..8   col (32 cols)
+ *   bits 9..10  bank within BG (4)
+ *   bits 11..12 BG (4)
+ *   bit  13     pch (2)
  *   (no chan bits for cfg_num_channels=1)
- *   bits 13..   linear_row
- * Under that config: elements 0..255 lie within bank 0 of BG 0 of pch 0
- * row 0; 256..511 advance to bank 1 of BG 0; after all 4 banks of BG 0
- * (1024 elements) advance to BG 1; etc.
+ *   bits 14..   linear_row
+ * Elements 0..511 lie within bank 0 of BG 0 of pch 0 row 0, 512..1023 advance to
+ * bank 1 of BG 0, and after all 4 banks of BG 0 (2048 elements) BG 1 follows.
  *
- * Vary cfg_num_banks/cfg_num_bg/etc. for ablation and the bit slice
- * widths re-shape automatically — no code change required, only that
- * the new values are powers of two. */
+ * The geometry changes only by editing the constants, which must stay powers of two. */
 static void map_element_interleaved(const tensor_info_t *t, int elem_idx,
                                     int *ch, int *pch, int *bg, int *bank,
                                     int *sa, int *row, int *col) {
@@ -441,8 +441,8 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   }
   if (inserted)
     t->lane_ord[key_lane]++;
-  int vpc = t->values_per_col > 0 ? t->values_per_col : 16;
-  int vpr = t->values_per_row > 0 ? t->values_per_row : 512;
+  int vpc = t->values_per_col;
+  int vpr = t->values_per_row;
   /* The halves of a pair take turns in blocks of words at matching (row, col). This is
    * the runtime's convention, not a compiler statement, and the block size moves cycles. */
   int w = slot / vpc;
@@ -586,31 +586,6 @@ void pim_init(const char *trace_file) {
   g_lane_row_top = -1;
   stat_lane_placed = 0;
 
-  /* The interleaved map shifts by log2 of every level, so a count that is not a power
-   * of two would silently corrupt it. */
-  {
-    struct {
-      const char *name;
-      int value;
-    } pow2_checks[] = {
-        {"channels",        cfg_num_channels},
-        {"pseudochannels",  cfg_num_pch},
-        {"bank groups",     cfg_num_bg},
-        {"banks per group", cfg_num_banks},
-        {"columns",         cfg_num_cols},
-    };
-    for (size_t i = 0; i < sizeof(pow2_checks) / sizeof(pow2_checks[0]); i++) {
-      int v = pow2_checks[i].value;
-      if (v <= 0 || (v & (v - 1)) != 0) {
-        fprintf(stderr,
-                "[pim-runtime] ERROR: the interleaved map needs every level to be a "
-                "power of two, but %s=%d.\n",
-                pow2_checks[i].name, v);
-        exit(1);
-      }
-    }
-  }
-
   num_tensors = 0;
   cur_phase = PIM_PHASE_IDLE;
   stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
@@ -618,7 +593,8 @@ void pim_init(const char *trace_file) {
   advance_program_epoch_if_needed();
   {
     /* Half as many lanes as banks is HBM-PIM's PE per bank pair (Lee et al. ISCA'21).
-     * This line must not say WARN: invariant 6 fails on any. */
+     * This line must not say WARN: the ladder records every WARN line in
+     * lever_ladder.json. */
     int banks = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
     g_banks_per_lane = 1;
     if (__pim_lanes > 0 && 2 * (int)__pim_lanes == banks && cfg_num_banks % 2 == 0) {
@@ -639,7 +615,6 @@ void pim_init(const char *trace_file) {
   {
     int active_banks =
         cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks;
-    if (active_banks < 1) active_banks = 1;
     g_lockstep_collapse = addr_dedup_create(active_banks * 136);
   }
 
@@ -660,16 +635,12 @@ void pim_init(const char *trace_file) {
  * emitPimLayoutTable (TritonIMToLLVM.cpp) puts these globals in the KERNEL
  * object. Kernel and runtime link into one dylib, so we just read them.
  *
- * Record: [operand_arg, bank_replicated, num_axes, footprint...]. bank_replicated is the compiler-DERIVED role: 1 when
- * every bank sees the same elements (deliver to each PE = OPERAND), 0 when the
- * tensor is bank-partitioned (read bank-locally = STREAMED), -1 when the pass
- * said nothing and the host's role stands.
- * operand_arg == tensor id, because pointer args are registered first and in
- * signature order. bank_replicated is the only word the runtime acts on; the address
- * footprint words fed the retired residency capacity and are ignored,
- * but the record width is kept in sync with emitPimLayoutTable's kRecWords so the
- * table still strides correctly. The record layout itself lives in
- * pim_layout_table.h so the SIMDRAM runtime reads the same definition. */
+ * Record layout in pim_layout_table.h, which the SIMDRAM runtime shares. The runtime
+ * reads operand_arg, bank_replicated (0 when the tensor is bank-partitioned, otherwise
+ * how many banks receive a copy, 1 meaning every bank, and -1 when the pass said
+ * nothing) and is_store. operand_arg == tensor id, because pointer args are registered
+ * first and in signature order. The footprint words are unread here but keep the
+ * record width equal to kRecWords. */
 
 static int stat_layout_from_compiler = 0;
 
@@ -754,7 +725,7 @@ static void apply_compiler_layout(int tensor_id) {
        * addresses). When the rows do not fit, keep the interleaved home and say so. */
       int lanes = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
                   g_banks_per_lane;
-      int vpr = _t->values_per_row > 0 ? _t->values_per_row : 512;
+      int vpr = _t->values_per_row;
       int share2 = 2 * ((_t->num_elements + lanes - 1) / lanes);
       int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
                      : share2 > 65536 ? share2
@@ -762,7 +733,7 @@ static void apply_compiler_layout(int tensor_id) {
       int rows = (per_lane + vpr - 1) / vpr;
       if (g_banks_per_lane > 1) {
         /* Rows are per bank, and each bank of a pair holds every other block of words. */
-        int vpc = _t->values_per_col > 0 ? _t->values_per_col : 16;
+        int vpc = _t->values_per_col;
         int span = PIM_PAIR_BLOCK_WORDS * g_banks_per_lane;
         int bank_words = ((per_lane + vpc - 1) / vpc + span - 1) / span *
                          PIM_PAIR_BLOCK_WORDS;
@@ -791,7 +762,8 @@ static void apply_compiler_layout(int tensor_id) {
      * tensor both loaded and stored is the output), bank_replicated says whether every
      * bank sees the same elements. The host string used to be the role and a layout
      * change silently inverted the charge (31x on a transposed accumulator); now it is
-     * an input to check, and a disagreement fails invariant 6 instead of costing a day. */
+     * an input to check, and a disagreement prints a WARN, which the ladder records,
+     * instead of costing a day. */
     if (rec[PIM_LW_IS_STORE] == 1 || rec[PIM_LW_BANK_REPLICATED] >= 0) {
       int derived = rec[PIM_LW_IS_STORE] == 1 ? PIM_ROLE_ACCUMULATOR
                     : rec[PIM_LW_BANK_REPLICATED] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
@@ -853,8 +825,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
    * elem_size stays in use for address decoding (addr -> element index), which is
    * genuinely a property of how the host stores the array. */
   t->values_per_col = cfg_dq_bits / cfg_data_width_bits;
-  if (t->values_per_col < 1)
-    t->values_per_col = 1;
   t->values_per_row = cfg_num_cols * t->values_per_col;
 
   int total_flat_banks =
@@ -874,21 +844,8 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
    * simulator can service them in parallel without bank contention.
    * Aligning to a global-row boundary instead would force every tensor
    * to start at bank 0, serializing all small-tensor accesses there. */
-  /* Per-tensor power-of-2 guard for values_per_col. Other levels are guarded once
-   * at pim_init. */
-  if (t->values_per_col <= 0 ||
-      (t->values_per_col & (t->values_per_col - 1)) != 0) {
-    fprintf(stderr,
-            "[pim-runtime] ERROR: tensor %d has values_per_col=%d, which is not a "
-            "power of two as the interleaved map requires.\n",
-            num_tensors, t->values_per_col);
-    return -1;
-  }
-
   uint64_t elems_per_global_row =
       (uint64_t)t->values_per_row * (uint64_t)total_flat_banks;
-  if (elems_per_global_row == 0)
-    elems_per_global_row = 1;
 
   uint64_t align = (uint64_t)t->values_per_col;
   uint64_t base = g_interleaved_next_linear;
@@ -1101,8 +1058,8 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   }
   tensor_info_t *t = &tensors[tidx];
 
-  /* Track program-id boundaries so the dedup table is reset per tile. The ordinal
-   * advance follows the epoch because it keys on cur_dispatch. */
+  /* Track program-id and tile boundaries, which advance cur_dispatch in the lockstep
+   * key. The ordinal advance follows the epoch because it keys on cur_dispatch. */
   if (cur_phase == PIM_PHASE_COMPUTE) {
     advance_program_epoch_if_needed();
     access_ord_next();
@@ -1167,11 +1124,6 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
         stat_ignored++;
         continue;
       }
-      /* Keyed by the element's physical tuple, not by the receiving bank where an
-       * OPERAND load's bus write actually lands. Re-keying was tried 2026-09-10 and
-       * reverted as inert, but the premise has since changed: the conv weight load
-       * used to arrive one element per call and skip this path entirely, and it now
-       * vectorizes. Re-keying is untested under that shape. */
       /* Key on the PLACED tuple. Keying on the interleaved home dropped every
        * word-mate before it reached place_in_lane_slab, so a partitioned tensor's
        * slab held one slot per word instead of one per element and came out 2-8x

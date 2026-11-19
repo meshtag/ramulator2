@@ -35,14 +35,6 @@ namespace Bank {
     node->m_state = T::m_states["Closed"];
   };
 
-  template <class T>
-  void PREASA(typename T::Node *node, int cmd, int target_id, Clk_t clk) {
-    for (auto child : node->m_child_nodes) {
-      child->m_state = T::m_states["Closed"];
-      child->m_row_state.clear();
-    }
-  };
-
 }       // namespace Bank
 
 namespace BankGroup {

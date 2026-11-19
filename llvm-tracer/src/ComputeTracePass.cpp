@@ -83,13 +83,10 @@ static int mapOpcode(unsigned LLVMOp) {
 
 /*
  * Forward def-use walker: does a BinaryOperator's result flow into a genuine
- * DATA store? Returns the terminal store instruction (a StoreInst, or an
- * llvm.masked.store / llvm.masked.scatter) reached DFS-first; the caller
- * inserts __compute_trace immediately before it so the destination address
- * dominates the call site in SSA (avoids "instruction does not dominate all
- * uses" verifier failures). Sets DestAddr to the store's pointer operand
- * (null for masked.scatter's vector-of-pointers → runtime resolves via
- * current_acc).
+ * DATA store? Returns the terminal store reached DFS-first (a StoreInst,
+ * llvm.masked.store or llvm.masked.scatter) and sets DestAddr to its pointer
+ * operand, which for masked.scatter is the pointer vector the caller strips to
+ * the tensor argument.
  *
  * W4 FIX (2026-07-01): returns nullptr for BinaryOperators whose value never
  * reaches a data store — i.e. pure ADDRESS/INDEX/LOOP-CONTROL arithmetic, which
@@ -310,9 +307,9 @@ struct ComputeTracePass : public PassInfoMixin<ComputeTracePass> {
         // Insert at the BO, so the call fires once per ARITHMETIC EXECUTION.
         // Inserting at the store (the old behavior) put it OUTSIDE the reduction
         // loop, so a K-deep MAC chain was charged like a single MAC and SIMDRAM
-        // cost was independent of the arithmetic. dest_addr is passed only when it
-        // dominates the BO; otherwise null, and the runtime attributes to
-        // current_acc.
+        // cost was independent of the arithmetic. dest_addr is the scalar element
+        // pointer when it dominates the BO, else the tensor argument argumentBaseOf
+        // finds, else null, and the runtime then attributes to current_acc.
         IRBuilder<> Builder(BO->getNextNode());
         Value *Dest = NullPtr;
         if (DestAddr) {
