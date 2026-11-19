@@ -100,7 +100,6 @@ static uint64_t g_interleaved_next_linear = 0;
 /* Lane slabs take rows from the TOP of the per-bank row space; interleaved placement
  * grows from the bottom, and the two must never meet. */
 static int g_lane_row_top = -1;
-static uint64_t stat_lane_placed = 0;
 /* Banks per lane: 2 when the kernel has half as many lanes as the machine has banks,
  * because an HBM-PIM PE serves an even/odd bank pair. Set in pim_init. */
 static int g_banks_per_lane = 1;
@@ -176,23 +175,31 @@ static pim_phase_t cur_phase = PIM_PHASE_IDLE;
 static int initialized = 0;
 static int finalized = 0;
 
-/* Statistics */
-static uint64_t stat_bank_reads = 0;
-static uint64_t stat_bank_writes = 0;
-/* Operand deliveries NOT charged because the compiler said the value is replicated over
- * only some of the banks. 0 whenever every split is single-axis, which is every mapping
- * our own picker emits. */
-static uint64_t stat_operand_repl_skips = 0;
-static uint64_t stat_reads = 0;
-static uint64_t stat_writes = 0;
-static uint64_t stat_ignored = 0;
-/* Loads folded by the within-call DQ-word coalescer: lanes of ONE vector load that
- * land on the same DRAM column. */
-static uint64_t stat_load_coalesced = 0;
-/* Distinct keys past the 64-entry per-call buffer, i.e. coalescing this call could
- * not complete. Must stay 0; nonzero means a kernel emits a vector wider than the
- * buffer and some duplicate lanes were charged twice. */
-static uint64_t stat_coalesce_overflow = 0;
+/* Per-run counts and warn-once flags. pim_init clears both, because the harness inits
+ * one library more than once per process (the ladder verifies, then traces), and each
+ * run must report its own counts and WARNs. */
+static struct {
+  uint64_t bank_reads, bank_writes, reads, writes, ignored;
+  /* Operand deliveries NOT charged because the compiler said the value is replicated
+   * over only some of the banks. 0 whenever every split is single-axis, which is every
+   * mapping our own picker emits. */
+  uint64_t operand_repl_skips;
+  /* Loads folded by the within-call DQ-word coalescer: lanes of ONE vector load that
+   * land on the same DRAM column. */
+  uint64_t load_coalesced;
+  /* Distinct keys past the 64-entry per-call buffer, i.e. coalescing this call could
+   * not complete. Must stay 0. Nonzero means a kernel emits a vector wider than the
+   * buffer and some duplicate lanes were charged twice. */
+  uint64_t coalesce_overflow;
+  uint64_t lockstep_skips;
+  uint64_t lane_placed;
+  int layout_from_compiler;
+} stats;
+/* One flag per WARN condition, so one condition cannot hide another. */
+static struct {
+  int dispatch_overflow, lane_outside, slot_alloc, slab_overflow, no_layout_table,
+      lane_count;
+} warned;
 
 /* Lockstep collapse. The host replays each kernel once per bank, so one SIMD
  * instruction reaches the trace once per bank, while HBM-PIM issues it once to every
@@ -200,7 +207,6 @@ static uint64_t stat_coalesce_overflow = 0;
  * lockstep_ns, dispatch, lane ordinal, row and col fold into one event. Every role
  * takes it, and the table grows on demand. */
 static addr_dedup_state_t *g_lockstep_collapse = NULL;
-static uint64_t stat_lockstep_skips = 0;
 
 /* The dispatch this runtime is currently seeing, taken from __pim_program_epoch.
  *
@@ -218,7 +224,6 @@ static uint64_t cur_dispatch = 0;
  * with instance p+1's tile 0, so two distinct dispatches folded into one and the
  * trace under-emitted. The tile index is policed at pack time. */
 #define PIM_TILE_BITS 10
-static int g_warned_dispatch_overflow = 0;
 
 /* Per-lane access ordinal within a dispatch. Lanes replay one instruction stream, so the
  * k-th access of every lane is the same instruction. Without it the key cannot tell one
@@ -298,9 +303,9 @@ static void advance_program_epoch_if_needed(void) {
     uint64_t tile = __pim_tile_index();
     uint64_t epoch = __pim_program_epoch;
     uint64_t packed = __pim_persistent ? ((epoch << PIM_TILE_BITS) | tile) : epoch;
-    if (!g_warned_dispatch_overflow && __pim_persistent &&
+    if (!warned.dispatch_overflow && __pim_persistent &&
         tile >= (1ULL << PIM_TILE_BITS)) {
-      g_warned_dispatch_overflow = 1;
+      warned.dispatch_overflow = 1;
       fprintf(stderr,
               "[pim-runtime] WARN: dispatch id does not fit (%llu tiles, epoch "
               "%llu, %d tile bits). Ids alias and distinct dispatches collapse.\n",
@@ -417,12 +422,11 @@ typedef struct {
  * treatment: its copy in bank b is a full slab, not the source word's (sa,row,col)
  * with the bank bits dropped, which aliased 4-8 words onto one address. */
 static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
-  static int warned = 0;
   int lanes = cfg_num_channels * cfg_num_pch * cfg_num_bg * cfg_num_banks /
               g_banks_per_lane;
   int lane = __pim_get_bank_id();
   if (lane < 0 || lane >= lanes || lane >= MAX_BANKS) {
-    if (!warned++)
+    if (!warned.lane_outside++)
       fprintf(stderr, "[pim-runtime] WARN replay lane %d outside the %d lanes; kept "
                       "the interleaved home.\n", lane, lanes);
     return;
@@ -434,7 +438,7 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
                                      t->lane_ord[key_lane], &inserted);
   if (slot < 0) {
-    if (!warned++)
+    if (!warned.slot_alloc++)
       fprintf(stderr, "[pim-runtime] WARN slab slot map allocation failed; kept the "
                       "interleaved home.\n");
     return;
@@ -452,7 +456,7 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   int bslot = bw * vpc + slot % vpc;
   int r = bslot / vpr;
   if (r >= t->lane_row_count) {
-    if (!warned++)
+    if (!warned.slab_overflow++)
       fprintf(stderr, "[pim-runtime] WARN tensor lane %d overflowed its %d-row slab; "
                       "rows now alias.\n", lane, t->lane_row_count);
     r = t->lane_row_count - 1;
@@ -462,24 +466,24 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   loc->sa = linear_row / cfg_num_rows;
   loc->row = linear_row % cfg_num_rows;
   loc->col = (bslot % vpr) / vpc;
-  stat_lane_placed++;
+  stats.lane_placed++;
 }
 
 /* Resolve one logical element access to its physical HBM tuple.
  *
  * Returns 1 on success and fills `loc`. Returns 0 when the current phase
  * should not emit anything or the address falls outside the tensor. In both
- * failure cases, stat_ignored is updated here so callers can simply return. */
+ * failure cases, stats.ignored is updated here so callers can simply return. */
 static int resolve_access_location(tensor_info_t *t, uint64_t addr,
                                    pim_phys_loc_t *loc) {
   if (cur_phase == PIM_PHASE_IDLE) {
-    stat_ignored++;
+    stats.ignored++;
     return 0;
   }
 
   int elem_idx = (int)((addr - (uint64_t)t->base_addr) / t->elem_size);
   if (elem_idx < 0 || elem_idx >= t->num_elements) {
-    stat_ignored++;
+    stats.ignored++;
     return 0;
   }
 
@@ -502,7 +506,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       case PIM_ROLE_STREAMED:
         emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        stat_bank_reads++;
+        stats.bank_reads++;
         break;
       case PIM_ROLE_OPERAND: {
         /* An operand load is a bus-mediated write into the RECEIVING PE's register
@@ -523,7 +527,7 @@ static void emit_access_by_role_phase(tensor_info_t *t,
                        ? t->bank_replicated : nl;
         int stride = (recv > 0) ? (nl / recv) : 1;
         if (stride > 1 && (__pim_get_bank_id() % stride) != 0) {
-          stat_operand_repl_skips++;
+          stats.operand_repl_skips++;
           break;
         }
         int dch, dpch, dbg, dbank;
@@ -531,20 +535,20 @@ static void emit_access_by_role_phase(tensor_info_t *t,
         decompose_global_bank(lane_bank(__pim_get_bank_id(), loc->bank & 1), &dch, &dpch,
                               &dbg, &dbank);
         emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
-        stat_writes++;
+        stats.writes++;
         break;
       }
       case PIM_ROLE_ACCUMULATOR:
         emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        stat_reads++;
+        stats.reads++;
         break;
       }
     } else {
       if (t->role == PIM_ROLE_ACCUMULATOR) {
         emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
-        stat_bank_writes++;
+        stats.bank_writes++;
       }
       /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     }
@@ -582,14 +586,16 @@ void pim_init(const char *trace_file) {
             (int)__pim_layout_scheme, (int)__pim_placement_align);
     exit(1);
   }
+  memset(&stats, 0, sizeof stats);
+  memset(&warned, 0, sizeof warned);
+  g_ord_lane = -1;
+  g_ord_disp = UINT64_MAX;
+  g_access_ord = 0;
   g_interleaved_next_linear = 0;
   g_lane_row_top = -1;
-  stat_lane_placed = 0;
 
   num_tensors = 0;
   cur_phase = PIM_PHASE_IDLE;
-  stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
-      0;
   advance_program_epoch_if_needed();
   {
     /* Half as many lanes as banks is HBM-PIM's PE per bank pair (Lee et al. ISCA'21).
@@ -606,8 +612,6 @@ void pim_init(const char *trace_file) {
                       "banks; lane placement puts lane b in bank b and assumes they agree.\n",
               (int)__pim_lanes, banks);
   }
-  stat_lockstep_skips = 0;
-  stat_coalesce_overflow = 0;
 
   /* HBM-PIM issues one all-bank command, but pass_ablation replays the kernel once per
    * (pid, bank), so the collapse undoes the replay. 136 entries per bank is only the
@@ -641,8 +645,6 @@ void pim_init(const char *trace_file) {
  * nothing) and is_store. operand_arg == tensor id, because pointer args are registered
  * first and in signature order. The footprint words are unread here but keep the
  * record width equal to kRecWords. */
-
-static int stat_layout_from_compiler = 0;
 
 /* The compiler bakes a bus width into every vector width it picks. Ours must match,
  * or the artifact was tuned for a machine this run is not modelling. */
@@ -683,8 +685,7 @@ static void apply_compiler_layout(int tensor_id) {
     /* The SIMDRAM twin of this silent return was a 64x under-charge (review 2026-09-12);
      * here the tensor merely stays on the interleaved map, but a placement decision made
      * by default rather than by the compiler must still be audible. */
-    static int warned = 0;
-    if (!warned++)
+    if (!warned.no_layout_table++)
       fprintf(stderr, "[pim-runtime] WARN kernel carries no layout table; every tensor "
                       "stays on the interleaved map and the host roles stand.\n");
     return;
@@ -694,7 +695,7 @@ static void apply_compiler_layout(int tensor_id) {
     const int32_t *rec = table + (size_t)i * PIM_LAYOUT_REC_WORDS;
     if (rec[PIM_LW_OPERAND_ARG] != tensor_id)
       continue;
-    if (stat_layout_from_compiler == 0)
+    if (stats.layout_from_compiler == 0)
       fprintf(
           stderr,
           "[pim-runtime] compiler-emitted layout table found in the kernel "
@@ -780,7 +781,7 @@ static void apply_compiler_layout(int tensor_id) {
       fprintf(stderr, "[pim-runtime] WARN tensor %d (%s): compiler stated no partition "
                       "bit; placement stays on the interleaved map.\n", tensor_id,
               _t->role == PIM_ROLE_ACCUMULATOR ? "ACCUMULATOR" : "STREAMED");
-    stat_layout_from_compiler++;
+    stats.layout_from_compiler++;
     return;
   }
   /* A table exists but has no record for this tensor: same gap, same warning. */
@@ -908,27 +909,27 @@ void pim_finalize(void) {
 
   fprintf(stderr, "\n[pim-runtime] === PIM Trace Statistics ===\n");
   fprintf(stderr, "[pim-runtime]   Bank-reads  (BR): %" PRIu64 "\n",
-          stat_bank_reads);
+          stats.bank_reads);
   fprintf(stderr, "[pim-runtime]   Bank-writes (BW): %" PRIu64 "\n",
-          stat_bank_writes);
+          stats.bank_writes);
   fprintf(stderr, "[pim-runtime]   Reads       (R) : %" PRIu64 "\n",
-          stat_reads);
+          stats.reads);
   fprintf(stderr, "[pim-runtime]   Writes      (W) : %" PRIu64 "\n",
-          stat_writes);
+          stats.writes);
   fprintf(stderr, "[pim-runtime]   Ignored        : %" PRIu64 "\n",
-          stat_ignored);
+          stats.ignored);
   fprintf(stderr, "[pim-runtime]   Total PIM ops  : %" PRIu64 "\n",
-          stat_bank_reads + stat_bank_writes + stat_reads + stat_writes);
+          stats.bank_reads + stats.bank_writes + stats.reads + stats.writes);
   fprintf(stderr,
           "[pim-runtime]   Lockstep collapse skips         : %" PRIu64 "\n",
-          stat_lockstep_skips);
-  if (stat_operand_repl_skips)
+          stats.lockstep_skips);
+  if (stats.operand_repl_skips)
     fprintf(stderr,
             "[pim-runtime]   Operand replication skips       : %" PRIu64
             " (compiler said fewer banks receive it)\n",
-            stat_operand_repl_skips);
+            stats.operand_repl_skips);
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
-          stat_lane_placed);
+          stats.lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
    * rows are masked or straddling lanes, not a bug; a zero row for an active lane is. */
   for (int i = 0; i < num_tensors; i++) {
@@ -952,12 +953,12 @@ void pim_finalize(void) {
   }
   fprintf(stderr,
           "[pim-runtime]   Load coalesce (intra-vector)    : %" PRIu64 "\n",
-          stat_load_coalesced);
-  if (stat_coalesce_overflow)
+          stats.load_coalesced);
+  if (stats.coalesce_overflow)
     fprintf(stderr,
             "[pim-runtime]   WARN coalesce buffer overflow    : %" PRIu64
             " (PIM_COALESCE_MAX is a compile-time #define, not an env var)\n",
-            stat_coalesce_overflow);
+            stats.coalesce_overflow);
 
   destroy_dedup_state();
   initialized = 0;
@@ -1028,7 +1029,7 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
     uint64_t h = lockstep_key(tensor_key, cur_dispatch, ord, key_row,
                               (uint64_t)loc.col);
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, h, h >> 16, h >> 48)) {
-      stat_lockstep_skips++;
+      stats.lockstep_skips++;
       return;
     }
   }
@@ -1047,13 +1048,13 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
 static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
                                    int is_write, uint64_t compiler_lanes) {
   if (cur_phase == PIM_PHASE_IDLE) {
-    stat_ignored++;
+    stats.ignored++;
     return;
   }
 
   int tidx = find_tensor(base_addr);
   if (tidx < 0) {
-    stat_ignored++;
+    stats.ignored++;
     return;
   }
   tensor_info_t *t = &tensors[tidx];
@@ -1076,9 +1077,8 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
    * a width the artifact never emitted. Disagreement means the registered dtype
    * and the IR element type have parted company. */
   if (compiler_lanes && compiler_lanes != n_elements) {
-    static int warned = 0;
-    if (!warned) {
-      warned = 1;
+    if (!warned.lane_count) {
+      warned.lane_count = 1;
       fprintf(stderr,
               "[pim-runtime] WARN: lane-count disagreement. The compiler emitted "
               "%llu lanes for a %llu-byte access; elem_size=%d makes that %llu. "
@@ -1113,7 +1113,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
       if (elem_addr >= (uint64_t)t->base_addr + t->total_bytes) {
         int ntidx = find_tensor(elem_addr);
         if (ntidx < 0) {
-          stat_ignored++;
+          stats.ignored++;
           continue;
         }
         t = &tensors[ntidx];
@@ -1121,7 +1121,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
       int elem_idx =
           (int)((elem_addr - (uint64_t)t->base_addr) / t->elem_size);
       if (elem_idx < 0 || elem_idx >= t->num_elements) {
-        stat_ignored++;
+        stats.ignored++;
         continue;
       }
       /* Key on the PLACED tuple. Keying on the interleaved home dropped every
@@ -1143,13 +1143,13 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
       for (int j = 0; j < n_seen; j++)
         if (seen[j] == key) { dup = 1; break; }
       if (dup) {
-        stat_load_coalesced++;
+        stats.load_coalesced++;
         continue;
       }
       if (n_seen < PIM_COALESCE_MAX)
         seen[n_seen++] = key;
       else
-        stat_coalesce_overflow++;
+        stats.coalesce_overflow++;
       pim_trace_access_one(t, elem_addr, is_write);
     }
     return;
@@ -1162,7 +1162,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
     if (elem_addr >= (uint64_t)t->base_addr + t->total_bytes) {
       int ntidx = find_tensor(elem_addr);
       if (ntidx < 0) {
-        stat_ignored++;
+        stats.ignored++;
         continue;
       }
       t = &tensors[ntidx];

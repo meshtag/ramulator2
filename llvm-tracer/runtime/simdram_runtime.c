@@ -168,12 +168,17 @@ static acc_tracker_t acc_trackers[MAX_ACC_TRACKERS];
 static int num_acc_trackers = 0;
 static int current_acc = -1; /* index into acc_trackers */
 
-/* Statistics */
-static uint64_t stat_bank_reads = 0;
-static uint64_t stat_reads = 0;
-static uint64_t stat_writes = 0;
-static uint64_t stat_compute_ops = 0;
-static uint64_t stat_ignored = 0;
+/* Per-run counts and warn-once flags. simdram_init clears both, because the harness
+ * inits one library more than once per process (the ladder verifies, then traces), and
+ * each run must report its own counts and WARNs. */
+static struct {
+  uint64_t bank_reads, reads, writes, compute_ops, ignored;
+  uint64_t lane_placed_writes, lane_rg_claimed;
+} stats;
+/* One flag per WARN condition, so one condition cannot hide another. */
+static struct {
+  int row_space, unpriced_op, lane_outside, lane_wide, lane_count, no_destination;
+} warned;
 
 /* K-amortization batching: one MAJ block per opcode every g_k_amort_batch compute
  * traces. BATCH is the per-pass lane count, so every batch boundary lands on a pid
@@ -246,17 +251,14 @@ static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
           col);
 }
 
-static uint64_t stat_lane_placed_writes = 0;
 /* Per-bank pool of row groups for lane slabs, claimed downward from the top of the row
  * space. Nothing else places rows on SIMDRAM any more (OPERAND emits nothing, STREAMED
  * and ACCUMULATOR are lane-placed), so there is no allocator below to collide with. */
 static int g_lane_rg_top = -1;
-static uint64_t stat_lane_rg_claimed = 0;
 
 /* Physical row group for slab row group `idx` of tensor t, claiming from the top of the
  * row space on first use. Returns -1 once the pool is exhausted (WARNs once). */
 static int lane_rg_for(tensor_info_t *t, int idx) {
-  static int warned = 0;
   while (idx >= t->lane_rg_n) {
     if (t->lane_rg_n == t->lane_rg_cap) {
       int ncap = t->lane_rg_cap ? t->lane_rg_cap * 2 : 8;
@@ -267,14 +269,14 @@ static int lane_rg_for(tensor_info_t *t, int idx) {
     if (g_lane_rg_top < 0)
       g_lane_rg_top = (cfg_num_sa * cfg_data_rows_per_sa) / cfg_pe_bits;
     if (g_lane_rg_top <= 0) {
-      if (!warned++)
+      if (!warned.row_space++)
         fprintf(stderr, "[simdram] WARN row space exhausted while growing a lane slab; "
                         "placement beyond this point aliases row group 0.\n");
       t->lane_rg[t->lane_rg_n++] = 0;
       continue;
     }
     t->lane_rg[t->lane_rg_n++] = --g_lane_rg_top;
-    stat_lane_rg_claimed++;
+    stats.lane_rg_claimed++;
   }
   return t->lane_rg[idx];
 }
@@ -334,7 +336,6 @@ static int find_tensor(uint64_t addr) {
  *
  * Float opcodes take the fixed-point polynomial of their integer twin, see below.
  */
-static int g_warned_unpriced_op = 0;
 
 static int maj_cost(int opcode) {
   int n = cfg_pe_bits;
@@ -375,8 +376,8 @@ static int maj_cost(int opcode) {
   default:
     /* Genuinely unmodelled opcode. Returning 0 here is how the float ops silently
      * went free, so make it LOUD rather than silent. */
-    if (!g_warned_unpriced_op) {
-      g_warned_unpriced_op = 1;
+    if (!warned.unpriced_op) {
+      warned.unpriced_op = 1;
       fprintf(stderr, "[simdram] WARNING: opcode %d has no MAJ cost and is being "
                       "charged ZERO. Any cycle count including it understates the "
                       "arithmetic.\n", opcode);
@@ -410,8 +411,8 @@ void simdram_init(const char *trace_file) {
 
   num_tensors = 0;
   cur_phase = SIMDRAM_PHASE_IDLE;
-  stat_bank_reads = stat_reads = stat_writes = 0;
-  stat_compute_ops = stat_ignored = 0;
+  memset(&stats, 0, sizeof stats);
+  memset(&warned, 0, sizeof warned);
   num_acc_trackers = 0;
   current_acc = -1;
   initialized = 1;
@@ -434,8 +435,6 @@ void simdram_init(const char *trace_file) {
     fprintf(stderr, "[simdram] WARN kernel compiled for %d lanes, machine has %d banks; "
                     "the occupancy divisor follows the kernel.\n",
             (int)__pim_lanes, cfg_num_pch * cfg_num_bg * cfg_num_banks);
-  stat_lane_placed_writes = 0;
-  stat_lane_rg_claimed = 0;
   g_lane_rg_top = -1; /* fresh row space per run */
   g_last_epoch = __pim_program_epoch;
   fprintf(stderr,
@@ -724,18 +723,18 @@ void simdram_finalize(void) {
 
   fprintf(stderr, "\n[simdram] === SIMDRAM Trace Statistics ===\n");
   fprintf(stderr, "[simdram]   Bank-reads  (BR): %" PRIu64 "\n",
-          stat_bank_reads);
-  fprintf(stderr, "[simdram]   Reads       (R) : %" PRIu64 "\n", stat_reads);
-  fprintf(stderr, "[simdram]   Writes      (W) : %" PRIu64 "\n", stat_writes);
+          stats.bank_reads);
+  fprintf(stderr, "[simdram]   Reads       (R) : %" PRIu64 "\n", stats.reads);
+  fprintf(stderr, "[simdram]   Writes      (W) : %" PRIu64 "\n", stats.writes);
   fprintf(stderr, "[simdram]   Compute ops     : %" PRIu64 "\n",
-          stat_compute_ops);
-  fprintf(stderr, "[simdram]   Ignored         : %" PRIu64 "\n", stat_ignored);
+          stats.compute_ops);
+  fprintf(stderr, "[simdram]   Ignored         : %" PRIu64 "\n", stats.ignored);
   fprintf(stderr, "[simdram]   Total SIMDRAM ops: %" PRIu64 "\n",
-          stat_bank_reads + stat_reads + stat_writes);
+          stats.bank_reads + stats.reads + stats.writes);
   fprintf(stderr, "[simdram]   Lane row groups claimed         : %" PRIu64 "\n",
-          stat_lane_rg_claimed);
+          stats.lane_rg_claimed);
   fprintf(stderr, "[simdram]   Lane-placed input writes        : %" PRIu64 "\n",
-          stat_lane_placed_writes);
+          stats.lane_placed_writes);
   initialized = 0;
 }
 
@@ -766,17 +765,16 @@ void simdram_finalize(void) {
  * and it measured a 2.21x under-charge (review 2026-09-13). A separate load op is a
  * separate consumption too, so unrolled channel chains need no multiplier of their own. */
 static void note_lane_consumption(tensor_info_t *t) {
-  static int warned_lane = 0, warned_wide = 0;
   int all_banks = cfg_num_pch * cfg_num_bg * cfg_num_banks;
   int lane = __pim_get_bank_id();
   if (lane < 0 || lane >= all_banks || lane >= SIMDRAM_MAX_LANES) {
-    if (!warned_lane++)
+    if (!warned.lane_outside++)
       fprintf(stderr, "[simdram] WARN replay lane %d outside the %d banks; "
                       "lane-placed delivery dropped.\n", lane, all_banks);
     return;
   }
   t->lane_ord[lane]++;
-  if (t->lane_ord[lane] >= (1 << 24) && !warned_wide++)
+  if (t->lane_ord[lane] >= (1 << 24) && !warned.lane_wide++)
     fprintf(stderr, "[simdram] WARN lane slab exceeds 2^24 slots.\n");
 }
 
@@ -875,8 +873,8 @@ static void flush_all_lanes(void) {
             int ch, pch, bg, bank;
             decompose_global_bank(l, &ch, &pch, &bg, &bank);
             emit_trace("W", ch, pch, bg, bank, sa, base_row + bit, col);
-            stat_writes++;
-            stat_lane_placed_writes++;
+            stats.writes++;
+            stats.lane_placed_writes++;
           }
         }
     }
@@ -945,27 +943,27 @@ static void simdram_read_out_cell(tensor_info_t *t, int elem_idx) {
     int base_row = linear_row % cfg_data_rows_per_sa;
     for (int bit = 0; bit < cfg_pe_bits; bit++) {
       emit_trace("R", ch, pch, bg, bank, sa, base_row + bit, (int)(c % cfg_num_cols));
-      stat_reads++;
+      stats.reads++;
     }
   }
 }
 
 static void simdram_trace_access(uint64_t addr, int is_write) {
   if (cur_phase == SIMDRAM_PHASE_IDLE) {
-    stat_ignored++;
+    stats.ignored++;
     return;
   }
 
   int tidx = find_tensor(addr);
   if (tidx < 0) {
-    stat_ignored++;
+    stats.ignored++;
     return;
   }
 
   tensor_info_t *t = &tensors[tidx];
   int elem_idx = (int)((addr - (uint64_t)t->base_addr) / t->elem_size);
   if (elem_idx < 0 || elem_idx >= t->num_elements) {
-    stat_ignored++;
+    stats.ignored++;
     return;
   }
 
@@ -976,7 +974,7 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
   if (cur_phase == SIMDRAM_PHASE_COMPUTE && t->role == SIMDRAM_ROLE_ACCUMULATOR &&
       !(t->lane_slot &&
         simdram_place_acc(t, elem_idx, 0, &ch, &pch, &bg, &bank, &sa, &base_row, &col))) {
-    stat_ignored++; /* no slab: allocation failed and WARNed at registration */
+    stats.ignored++; /* no slab: allocation failed and WARNed at registration */
     return;
   }
 
@@ -1004,7 +1002,7 @@ static void simdram_trace_access(uint64_t addr, int is_write) {
           break;
         for (int bit = 0; bit < cfg_pe_bits; bit++) {
           emit_trace("R", ch, pch, bg, bank, sa, base_row + bit, col);
-          stat_reads++;
+          stats.reads++;
         }
         if (t->acc_tracker_idx >= 0) {
           acc_tracker_t *at = &acc_trackers[t->acc_tracker_idx];
@@ -1050,8 +1048,7 @@ static void simdram_trace_access_range(uint64_t base_addr, uint64_t size, int is
   if (n == 0)
     n = 1;
   if (compiler_lanes && compiler_lanes != n) {
-    static int warned = 0;
-    if (!warned++)
+    if (!warned.lane_count++)
       fprintf(stderr, "[simdram] WARN lane-count disagreement: the compiler emitted %llu "
                       "lanes for a %llu-byte access, elem_size=%d makes that %llu. "
                       "Pricing the runtime's count.\n",
@@ -1140,8 +1137,7 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
     /* Last resort. The pass names the destination tensor even when it cannot name the
      * element, so reaching here means arithmetic whose result never reaches any
      * argument. The bank is then a guess from trace order; say so once. */
-    static int warned_guess = 0;
-    if (!warned_guess++)
+    if (!warned.no_destination++)
       fprintf(stderr, "[simdram] WARN compute trace with no destination; charged at the "
                       "most recently touched accumulator's bank.\n");
     const acc_tracker_t *at = &acc_trackers[current_acc];
@@ -1175,8 +1171,8 @@ void __compute_trace(int32_t opcode, int32_t bit_width, void *dest_addr) {
     emit_trace("BR", ch, pch, bg, bank, sa,
                b_group_base + cur_row_offset, 0);
     cur_row_offset = (cur_row_offset + 1) % SIMDRAM_B_GROUP_ROWS;
-    stat_bank_reads++;
+    stats.bank_reads++;
   }
 
-  stat_compute_ops++;
+  stats.compute_ops++;
 }
