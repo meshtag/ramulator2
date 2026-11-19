@@ -5,7 +5,7 @@
  * Each kernel invocation reads these via the __pim_get_*() calls that
  * the Triton IM backend emits as extern function calls in the LLVM IR.
  *
- * The replay loop (pass_ablation._run_pim_trace):
+ * The replay loop (pipeline.trace):
  *   for pid_z: __pim_set_program_id_z(pid_z)
  *     for pid_y: __pim_set_program_id_y(pid_y)
  *       for pid: __pim_set_program_id(pid), __pim_set_group_id(instance % groups)
@@ -25,9 +25,9 @@ static int32_t current_program_id_z = 0;
 
 /* Program-instance epoch. Bumped by every program-id setter, i.e. exactly when the
  * host starts a new instance, and NOT by the bank setter, since the banks of one
- * instance are one all-bank command. The trace runtimes reset their per-instance
- * state when this changes, instead of diffing the three ids on the next access,
- * which was only correct while the replay loop stayed program-major. */
+ * instance are one all-bank command. The trace runtimes put it in their lockstep key,
+ * so the replicas of one instance fold and two instances never do, whatever order the
+ * replay loop walks the grid in. */
 uint64_t __pim_program_epoch = 0;
 
 /* Tile index within ONE bank replay, for persistent kernels.
@@ -82,8 +82,7 @@ void __pim_set_program_id_z(int32_t id) {
 /* Called by the kernel at the end of one tile of a persistent loop. */
 void __pim_tile_boundary(void) { current_tile_idx++; }
 
-/* Tile index within the current bank replay. A FACT, not a composed id: the
- * trace runtime packs this with the program epoch itself, because it is the one
- * that knows how many bits its collapse key has left. Summing them here was
- * wrong and lossy -- instance p tile 1 aliased instance p+1 tile 0. */
+/* Tile index within the current bank replay, not a composed id. The trace runtime
+ * packs it with the program epoch itself, since it knows how many bits its collapse key
+ * has left. */
 uint64_t __pim_tile_index(void) { return current_tile_idx; }

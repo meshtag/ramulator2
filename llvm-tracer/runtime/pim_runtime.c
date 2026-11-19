@@ -15,22 +15,22 @@
  *
  * Intercepts LLVM-instrumented loads/stores and emits DCC's opcodes at DCC's
  * addresses, for DCC's Ramulator build.
+ *
+ * It is the paper's Runtime Contract for this target. check_contract compares the kernel's
+ * lane count and access width with this machine, and pim_register_tensor applies each
+ * tensor's record (apply_compiler_layout), which is Recording and Applying the Decisions.
+ * The coalescer in pim_trace_access_range prices the access width of Parallelism Within a
+ * Triton Thread. The paper leaves out the replay: the host calls the kernel once per
+ * program instance and bank, and the lockstep collapse folds the bank replicas of one
+ * access into one command per channel.
  */
+
+#define MAX_TENSORS 16
+#define MAX_BANKS 1024   /* DCC's 16 channels of 64 banks */
 
 /* ================================================================
  *  HBM3_PIM organization, the DCC-matched machine
  * ================================================================ */
-/* Set by pim_set_machine. A rank is folded into the pseudo-channel slot, which is where
- * DCC's address puts it (bank, bank group, rank, pseudo-channel, channel from the low
- * bits), so cfg_num_pch counts pseudo-channels times ranks. */
-static int cfg_num_channels = 1;
-static int cfg_num_pch = 2;
-/* Channels the launch spreads its program instances over, one group per channel. */
-static int g_groups = 1;
-/* Sizing replay: each lane's distinct elements per tensor, measured before placement, since
- * a tensor partitioned within a group may still be read whole by every group. */
-static int g_sizing = 0, g_sized = 0;
-static int g_sized_share[16];
 static const int cfg_num_bg = 4;
 static const int cfg_num_banks = 4; /* per bank group */
 /* Hand copy of the simulator's org preset (HBM3_8Gb in HBM3_PIM.cpp). Nothing checks
@@ -41,11 +41,27 @@ static const int cfg_num_rows = 512;
  * cfg_num_cols and cfg_dq_bits move together, and with the simulator org. */
 static const int cfg_num_cols = 32;
 static const int cfg_dq_bits = 256;
-static void check_compiler_dq_bits(void);
 
 /* Modelled value width, a hardware property (the spec's pe_bits), not the host dtype.
  * Column packing is dq_bits / data_width. */
 static const int cfg_data_width_bits = 16;
+
+/* HOST INPUTS. The host sets these before pim_init (pim_set_machine, pim_size_begin and
+ * pim_dcc_mark_activation), so pim_init must not clear them. */
+/* A rank is folded into the pseudo-channel slot, which is where DCC's address puts it
+ * (bank, bank group, rank, pseudo-channel, channel from the low bits), so cfg_num_pch
+ * counts pseudo-channels times ranks. */
+static int cfg_num_channels = 1;
+static int cfg_num_pch = 2;
+/* Channels the launch spreads its program instances over, one group per channel. */
+static int g_groups = 1;
+/* Sizing replay: each lane's distinct elements per tensor, measured before placement, since
+ * a tensor partitioned within a group may still be read whole by every group. The sizing
+ * run's pim_finalize fills g_sized_share for the run after it. */
+static int g_sizing = 0, g_sized = 0;
+static int g_sized_share[MAX_TENSORS];
+/* Inputs the harness marks as activations, see dcc_stage_activation. */
+static unsigned char g_dcc_activation[MAX_TENSORS];
 
 /* Next free position in the global linear-element space. Tensors are appended and
  * aligned to a values_per_col boundary only, so they share rows on different banks. */
@@ -66,18 +82,32 @@ static int ilog2_pow2(int n) {
   return k;
 }
 
+/* buf grown to hold at least `need` elements of `size` bytes, doubling its capacity, or an
+ * exit naming what could not grow. */
+static void *grow(void *buf, size_t *cap, size_t need, size_t size, const char *what) {
+  if (need <= *cap)
+    return buf;
+  size_t c = *cap ? *cap : 4096;
+  while (c < need)
+    c *= 2;
+  buf = realloc(buf, c * size);
+  if (!buf) {
+    fprintf(stderr, "[pim-runtime] ERROR: %s alloc failed\n", what);
+    exit(1);
+  }
+  *cap = c;
+  return buf;
+}
+
 /* ================================================================
  *  Tensor registry
  * ================================================================ */
-#define MAX_TENSORS 16
-#define MAX_BANKS 1024   /* DCC's 16 channels of 64 banks */
 
 static int banks_per_channel(void) { return cfg_num_pch * cfg_num_bg * cfg_num_banks; }
 /* A group's lanes are the kernel's, the first banks of its channel, as DCC's cores of a
  * tiling that uses fewer than a channel's banks are its first banks. */
 static int group_lanes(void) {
-  return __pim_lanes > 0 && (int)__pim_lanes < banks_per_channel() ? (int)__pim_lanes
-                                                                    : banks_per_channel();
+  return (int)__pim_lanes < banks_per_channel() ? (int)__pim_lanes : banks_per_channel();
 }
 static int active_banks(void) { return g_groups * group_lanes(); }
 
@@ -124,11 +154,9 @@ typedef struct {
   /* Offset into the global bit-interleaved element space, see map_element. */
   uint64_t layout_linear_base;
   /* The record's receive count (pim_layout_table.h), -1 when the compiler stated nothing.
-   * Any stated value puts the tensor's accesses in the executing lane's slab, see
-   * place_in_lane_slab, instead of the element's interleaved home. */
+   * Any stated value gives the tensor a slab, see has_slab, and puts its accesses in the
+   * executing lane's slab instead of the element's interleaved home. */
   int bank_replicated;
-  int lane_row_base;        /* first row of this tensor's per-lane slab, or -1 */
-  int lane_row_count;
   int lane_ord[MAX_BANKS];  /* next free value slot per lane */
   slot_map_t *lane_slot;    /* (lane, elem) -> slot, every tensor with a slab */
   long pack_base_col;       /* row-pack: first column of this tensor's share, or -1 */
@@ -150,8 +178,24 @@ typedef struct {
   int ret_src, ret_cols;
 } tensor_info_t;
 
+/* One element access, resolved to the physical tuple it lands on. */
+typedef struct {
+  int elem_idx;
+  int ch;
+  int pch;
+  int bg;
+  int bank;
+  int sa;
+  int row;
+  int col;
+} pim_phys_loc_t;
+
 static tensor_info_t tensors[MAX_TENSORS];
 static int num_tensors = 0;
+
+/* apply_compiler_layout gives a tensor its share of the packed columns, its slot map and a
+ * stated bank_replicated together, so the share alone says whether it has a slab. */
+static int has_slab(const tensor_info_t *t) { return t->pack_base_col >= 0; }
 
 /* DCC-parity tracer (branch dcc-parity). Group-level commands span the CHANNEL, DCC's
  * PIM group. Their MAC count reconciles only at that scope (cmds x 16 lanes x 32 cores
@@ -203,7 +247,7 @@ static uint64_t stat_ignored = 0;
  * land on the same DRAM column. */
 static uint64_t stat_load_coalesced = 0;
 /* Distinct keys past the 64-entry per-call buffer, i.e. coalescing this call could
- * not complete. Must stay 0; nonzero means a kernel emits a vector wider than the
+ * not complete. Must stay 0. Nonzero means a kernel emits a vector wider than the
  * buffer and some duplicate lanes were charged twice. */
 static uint64_t stat_coalesce_overflow = 0;
 
@@ -218,34 +262,14 @@ static uint64_t stat_lockstep_skips = 0;
  * them. Counted so the omission is visible rather than silent. */
 static uint64_t stat_dcc_free_acc_ops = 0;
 
-/* ACTIVATION STAGING, DCC's convention, this tree only.
- *
- * Their model stages activation vectors into the banks per invocation and leaves the
- * weight matrix resident: GEMV emits ST for the vector and nothing for the matrix, VA
- * emits LD for both its inputs because both are activations. We already match them on
- * GEMV, because our operand path stages the vector,
- * but an elementwise kernel's inputs look partitioned to the residency classifier, get
- * read as bank-local group commands, and are never staged. That is the whole reason our
- * unfused VA looked 1.5-2.1x faster than theirs: 34 costed commands against 128.
- *
- * Which tensors are activations is inter-kernel dataflow, so the harness says: it marks
- * every input it does not declare resident through pim_dcc_mark_activation.
- *
- * Staging is emitted once per distinct (tensor, bank, row, col), into the stage phase,
- * on first read -- which is banks x columns-per-bank, exactly the vector. */
-static unsigned char g_dcc_activation[MAX_TENSORS];
-
 /* GRF-SIDE OPERAND, DCC's convention, this tree only.
  *
  * HBM-PIM's MAC takes one operand from a DRAM column and the other from the register
  * file, so exactly one input needs a bank->GRF load. The residency classifier decides
- * only REPLICATION, and a GEMV vector partitioned across a parallel axis comes back
- * with the same verdict as the matrix (ReductionStridedMatrix, partitioned), so neither
- * was staged and the GRF load went uncharged entirely -- the whole 1.28x on DCC's own
- * gemv_single shapes.
- *
- * The compiler elects the operand (__pim_dcc_grf_a, see dcc_pick_grf_operand). Its ST
- * staging is deduped per (bank, row, col) and every PIM_LD_OP1 is charged. */
+ * only replication, and a GEMV vector partitioned across a parallel axis gets the same
+ * verdict as the matrix (ReductionStridedMatrix, partitioned), so it cannot tell the two
+ * apart. The compiler elects the operand (__pim_dcc_grf_a, see dcc_pick_grf_operand). Its
+ * ST staging is deduped per (bank, row, col) and every PIM_LD_OP1 is charged. */
 static unsigned char g_dcc_grf_operand[MAX_TENSORS];
 static addr_dedup_state_t *g_dcc_grf_staged = NULL;
 static int g_dcc_grf_decided = 0;
@@ -265,9 +289,7 @@ static uint64_t stat_grf_a_refetch = 0;  /* loaded again into the same bank */
 #define GRF_B_ENTRIES 8
 static int g_grf_b_overflow = 0;   /* cells beyond capacity, 0 = fits */
 
-/* Lazy: registration is one tensor at a time and this needs to compare them all.
- *
- * Only the compiler elects. Without its election a kernel with one partitioned input
+/* Only the compiler elects. Without its election a kernel with one partitioned input
  * strictly smaller than another is refused, since which operand GRF_A holds is the
  * compiler's call. Inputs that match in size elect nothing. */
 static void dcc_pick_grf_operand(void) {
@@ -289,11 +311,9 @@ static void dcc_pick_grf_operand(void) {
     if (best < 0 || tensors[i].num_elements < tensors[best].num_elements) best = i;
   }
   if (best < 0) return;
-  /* The larger tensor must be PARTITIONED too. Comparing against a replicated one elects
-   * the streamed matrix whenever a replicated operand is bigger: measured on matmul
-   * 64x256x32 with bank_axis=0 (A partitioned 2,048, B replicated 8,192) as PIM_MAC_OP1
-   * 0 -- the entire compute stream replaced by operand loads. A replicated tensor is
-   * already the GRF side by way of the W path and is not a candidate on either side. */
+  /* The larger tensor must be partitioned too. A replicated tensor is already the GRF side
+   * by way of the W path, so it is no candidate on either side, and comparing against one
+   * would elect the streamed matrix whenever the replicated operand is bigger. */
   for (int i = 0; i < num_tensors; i++)
     if (i != best && tensors[i].role != PIM_ROLE_ACCUMULATOR &&
         tensors[i].bank_replicated == 0 &&
@@ -304,6 +324,18 @@ static void dcc_pick_grf_operand(void) {
       exit(1);
     }
 }
+
+/* The election and the GRF_B bound, made once per run at the first load of an input, when
+ * every tensor is registered, or at pim_finalize when no such load comes. */
+static void grf_b_check(void);
+static void dcc_decide_grf_once(void) {
+  if (g_dcc_grf_decided)
+    return;
+  g_dcc_grf_decided = 1;
+  dcc_pick_grf_operand();
+  grf_b_check();
+}
+
 static addr_dedup_state_t *g_dcc_staged = NULL;
 static uint64_t stat_dcc_staged = 0;
 
@@ -349,10 +381,8 @@ void pim_dcc_mark_activation(int tensor_id) {
  * epochs and the collapse would never fire at all. Keying works for both. */
 static uint64_t cur_dispatch = 0;
 
-/* Bits of the dispatch field given to the tile index, with the program epoch
- * above it. Packed rather than summed: summing let instance p's tile 1 collide
- * with instance p+1's tile 0, so two distinct dispatches folded into one and the
- * trace under-emitted. Both components are policed at pack time. */
+/* Bits of the dispatch id given to the tile index, with the program epoch above them.
+ * refresh_dispatch_id WARNs when a tile index does not fit. */
 #define PIM_TILE_BITS 10
 static int g_warned_dispatch_overflow = 0;
 
@@ -365,17 +395,16 @@ static int g_warned_dispatch_overflow = 0;
  *
  * Emits DCC's own opcodes at DCC's own addresses so the trace runs through THEIR
  * Ramulator build. Pricing is then theirs by construction, with no mapping layer left
- * to get wrong -- which matters, because every error in this campaign bar one was a
- * vocabulary-mapping error.
+ * to get wrong.
  *
  * Every mapping below is pinned by counting, not by judgement:
- *   BR (group-collapsed column read)  -> PIM_MAC_OP1   one 16-lane SIMD op across 32
- *        cores.
- *   W  (operand into a bank)          -> ST + PIM_LD_OP1   staged, then bank->GRF;
- *        their PIM_LD_OP1 count equals our W count exactly.
- *   BW (accumulator column)           -> PIM_WB_ACC + ST + PIM_ACC_RESET, 128 each on
+ *   streamed column read, group-collapsed (dcc_emit_stream_read) -> PIM_MAC_OP1, one
+ *        16-lane SIMD op across 32 cores.
+ *   operand into a bank (dcc_emit_operand_load) -> ST + PIM_LD_OP1, staged, then
+ *        bank->GRF. Their PIM_LD_OP1 count equals ours exactly.
+ *   accumulator column (dcc_emit_store) -> PIM_WB_ACC + ST + PIM_ACC_RESET, 128 each on
  *        matvec 512x64, which is their whole output path.
- *   R  (accumulator read)             -> LD
+ *   accumulator read (dcc_emit_acc_read) -> LD
  *
  * Addresses follow THEIR geometry, not ours: a 32-byte column, 32 columns to a row,
  * and the bank/bankgroup strides their generator derives in HBM_GS. Our (sa,row) is
@@ -409,6 +438,10 @@ static uint64_t dcc_addr(int ch, int pch, int bg, int bank, int sa, int row, int
   return (uint64_t)ch * g_ch + (uint64_t)pch * g_pch + (uint64_t)bg * g_bg
        + (uint64_t)bank * g_ba + lrow * g_row
        + (uint64_t)(col % DCC_COLS_PER_ROW) * DCC_COL_BYTES;
+}
+
+static uint64_t dcc_loc_addr(const pim_phys_loc_t *loc) {
+  return dcc_addr(loc->ch, loc->pch, loc->bg, loc->bank, loc->sa, loc->row, loc->col);
 }
 
 static uint64_t bank_bytes(void) {
@@ -451,8 +484,8 @@ static void barrier_block(FILE *f) {
             (unsigned long long)((uint64_t)c * bank_bytes() * banks_per_channel()));
 }
 
-/* PHASE ORDERING. DCC's trace is grouped by phase -- stage the vector, then per round
- * reset / load operand / MAC / write back, then write the outputs -- and their controller
+/* PHASE ORDERING. DCC's trace is grouped by phase (stage the vector, then per round
+ * reset, load operand, MAC and write back, then write the outputs), and their controller
  * depends on it: MAC_OP1 requires every bank's row open, and our kernel-order interleaving
  * starves that prerequisite until the refresh manager aborts ("Failed to send refresh").
  * Each opcode class simulates cleanly alone, so it is the interleaving and not any one
@@ -470,13 +503,7 @@ static size_t stage_len, stage_cap;
 static void dp_push(const char *op, uint64_t addr) {
   char line[64];
   int n = snprintf(line, sizeof line, "%s 0x%08llx\n", op, (unsigned long long)addr);
-  if (stage_len + n + 1 > stage_cap) {
-    size_t cap = stage_cap ? stage_cap * 2 : (1u << 16);
-    while (cap < stage_len + n + 1) cap *= 2;
-    char *nb = (char *)realloc(stage_buf, cap);
-    if (!nb) { fprintf(stderr, "[pim-runtime] ERROR: phase buffer alloc failed\n"); exit(1); }
-    stage_buf = nb; stage_cap = cap;
-  }
+  stage_buf = grow(stage_buf, &stage_cap, stage_len + n + 1, 1, "phase buffer");
   memcpy(stage_buf + stage_len, line, n);
   stage_len += n;
 }
@@ -605,48 +632,39 @@ int pim_dcc_coverage_failures(void) { return g_cov_failures; }
  * SWAP, which moves a command within its bank and keeps our order. */
 typedef struct { uint64_t dispatch, addr, seq; uint32_t round; int phase; const char *op; int tid;
                  uint64_t at; } dcc_rec_t;
-static const tensor_info_t *t_emit = NULL;  /* the tensor the current emit belongs to */
 static dcc_rec_t *g_recs = NULL;
 static size_t g_rec_n = 0, g_rec_cap = 0;
 
 static uint64_t g_last_mac = 0;       /* a fold step issues at the open row of the last MAC */
+static int g_fold_tid = -1;           /* and is charged to the tensor of the last access emitted */
 static int32_t g_cur_op = 0;          /* im-relu-opcode: 1 while a ReLU-only load issues, 2
                                        * while a store of a register ReLU does */
 /* As emitted, a register ReLU is one MOV per lockstep group and column, as a MAC is. */
 static addr_dedup_state_t *g_rrelu_seen = NULL;
 static uint64_t stat_fold_cmds = 0;  /* fold commands emitted after the collapse */
 
-static void dp_record_at(int phase, const char *op, uint64_t addr, uint64_t at) {
-  if (g_rec_n == g_rec_cap) {
-    g_rec_cap = g_rec_cap ? g_rec_cap * 2 : 1u << 14;
-    g_recs = (dcc_rec_t *)realloc(g_recs, g_rec_cap * sizeof *g_recs);
-    if (!g_recs) { fprintf(stderr, "[pim-runtime] ERROR: command record alloc\n"); exit(1); }
-  }
-  g_recs[g_rec_n] = (dcc_rec_t){cur_dispatch, addr, g_rec_n, g_rnd, phase, op,
-                                t_emit ? (int)(t_emit - tensors) : -1, at};
+static void dp_record_at(int phase, const char *op, int tid, uint64_t addr, uint64_t at) {
+  g_recs = grow(g_recs, &g_rec_cap, g_rec_n + 1, sizeof *g_recs, "command record");
+  g_recs[g_rec_n] = (dcc_rec_t){cur_dispatch, addr, g_rec_n, g_rnd, phase, op, tid, at};
   g_rec_n++;
 }
 
-static void dp_record(int phase, const char *op, uint64_t addr) {
-  dp_record_at(phase, op, addr, addr);
+static void dp_record(int phase, const char *op, int tid, uint64_t addr) {
+  dp_record_at(phase, op, tid, addr, addr);
 }
 
 /* GRF-operand staging is recorded, not pushed as text, because its ORDER is DCC's and
  * not the replay's. Each lane replays the program in turn, so pushing at emission gives
- * eight consecutive commands to one bank, serialized; their generator nests block, then
- * column, then bank, so consecutive commands hit 32 different banks. Same commands, 4%
- * apart in cycles. Flushed sorted into the stage and operand-load positions. */
+ * eight consecutive commands to one bank, serialized, where their generator nests block,
+ * then column, then bank, so consecutive commands hit 32 different banks. Flushed sorted
+ * into the stage and operand-load positions. */
 /* `addr` is where the value is staged and orders the load, `ld` where PIM_LD_OP1 reads it. */
 typedef struct { uint64_t dispatch, addr, round; int stage; uint32_t blk; uint64_t ld; } grf_rec_t;
 static grf_rec_t *g_grf_recs = NULL;
 static size_t g_grf_n = 0, g_grf_cap = 0;
 
 static void grf_record(uint64_t addr, uint64_t ld, int stage) {
-  if (g_grf_n == g_grf_cap) {
-    g_grf_cap = g_grf_cap ? g_grf_cap * 2 : 4096;
-    g_grf_recs = (grf_rec_t *)realloc(g_grf_recs, g_grf_cap * sizeof *g_grf_recs);
-    if (!g_grf_recs) { fprintf(stderr, "[pim-runtime] ERROR: grf record alloc\n"); exit(1); }
-  }
+  g_grf_recs = grow(g_grf_recs, &g_grf_cap, g_grf_n + 1, sizeof *g_grf_recs, "grf record");
   g_grf_recs[g_grf_n].dispatch = cur_dispatch;
   g_grf_recs[g_grf_n].round = 0;
   g_grf_recs[g_grf_n].stage = stage;
@@ -677,19 +695,15 @@ static void grf_sort(void) {
 }
 
 /* Host staging of an activation, written in DCC's host order at flush: per tensor, then
- * position, then bank (gen_trace_HBMPIM_VA.py:111-117). Issued in first-touch order, a
- * kernel that interleaves two inputs made the host staging thrash rows, a cost of the
- * replay order and not of anything the host or the compiler does. */
+ * position, then bank (gen_trace_HBMPIM_VA.py:111-117). In first-touch order a kernel that
+ * interleaves two inputs would make the host staging thrash rows, a cost of the replay
+ * order and not of anything the host or the compiler does. */
 typedef struct { int tid; uint64_t pos; int gb; uint64_t addr; } stage_rec_t;
 static stage_rec_t *g_stage = NULL;
 static size_t g_stage_n = 0, g_stage_cap = 0;
 
 static void stage_record(int tid, uint64_t pos, int gb, uint64_t addr) {
-  if (g_stage_n == g_stage_cap) {
-    g_stage_cap = g_stage_cap ? g_stage_cap * 2 : 1u << 12;
-    g_stage = (stage_rec_t *)realloc(g_stage, g_stage_cap * sizeof *g_stage);
-    if (!g_stage) { fprintf(stderr, "[pim-runtime] ERROR: staging record alloc\n"); exit(1); }
-  }
+  g_stage = grow(g_stage, &g_stage_cap, g_stage_n + 1, sizeof *g_stage, "staging record");
   g_stage[g_stage_n++] = (stage_rec_t){tid, pos, gb, addr};
 }
 
@@ -714,21 +728,16 @@ static int stage_bank_cmp(const void *pa, const void *pb) {
 /* DRAM state and register state have different lifetimes, so they are emitted on
  * different conditions. The ST puts the value into the bank and it STAYS there, so it is
  * charged once per address for the whole kernel. The PIM_LD_OP1 pulls it bank -> GRF_A
- * and the register file is reloaded per dispatch, so it is charged on every miss.
- * Coupling them, which this did until 2026-09-17, re-staged x once per output block:
- * 768 surplus ST worth 1,512 cycles at 1x32x128x512, charged against us on the parity
- * rung and credited to us on the lever rung. DCC separates them the same way -- their
- * 256 LD + 256 ST is a one-time host broadcast, their 1,024 PIM_LD_OP1 is per block. */
+ * and the register file is reloaded per dispatch, so it is charged on every miss. DCC
+ * separates them the same way: its host stages the vector once, and every block issues
+ * its own PIM_LD_OP1. */
 /* Replicated operands (the W path) stage through the same convention, once per column. */
 static uint64_t *g_op_stage = NULL;
 static size_t g_op_stage_n = 0, g_op_stage_cap = 0;
 
 static void op_stage_record(uint64_t addr) {
-  if (g_op_stage_n == g_op_stage_cap) {
-    g_op_stage_cap = g_op_stage_cap ? g_op_stage_cap * 2 : 1u << 12;
-    g_op_stage = (uint64_t *)realloc(g_op_stage, g_op_stage_cap * sizeof *g_op_stage);
-    if (!g_op_stage) { fprintf(stderr, "[pim-runtime] ERROR: staging alloc\n"); exit(1); }
-  }
+  g_op_stage = grow(g_op_stage, &g_op_stage_cap, g_op_stage_n + 1, sizeof *g_op_stage,
+                    "staging");
   g_op_stage[g_op_stage_n++] = addr;
 }
 
@@ -803,8 +812,8 @@ static int rec_cmp(const void *a, const void *b) {
  * generators give it (maddr_*).
  * Every mask carries FAN, ACC and WAVE, as dcc_convention.native_mask builds it.
  * A convention the runtime cannot apply is counted rather than fatal, so an in-process
- * harness survives and the reading refuses the stream. NAT_ALL leaves out bit 8, the
- * retired HOIST bit, so a mask carrying it is refused. */
+ * harness survives and the reading refuses the stream. NAT_ALL leaves out bit 8, which no
+ * convention uses, so a mask carrying it is refused. */
 enum { NAT_FAN = 1, NAT_ACC = 2, NAT_WAVE = 4, NAT_TILE = 16, NAT_ADDR = 32, NAT_RET = 64,
        NAT_GPOS = 128, NAT_SWAP = 256, NAT_MADDR = 512, NAT_ALL = 1015 };
 static int g_dcc_native = 0;
@@ -812,29 +821,17 @@ static uint64_t stat_native_off_bank0 = 0, g_dcc_waves = 0, stat_tile_absorbed =
 static uint64_t stat_tile_issued = 0;
 static uint64_t stat_addr_order_mismatch = 0, stat_addr_unmapped = 0, stat_addr_mapped = 0;
 static uint64_t stat_ret_refused = 0, stat_acc_unstated = 0;
-static int g_emit_elem = -1;  /* logical element index of the access being emitted */
 
-/* ADDR: their generator's address for the tile the kept read at element e opens. With A as
+/* ADDR: their generator's address for the tile the kept read at loc opens. With A as
  * mat[head][k][out], their MAC for head-in-bank itr, k tile i and column group c sits at
  * itr*K*M + i*K + c*n_mac elements from the matrix base (gen_trace_HBMPIM_GEMV.py:139,
  * the k tile stepping by dhead where the row is seq long), here from our slab's base. */
 static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
                         int *bg, int *bank, int *sa, int *row, int *col);
 
-typedef struct {
-  int elem_idx;
-  int ch;
-  int pch;
-  int bg;
-  int bank;
-  int sa;
-  int row;
-  int col;
-} pim_phys_loc_t;
-
-static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, int bank) {
+static uint64_t dcc_mac_addr(tensor_info_t *t, const pim_phys_loc_t *loc) {
   int64_t n = t->tile_mac_reads, K = t->addr_kext, M = t->addr_k;
-  int64_t k = (e % t->addr_head) / M, o = e % M;
+  int64_t e = loc->elem_idx, k = (e % t->addr_head) / M, o = e % M;
   /* The head's iteration within its core is the program's within its group, instances going
    * round-robin over the groups. */
   int64_t itr = (int64_t)__pim_get_program_id() / g_groups;
@@ -844,7 +841,7 @@ static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, i
   int vpc = t->values_per_col;
   int vpr = t->values_per_row;
   if (k % n || o % n || t->elem_size != 2 || n != vpc || off % vpc ||
-      (t->pack_base_col >= 0 && off / vpc >= t->pack_cols)) {
+      (has_slab(t) && off / vpc >= t->pack_cols)) {
     stat_addr_unmapped++;
     return 0;
   }
@@ -860,15 +857,15 @@ static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, i
   /* The matrix base is the slab's first column, or, for a tensor with no slab, where its
    * first element lands in this bank's row map. */
   long cpr = vpr / vpc, base = t->pack_base_col;
-  if (base < 0) {
+  if (!has_slab(t)) {
     int c0, p0, g0, b0, s0, r0, col0;
     map_element(t, 0, &c0, &p0, &g0, &b0, &s0, &r0, &col0);
     base = ((long)s0 * cfg_num_rows + r0) * cpr + col0;
   }
   long lc = base + off / vpc;
   int linear_row = (int)(lc / cpr);
-  return dcc_addr(ch, pch, bg, bank, linear_row / cfg_num_rows, linear_row % cfg_num_rows,
-                  (int)(lc % cpr));
+  return dcc_addr(loc->ch, loc->pch, loc->bg, loc->bank, linear_row / cfg_num_rows,
+                  linear_row % cfg_num_rows, (int)(lc % cpr));
 }
 
 /* SWAP. run_GEMV lays out Mat | Key | Ret and passes (Mat, Key, Ret) as GEMV's (Vec, Mat, Ret)
@@ -889,8 +886,8 @@ static int dcc_swap_geometry(const tensor_info_t *res, dcc_swap_t *g) {
       vec = &tensors[i];
     }
   }
-  if (!mat || !vec || mat->pack_base_col < 0 || vec->pack_base_col < 0 ||
-      (res && res->pack_base_col < 0) || mat->addr_k <= 0 || mat->addr_kext <= 0)
+  if (!mat || !vec || !has_slab(mat) || !has_slab(vec) || (res && !has_slab(res)) ||
+      mat->addr_k <= 0 || mat->addr_kext <= 0)
     return 0;
   int vpc = mat->values_per_col;
   long ek = mat->addr_kext, em = mat->addr_k, per_head = ek * em;
@@ -931,7 +928,7 @@ static void dcc_swap_vec(const tensor_info_t *t, const pim_phys_loc_t *loc, uint
   long s = c * (t->values_per_col > 0 ? t->values_per_col : 1);
   long itr = (long)__pim_get_program_id() / g_groups;
   if (!dcc_swap_geometry(NULL, &g) || c < 0 || c >= t->pack_cols || s / g.ek != itr) {
-    stat_addr_unmapped++;   /* pass_ablation records this one, and native_reading refuses on it */
+    stat_addr_unmapped++;   /* pipeline records this one, and native_reading refuses on it */
     return;
   }
   long byte = 2 * (itr * g.ek + (s % g.ek) / g.vpc);
@@ -948,7 +945,7 @@ static int dcc_swap_res(const tensor_info_t *t, const pim_phys_loc_t *loc, uint6
   long s = c * (t->values_per_col > 0 ? t->values_per_col : 1);
   long itr = (long)__pim_get_program_id() / g_groups;
   if (!dcc_swap_geometry(t, &g) || c < 0 || c >= t->pack_cols || s / g.em != itr) {
-    stat_addr_unmapped++;   /* pass_ablation records this one, and native_reading refuses on it */
+    stat_addr_unmapped++;   /* pipeline records this one, and native_reading refuses on it */
     return 0;
   }
   *reset = dcc_swap_at(loc, g.vec0, 0);
@@ -978,7 +975,7 @@ static int maddr_on(void) {
   if (!(g_dcc_native & NAT_MADDR)) return 0;
   long base = 0;
   for (int i = 0; i < num_tensors; i++) {
-    if (tensors[i].addr_head > 0 || tensors[i].pack_base_col < 0) return 0;
+    if (tensors[i].addr_head > 0 || !has_slab(&tensors[i])) return 0;
     g_maddr_base[i] = base;
     base += tensors[i].pack_cols;
   }
@@ -1064,16 +1061,8 @@ typedef struct { seg_ent_t *e; size_t n, cap; char *txt; size_t tn, tcap; } seg_
 static void seg_push(seg_buf_t *b, uint64_t key, const char *op, uint64_t addr) {
   char line[64];
   int len = snprintf(line, sizeof line, "%s 0x%08llx\n", op, (unsigned long long)addr);
-  if (b->n == b->cap) {
-    b->cap = b->cap ? b->cap * 2 : 1u << 12;
-    b->e = (seg_ent_t *)realloc(b->e, b->cap * sizeof *b->e);
-  }
-  if (b->tn + (size_t)len > b->tcap) {
-    b->tcap = b->tcap ? b->tcap * 2 : 1u << 16;
-    while (b->tn + (size_t)len > b->tcap) b->tcap *= 2;
-    b->txt = (char *)realloc(b->txt, b->tcap);
-  }
-  if (!b->e || !b->txt) { fprintf(stderr, "[pim-runtime] ERROR: group stream alloc\n"); exit(1); }
+  b->e = grow(b->e, &b->cap, b->n + 1, sizeof *b->e, "group stream");
+  b->txt = grow(b->txt, &b->tcap, b->tn + (size_t)len, 1, "group stream");
   memcpy(b->txt + b->tn, line, (size_t)len);
   b->e[b->n++] = (seg_ent_t){key, (uint32_t)b->tn, (uint32_t)len};
   b->tn += (size_t)len;
@@ -1214,7 +1203,7 @@ uint64_t pim_dcc_native_off_bank0(void) { return stat_native_off_bank0; }
  * banks it stored to, each at the next column away from the input. Not coverage: no kernel
  * access touched these. */
 static void dcc_return_stage(void) {
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  uint64_t g_ba = bank_bytes();
   for (int t = 0; t < num_tensors; t++) {
     tensor_info_t *T = &tensors[t];
     if (T->ret_src < 0 || T->ret_cols <= T->pack_cols) continue;
@@ -1254,7 +1243,7 @@ static void dcc_return_stage(void) {
  * strip is the program's. */
 static int map_rec_cmp(const void *a, const void *b) {
   const dcc_rec_t *x = *(const dcc_rec_t *const *)a, *y = *(const dcc_rec_t *const *)b;
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  uint64_t g_ba = bank_bytes();
   if (x->dispatch != y->dispatch) return x->dispatch < y->dispatch ? -1 : 1;
   if (x->round != y->round) return x->round < y->round ? -1 : 1;
   if (x->addr / g_ba != y->addr / g_ba) return x->addr / g_ba < y->addr / g_ba ? -1 : 1;
@@ -1264,8 +1253,8 @@ static int map_rec_cmp(const void *a, const void *b) {
 static void map_grf_b_check(void) {
   int all = __pim_acc_cells_per_lane == 0, any = all;
   for (int i = 0; i < num_tensors && !any; i++) any = tensors[i].dcc_map;
-  if (!(__pim_layout_count > 0 && any) || !g_rec_n) return;
-  uint64_t g_ba = (uint64_t)DCC_ROWS_PER_BANK * DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  if (!any || !g_rec_n) return;
+  uint64_t g_ba = bank_bytes();
   const dcc_rec_t **v = (const dcc_rec_t **)malloc(g_rec_n * sizeof *v);
   if (!v) { fprintf(stderr, "[pim-runtime] ERROR: map GRF_B check alloc\n"); exit(1); }
   size_t n = 0;
@@ -1292,6 +1281,15 @@ static void map_grf_b_check(void) {
   }
 }
 
+/* Releases the command buffers once dp_flush has written them. */
+static void free_records(void) {
+  free(stage_buf); stage_buf = NULL; stage_len = stage_cap = 0;
+  free(g_recs); g_recs = NULL; g_rec_n = g_rec_cap = 0;
+  free(g_stage); g_stage = NULL; g_stage_n = g_stage_cap = 0;
+  free(g_op_stage); g_op_stage = NULL; g_op_stage_n = g_op_stage_cap = 0;
+  free(g_grf_recs); g_grf_recs = NULL; g_grf_n = g_grf_cap = 0;
+}
+
 static void dp_flush(void) {
   if (!trace_fp) return;
   if (g_grf_n) grf_sort();
@@ -1310,16 +1308,11 @@ static void dp_flush(void) {
   if (g_grf_n || g_op_stage_n) grf_stage_flush();
   /* GRF loads join the round they were issued in. Their seq sits above every emitted
    * command's, so grf_sort's order survives the sort below. */
-  for (size_t i = 0; i < g_grf_n; i++) {
-    if (g_rec_n == g_rec_cap) {
-      g_rec_cap = g_rec_cap ? g_rec_cap * 2 : 1u << 14;
-      g_recs = (dcc_rec_t *)realloc(g_recs, g_rec_cap * sizeof *g_recs);
-      if (!g_recs) { fprintf(stderr, "[pim-runtime] ERROR: command record alloc\n"); exit(1); }
-    }
+  g_recs = grow(g_recs, &g_rec_cap, g_rec_n + g_grf_n, sizeof *g_recs, "command record");
+  for (size_t i = 0; i < g_grf_n; i++)
     g_recs[g_rec_n++] = (dcc_rec_t){g_grf_recs[i].dispatch, g_grf_recs[i].addr,
                                     ((uint64_t)1 << 62) + i, g_grf_recs[i].blk, DP_LDOP,
                                     "PIM_LD_OP1", -1, g_grf_recs[i].ld};
-  }
   map_grf_b_check();
   if (g_rec_n) qsort(g_recs, g_rec_n, sizeof *g_recs, rec_cmp);
   size_t i = 0;
@@ -1329,13 +1322,7 @@ static void dp_flush(void) {
   for (; i < g_rec_n; i++)
     fprintf(trace_fp, "%s 0x%08llx\n", g_recs[i].op, (unsigned long long)g_recs[i].at);
   if (g_dcc_native & NAT_RET) dcc_return_stage();
-  free(stage_buf); stage_buf = NULL; stage_len = stage_cap = 0;
-  free(g_recs); g_recs = NULL; g_rec_n = g_rec_cap = 0;
-  free(g_stage); g_stage = NULL; g_stage_n = g_stage_cap = 0;
-  free(g_op_stage); g_op_stage = NULL; g_op_stage_n = g_op_stage_cap = 0;
-  free(g_grf_recs); g_grf_recs = NULL; g_grf_n = g_grf_cap = 0;
-  g_rnd_lane = -1; g_rnd_disp = UINT64_MAX; g_rnd = 0; g_rnd_closed = 0;
-  g_open_lane = -1; g_open_valid = 0; g_open_closed = 0;
+  free_records();
 }
 
 static void grf_b_check(void) {
@@ -1362,122 +1349,137 @@ static void grf_b_check(void) {
 int pim_dcc_grf_b_overflow(void) { return g_grf_b_overflow; }
 uint64_t pim_dcc_grf_a_refetches(void) { return stat_grf_a_refetch; }
 
-/* op is BR, W, BW or R, the role-level command, emitted in DCC's vocabulary. */
-static void emit_trace(const char *op, int ch, int pch, int bg, int bank,
-                       int sa, int row, int col) {
-  uint64_t a = dcc_addr(ch, pch, bg, bank, sa, row, col);
-  if (!strcmp(op, "BR")) {                       /* streamed column read + MAC */
-    int tid = (int)(t_emit - tensors);
-    if (g_dcc_activation[tid]) {
-      /* PER BANK, not per surviving command. The read itself is one group-level
-       * command covering every bank, but staging is host-side data movement and
-       * DCC charges it once per bank -- their LD is 64 for two M-vectors over 32
-       * banks. Deduped on (tensor, row, col) so each column stages exactly once. */
-      if (!g_dcc_staged)
-        g_dcc_staged = addr_dedup_create(4096);
-      /* Per channel: a group's banks hold its own instances' data. */
-      if (addr_dedup_check_and_mark(g_dcc_staged, (uint64_t)tid | ((uint64_t)ch << 8),
-                                    (uint64_t)sa * (uint64_t)cfg_num_rows + row,
-                                    (uint64_t)col)) {
-        int nb = banks_per_channel();
-        uint64_t pos = ((uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row) *
-                           (uint64_t)DCC_COLS_PER_ROW + (uint64_t)col;
-        for (int gb = ch * nb; gb < ch * nb + group_lanes(); gb++) {
-          int c2, p2, g2, b2;
-          decompose_global_bank(gb, &c2, &p2, &g2, &b2);
-          uint64_t at = dcc_addr(c2, p2, g2, b2, sa, row, col);
-          if (maddr_on()) {
-            pim_phys_loc_t l = {g_emit_elem, c2, p2, g2, b2, sa, row, col};
-            long c = maddr_col(t_emit, &l);
-            if (c >= 0) at = maddr_at(&l, tid, c * DCC_COL_BYTES);
-          }
-          stage_record(tid, pos, gb, at);
-          stat_dcc_staged++;
-        }
-      }
+/* ACTIVATION STAGING, DCC's convention, this tree only.
+ *
+ * Their model stages activation vectors into the banks per invocation and leaves the
+ * weight matrix resident: GEMV emits ST for the vector and nothing for the matrix, VA
+ * emits LD for both its inputs because both are activations. Our operand path stages a
+ * GEMV vector, but an elementwise kernel's inputs look partitioned to the residency
+ * classifier and are read as bank-local group commands, so they are staged here. Which
+ * tensors are activations is inter-kernel dataflow, so the harness marks every input it
+ * does not declare resident through pim_dcc_mark_activation.
+ *
+ * Staging is per bank, not per surviving command. The read is one group-level command
+ * covering every bank, but staging is host-side data movement and DCC charges it once per
+ * bank (their LD is 64 for two M-vectors over 32 banks). It is deduped on (tensor, channel,
+ * row, col), since a group's banks hold its own instances' data, so each column stages
+ * once into every bank of the group, exactly the vector. */
+static void dcc_stage_activation(const tensor_info_t *t, const pim_phys_loc_t *loc) {
+  int tid = (int)(t - tensors);
+  if (!g_dcc_staged)
+    g_dcc_staged = addr_dedup_create(4096);
+  if (!addr_dedup_check_and_mark(g_dcc_staged, (uint64_t)tid | ((uint64_t)loc->ch << 8),
+                                 (uint64_t)loc->sa * (uint64_t)cfg_num_rows + loc->row,
+                                 (uint64_t)loc->col))
+    return;
+  int nb = banks_per_channel();
+  uint64_t pos = ((uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row) *
+                     (uint64_t)DCC_COLS_PER_ROW + (uint64_t)loc->col;
+  for (int gb = loc->ch * nb; gb < loc->ch * nb + group_lanes(); gb++) {
+    pim_phys_loc_t l = *loc;
+    decompose_global_bank(gb, &l.ch, &l.pch, &l.bg, &l.bank);
+    uint64_t at = dcc_loc_addr(&l);
+    if (maddr_on()) {
+      long c = maddr_col(t, &l);
+      if (c >= 0) at = maddr_at(&l, tid, c * DCC_COL_BYTES);
     }
-    if (dcc_tile_issue((tensor_info_t *)t_emit)) {
-      if ((g_dcc_native & NAT_ADDR) && t_emit->addr_head > 0) {
-        uint64_t their = dcc_mac_addr((tensor_info_t *)t_emit, g_emit_elem, ch, pch, bg,
-                                      bank);
-        if (their) a = their;
-      }
-      if (maddr_on()) {
-        int tid = (int)(t_emit - tensors);
-        pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
-        long c = maddr_col(t_emit, &l);
-        if (c >= 0) {
-          int gb = maddr_bank(&l);
-          a = maddr_at(&l, tid, maddr_pim_byte(tid, t_emit, gb, c));
-          g_ms_in[gb] = g_ms_first[tid][gb];
-          g_last_mac_tid = tid;
-          g_last_mac_loc = l;
-        }
-      }
-      dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", a);
-    }
-    g_last_mac = a;
-  } else if (!strcmp(op, "W")) {                 /* operand staged once, then into the GRF */
-    if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
-    if (addr_dedup_check_and_mark(g_dcc_grf_staged,
-                                  perbank_ns(t_emit, ch, pch, bg, bank, 0),
-                                  (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row,
-                                  (uint64_t)col))
-      op_stage_record(a);
-    dp_record(DP_LDOP, "PIM_LD_OP1", a);
-  } else if (!strcmp(op, "BW")) {                /* their entire output path */
-    /* A map has no accumulator to reset or drain, and DCC's own VA and RELU emit
-     * neither command. Gate on layout_count too: the weak-extern fallback makes both
-     * globals 0, so an artifact carrying no table must not read as elementwise. */
-    /* DCC's result-register path writes a map's output back too (WB_RES), so under
-     * the ACC bit a tensor the compiler gave a write-back keeps it. */
-    if (g_dcc_native && __pim_dcc_decided && t_emit->acc_wb < 0)
-      stat_acc_unstated++;  /* a stored tensor the compiler stated nothing for */
-    uint64_t reset_at = a, wb_at = a, out_at = a;
-    if (g_dcc_native & NAT_SWAP) {
-      pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
-      dcc_swap_res(t_emit, &l, &reset_at, &wb_at, &out_at);
+    stage_record(tid, pos, gb, at);
+    stat_dcc_staged++;
+  }
+}
+
+/* A streamed column read, which is the MAC that consumes it (PIM_RELU under the ReLU
+ * opcode). */
+static void dcc_emit_stream_read(tensor_info_t *t, const pim_phys_loc_t *loc) {
+  int tid = (int)(t - tensors);
+  uint64_t a = dcc_loc_addr(loc);
+  if (g_dcc_activation[tid])
+    dcc_stage_activation(t, loc);
+  if (dcc_tile_issue(t)) {
+    if ((g_dcc_native & NAT_ADDR) && t->addr_head > 0) {
+      uint64_t their = dcc_mac_addr(t, loc);
+      if (their) a = their;
     }
     if (maddr_on()) {
-      /* A map writes its own slice back. A reduction's partial lands at the first value of
-       * the slice it summed. */
-      int tid = (int)(t_emit - tensors);
-      pim_phys_loc_t l = {g_emit_elem, ch, pch, bg, bank, sa, row, col};
-      long c = maddr_col(t_emit, &l);
+      long c = maddr_col(t, loc);
       if (c >= 0) {
-        int gb = maddr_bank(&l);
-        out_at = maddr_at(&l, tid, c * DCC_COL_BYTES);
-        int map = __pim_acc_cells_per_lane == 0 || t_emit->dcc_map;
-        wb_at = maddr_at(&l, tid, map ? maddr_pim_byte(tid, t_emit, gb, c)
-                                      : 2 * 16 * g_ms_in[gb]);
+        int gb = maddr_bank(loc);
+        a = maddr_at(loc, tid, maddr_pim_byte(tid, t, gb, c));
+        g_ms_in[gb] = g_ms_first[tid][gb];
+        g_last_mac_tid = tid;
+        g_last_mac_loc = *loc;
       }
     }
-    /* A stored register ReLU is a GRF->GRF MOV(ReLU) at the column of the register it
-     * moves, the write-back's, on every bank the write-back reaches (nat_print). */
-    if (g_cur_op == 2) {
-      uint64_t lrow = (uint64_t)sa * (uint64_t)cfg_num_rows + (uint64_t)row;
-      uint64_t h = lockstep_key(channel_ns(t_emit, ch, 1), cur_dispatch, g_access_ord, lrow,
-                                (uint64_t)col);
-      if (!g_rrelu_seen) g_rrelu_seen = addr_dedup_create(4096);
-      if (g_dcc_native || addr_dedup_check_and_mark(g_rrelu_seen, h, h >> 16, h >> 48))
-        dp_record_at(DP_RRELU, "PIM_RELU", a, wb_at);
-    }
-    if (__pim_layout_count > 0 && (__pim_acc_cells_per_lane == 0 || t_emit->dcc_map) &&
-        !(g_dcc_native && t_emit->acc_wb > 0)) {
-      stat_dcc_free_acc_ops += 2;
-    } else {
-      dp_record_at(DP_RESET, "PIM_ACC_RESET", a, reset_at);
-      if (g_open_valid && g_open_lane == phys_lane() &&
-          (g_open_disp != cur_dispatch || g_open_rnd != g_rnd)) {
-        g_recs[g_rec_n - 1].dispatch = g_open_disp;
-        g_recs[g_rec_n - 1].round = g_open_rnd;
-      }
-      dp_record_at(DP_WB, "PIM_WB_ACC", a, wb_at);
-    }
-    dp_record_at(DP_OUT, "ST", a, out_at);
-  } else if (!strcmp(op, "R")) {
-    dp_push("LD", a);
+    dp_record(DP_MAC, g_cur_op == 1 ? "PIM_RELU" : "PIM_MAC_OP1", tid, a);
   }
+  g_last_mac = a;
+}
+
+/* An operand load into the receiving bank's GRF, at that bank (loc): staged into the bank
+ * once, then one PIM_LD_OP1 per load. */
+static void dcc_emit_operand_load(const tensor_info_t *t, const pim_phys_loc_t *loc) {
+  uint64_t a = dcc_loc_addr(loc);
+  if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
+  if (addr_dedup_check_and_mark(g_dcc_grf_staged,
+                                perbank_ns(t, loc->ch, loc->pch, loc->bg, loc->bank, 0),
+                                (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row,
+                                (uint64_t)loc->col))
+    op_stage_record(a);
+  dp_record(DP_LDOP, "PIM_LD_OP1", (int)(t - tensors), a);
+}
+
+/* A store to an accumulator, DCC's entire output path: reset, write-back and the output
+ * ST, or the ST alone for a map. */
+static void dcc_emit_store(const tensor_info_t *t, const pim_phys_loc_t *loc) {
+  int tid = (int)(t - tensors);
+  uint64_t a = dcc_loc_addr(loc);
+  /* DCC's result-register path writes a map's output back too (WB_RES), so under
+   * the ACC bit a tensor the compiler gave a write-back keeps it. */
+  if (g_dcc_native && __pim_dcc_decided && t->acc_wb < 0)
+    stat_acc_unstated++;  /* a stored tensor the compiler stated nothing for */
+  uint64_t reset_at = a, wb_at = a, out_at = a;
+  if (g_dcc_native & NAT_SWAP)
+    dcc_swap_res(t, loc, &reset_at, &wb_at, &out_at);
+  if (maddr_on()) {
+    /* A map writes its own slice back. A reduction's partial lands at the first value of
+     * the slice it summed. */
+    long c = maddr_col(t, loc);
+    if (c >= 0) {
+      int gb = maddr_bank(loc);
+      out_at = maddr_at(loc, tid, c * DCC_COL_BYTES);
+      int map = __pim_acc_cells_per_lane == 0 || t->dcc_map;
+      wb_at = maddr_at(loc, tid, map ? maddr_pim_byte(tid, t, gb, c) : 2 * 16 * g_ms_in[gb]);
+    }
+  }
+  /* A stored register ReLU is a GRF->GRF MOV(ReLU) at the column of the register it
+   * moves, the write-back's, on every bank the write-back reaches (nat_print). */
+  if (g_cur_op == 2) {
+    uint64_t lrow = (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row;
+    uint64_t h = lockstep_key(channel_ns(t, loc->ch, 1), cur_dispatch, g_access_ord, lrow,
+                              (uint64_t)loc->col);
+    if (!g_rrelu_seen) g_rrelu_seen = addr_dedup_create(4096);
+    if (g_dcc_native || addr_dedup_check_and_mark(g_rrelu_seen, h, h >> 16, h >> 48))
+      dp_record_at(DP_RRELU, "PIM_RELU", tid, a, wb_at);
+  }
+  /* A map has no accumulator to reset or drain, and DCC's own VA and RELU emit neither
+   * command. */
+  if ((__pim_acc_cells_per_lane == 0 || t->dcc_map) && !(g_dcc_native && t->acc_wb > 0)) {
+    stat_dcc_free_acc_ops += 2;
+  } else {
+    dp_record_at(DP_RESET, "PIM_ACC_RESET", tid, a, reset_at);
+    if (g_open_valid && g_open_lane == phys_lane() &&
+        (g_open_disp != cur_dispatch || g_open_rnd != g_rnd)) {
+      g_recs[g_rec_n - 1].dispatch = g_open_disp;
+      g_recs[g_rec_n - 1].round = g_open_rnd;
+    }
+    dp_record_at(DP_WB, "PIM_WB_ACC", tid, a, wb_at);
+  }
+  dp_record_at(DP_OUT, "ST", tid, a, out_at);
+}
+
+/* An accumulator read, which the host does with an LD. */
+static void dcc_emit_acc_read(const pim_phys_loc_t *loc) {
+  dp_push("LD", dcc_loc_addr(loc));
 }
 
 /*
@@ -1498,35 +1500,28 @@ static int find_tensor(uint64_t addr) {
   return -1;
 }
 
-static void destroy_dedup_state() {
-  if (g_lockstep_collapse) {
-    addr_dedup_destroy(g_lockstep_collapse);
-    g_lockstep_collapse = NULL;
-  }
+static void destroy_dedup_state(void) {
+  addr_dedup_destroy(g_lockstep_collapse);
+  addr_dedup_destroy(g_dcc_grf_staged);
+  addr_dedup_destroy(g_dcc_staged);
+  addr_dedup_destroy(g_rrelu_seen);
+  g_lockstep_collapse = g_dcc_grf_staged = g_dcc_staged = g_rrelu_seen = NULL;
 }
 
-static void advance_program_epoch_if_needed(void) {
-  /* Just record which dispatch we are in; the id goes into the lockstep key. See
-   * cur_dispatch for why keying beats resetting. The epoch itself is signalled by the
-   * host through the program-id setters rather than inferred from the ids, so the
-   * cadence does not depend on the order the replay walks the grid. */
-  {
-    uint64_t tile = __pim_tile_index();
-    uint64_t epoch = __pim_program_epoch;
-    uint64_t packed = __pim_persistent ? ((epoch << PIM_TILE_BITS) | tile) : epoch;
-    if (!g_warned_dispatch_overflow && __pim_persistent &&
-        tile >= (1ULL << PIM_TILE_BITS)) {
-      g_warned_dispatch_overflow = 1;
-      fprintf(stderr,
-              "[pim-runtime] WARN: tile index %llu does not fit %d bits (epoch "
-              "%llu). Ids alias and distinct dispatches collapse.\n",
-              (unsigned long long)tile, PIM_TILE_BITS, (unsigned long long)epoch);
-    }
-    /* Only a persistent kernel spends bits on the tile index. A gridded one has
-     * none, and shifting its epoch left by 10 overflowed the field at 128
-     * instances. The artifact says which shape this is. */
-    cur_dispatch = packed;
+/* Sets cur_dispatch from the epoch the host signals through the program-id setters, so
+ * the cadence does not depend on the order the replay walks the grid. Only a persistent
+ * kernel spends bits on the tile index, so a gridded kernel's epoch keeps the whole id. */
+static void refresh_dispatch_id(void) {
+  uint64_t tile = __pim_tile_index();
+  uint64_t epoch = __pim_program_epoch;
+  if (!g_warned_dispatch_overflow && __pim_persistent && tile >= (1ULL << PIM_TILE_BITS)) {
+    g_warned_dispatch_overflow = 1;
+    fprintf(stderr,
+            "[pim-runtime] WARN: tile index %llu does not fit %d bits (epoch "
+            "%llu). Ids alias and distinct dispatches collapse.\n",
+            (unsigned long long)tile, PIM_TILE_BITS, (unsigned long long)epoch);
   }
+  cur_dispatch = __pim_persistent ? ((epoch << PIM_TILE_BITS) | tile) : epoch;
 }
 
 static int compute_global_bank(int ch, int pch, int bg, int bank) {
@@ -1584,21 +1579,17 @@ static void map_element(const tensor_info_t *t, int elem_idx, int *ch, int *pch,
   *row = linear_row % cfg_num_rows;
 }
 
-/* Banks are threads here: lane b is bank b's PE and may only touch bank b. The
- * interleaved map changes bank every 512 elements while a lane's slab is 1024, so
- * lane 0's data sat in banks 0 and 1. Put the element in the executing lane's bank at
- * the next slot of that lane's slab, and the slot is remembered so a re-read lands on
- * the same address. A replicated tensor gets the same
- * treatment: its copy in bank b is a full slab, not the source word's (sa,row,col)
- * with the bank bits dropped, which aliased 4-8 words onto one address. */
+/* Banks are threads here: lane b is bank b's PE and may only touch bank b, while the
+ * interleaved map spreads a lane's elements over several banks. So the element goes to the
+ * executing lane's bank at the next slot of that lane's slab, and the slot is remembered
+ * so a re-read lands on the same address. A replicated tensor's copy in every bank is a
+ * full slab. */
 static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
   static int warned = 0;
   int lane = phys_lane();
   /* Every lane loads a replicated tensor in the same order, so one numbering serves
-   * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x. */
-  /* >= 1, not == 1: the compiler word carries the RECEIVER COUNT now (0 partitioned,
-   * 1 every bank, >1 exactly that many), so an equality test read a replicated tensor
-   * as partitioned the moment the count stopped being a flag. */
+   * all 32 copies: key on lane 0 and the map stays the size of the tensor, not 32x.
+   * bank_replicated is a receiver count, so any positive value is replicated. */
   int key_lane = (t->bank_replicated >= 1) ? 0 : lane;
   int inserted = 0;
   int32_t slot = slot_map_get_or_put(t->lane_slot, key_lane, loc->elem_idx,
@@ -1634,88 +1625,86 @@ static void note_ignored(void) {
   g_emit_drops++;
 }
 
-/* Resolve one logical element access to its physical HBM tuple.
- *
- * Returns 1 on success and fills `loc`. Returns 0 when the address falls outside the
- * tensor, already counted by note_ignored. */
-static int resolve_access_location(tensor_info_t *t, uint64_t addr,
-                                   pim_phys_loc_t *loc) {
+/* The element at addr, mapped and, when its tensor has a slab, placed in the executing
+ * lane's slab. *tp moves on when a vector crosses into the next tensor. Returns 0, counted
+ * by note_ignored, when addr is in no tensor or past its tensor's elements. */
+static int resolve_elem(tensor_info_t **tp, uint64_t addr, pim_phys_loc_t *loc) {
+  tensor_info_t *t = *tp;
+  if (addr >= (uint64_t)t->base_addr + t->total_bytes) {
+    int k = find_tensor(addr);
+    if (k < 0) {
+      note_ignored();
+      return 0;
+    }
+    t = *tp = &tensors[k];
+  }
   int elem_idx = (int)((addr - (uint64_t)t->base_addr) / t->elem_size);
   if (elem_idx < 0 || elem_idx >= t->num_elements) {
     note_ignored();
     return 0;
   }
-
   loc->elem_idx = elem_idx;
   map_element(t, elem_idx, &loc->ch, &loc->pch, &loc->bg, &loc->bank, &loc->sa,
               &loc->row, &loc->col);
-  if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
+  if (has_slab(t))
     place_in_lane_slab(t, loc);
   return 1;
 }
 
-/* Emit the trace op implied by the access direction and tensor role for an
- * already-resolved physical tuple. */
-static void emit_access_by_role_phase(tensor_info_t *t,
-                                      const pim_phys_loc_t *loc, int is_write) {
-  t_emit = t;
-  g_emit_elem = loc->elem_idx;
-  if (!is_write) {
-    switch (t->role) {
-    case PIM_ROLE_STREAMED:
-      emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                 loc->row, loc->col);
-      stat_bank_reads++;
-      break;
-    case PIM_ROLE_OPERAND: {
-      /* An operand load is a bus-mediated write into the RECEIVING PE's register
-       * file, so address it at the replay bank rather than at the source element's
-       * home bank, or all N fanout writes pile onto one bank and serialize. There is
-       * deliberately no broadcast, as DCC issues one PIM_LD_OP1 per bank. */
-      int dch, dpch, dbg, dbank;
-      decompose_global_bank(phys_lane(), &dch, &dpch, &dbg, &dbank);
-      emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
-      stat_writes++;
-      /* The W already expands to ST + PIM_LD_OP1 in emit_trace, so no second command.
-       * Our W count equals DCC's PIM_LD_OP1 count exactly. */
-      break;
-    }
-    case PIM_ROLE_ACCUMULATOR: {
-      int rr = dcc_reread(t, loc->elem_idx);
-      if (rr < 0 && g_dcc_native) {
-        /* DCC reads no other bank's result, so no native stream has this read. */
-        fprintf(stderr, "[pim-runtime] ERROR: lane %d reads element %lld of tensor %d, "
-                        "which another lane wrote\n", phys_lane(), (long long)loc->elem_idx,
-                (int)(t - tensors));
-        exit(1);
-      }
-      if (rr > 0) {
-        emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                   loc->row, loc->col);
-        stat_bank_reads++;
-        break;
-      }
-      emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                 loc->row, loc->col);
-      stat_reads++;
-      break;
-    }
-    }
-  } else {
+/* The DRAM column word loc lands on, the coalescer's key. */
+static uint64_t word_key(const pim_phys_loc_t *loc) {
+  int gb = compute_global_bank(loc->ch, loc->pch, loc->bg, loc->bank);
+  return ((uint64_t)gb & 0xFFFFULL) | (((uint64_t)loc->sa & 0xFFULL) << 16) |
+         (((uint64_t)loc->row & 0xFFFFFFULL) << 24) | (((uint64_t)loc->col & 0xFFFFULL) << 48);
+}
+
+/* The commands one resolved access implies, by direction and role. ACCUMULATOR means the
+ * target of a store, not of a reduction, so a map's output takes the store path too. */
+static void emit_access(tensor_info_t *t, const pim_phys_loc_t *loc, int is_write) {
+  g_fold_tid = (int)(t - tensors);
+  if (is_write) {
     if (t->role == PIM_ROLE_ACCUMULATOR) {
-      /* ACCUMULATOR here means "target of a tt.store", not "reduction target", so a
-       * map lands in this branch too. Whether its reset and writeback are emitted is
-       * decided in emit_trace's BW arm from the compiler's acc_cells_per_lane.
-       *
-       * This is confined to this tree. The default charges an accumulator writeback
-       * as the DRAM write it is. */
-      emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
-                 loc->row, loc->col);
+      dcc_emit_store(t, loc);
       stat_bank_writes++;
+    } else {
+      g_emit_drops++;  /* a store to an input */
     }
-    /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
-    else
-      g_emit_drops++;
+    return;
+  }
+  switch (t->role) {
+  case PIM_ROLE_STREAMED:
+    dcc_emit_stream_read(t, loc);
+    stat_bank_reads++;
+    break;
+  case PIM_ROLE_OPERAND: {
+    /* An operand load is a bus-mediated write into the RECEIVING PE's register file, so
+     * it is addressed at the replay bank rather than the element's home bank, or all N
+     * fanout writes would pile onto one bank. There is deliberately no broadcast, as DCC
+     * issues one PIM_LD_OP1 per bank. */
+    pim_phys_loc_t at = *loc;
+    decompose_global_bank(phys_lane(), &at.ch, &at.pch, &at.bg, &at.bank);
+    dcc_emit_operand_load(t, &at);
+    stat_writes++;
+    break;
+  }
+  case PIM_ROLE_ACCUMULATOR: {
+    int rr = dcc_reread(t, loc->elem_idx);
+    if (rr < 0 && g_dcc_native) {
+      /* DCC reads no other bank's result, so no native stream has this read. */
+      fprintf(stderr, "[pim-runtime] ERROR: lane %d reads element %lld of tensor %d, "
+                      "which another lane wrote\n", phys_lane(), (long long)loc->elem_idx,
+              (int)(t - tensors));
+      exit(1);
+    }
+    if (rr > 0) {
+      dcc_emit_stream_read(t, loc);
+      stat_bank_reads++;
+    } else {
+      dcc_emit_acc_read(loc);
+      stat_reads++;
+    }
+    break;
+  }
   }
 }
 
@@ -1731,12 +1720,31 @@ enum { EC_BR = 1, EC_R, EC_BW, EC_GRF, EC_W, EC_FOLD, EC_RR };
 enum { EO_ST = 1, EO_LD, EO_LDOP, EO_C, EO_RESET, EO_WB, EO_N };
 static const char *const EO_NAME[EO_N] = {"", "ST", "LD", "PIM_LD_OP1", "compute", "PIM_ACC_RESET",
                                           "PIM_WB_ACC"};
-/* a: class, bank or channel, tensor, unwrapped linear row, column, low bits. b: dispatch, ordinal. */
+/* One access event in two words: a is the packed ec_key_t, b is dispatch << 32 | ordinal.
+ * Sorting on (a, b) puts the replicas of one access side by side. */
 typedef struct { uint64_t a, b; } ec_ev_t;
+typedef struct { int cls, cb, tid, col; uint64_t lrow, low; } ec_key_t;
 static ec_ev_t *g_ec = NULL;
 static size_t g_ec_n = 0, g_ec_cap = 0;
 static uint64_t g_ec_overflow = 0;
 static char g_trace_path[4096];
+
+/* Word a from the top: class 3 bits, bank or channel 10, tensor 4, unwrapped linear row
+ * 15, column 5 and low bits 27. Returns 0 when a field does not fit its width. */
+static int ec_pack(const ec_key_t *k, uint64_t *a) {
+  if (k->cb >= 1024 || k->tid >= 16 || k->lrow >= (1ULL << 15) || k->col >= 32 ||
+      k->low >= (1ULL << 27))
+    return 0;
+  *a = (uint64_t)k->cls << 61 | (uint64_t)k->cb << 51 | (uint64_t)k->tid << 47 |
+       k->lrow << 32 | (uint64_t)k->col << 27 | k->low;
+  return 1;
+}
+
+static ec_key_t ec_unpack(uint64_t a) {
+  return (ec_key_t){.cls = (int)(a >> 61), .cb = (int)((a >> 51) & 1023),
+                    .tid = (int)((a >> 47) & 15), .col = (int)((a >> 27) & 31),
+                    .lrow = (a >> 32) & 32767, .low = a & ((1ULL << 27) - 1)};
+}
 
 static void ec_reset(void) {
   free(g_ec);
@@ -1747,19 +1755,14 @@ static void ec_reset(void) {
 
 static void ec_push(int cls, int cb, int tid, uint64_t lrow, int col, uint64_t low,
                     uint64_t disp, uint64_t ord) {
-  if (cb >= 1024 || tid >= 16 || lrow >= (1ULL << 15) || col >= 32 || low >= (1ULL << 27) ||
-      disp >= (1ULL << 32) || ord >= (1ULL << 32)) {
+  ec_key_t k = {.cls = cls, .cb = cb, .tid = tid, .col = col, .lrow = lrow, .low = low};
+  uint64_t a;
+  if (!ec_pack(&k, &a) || disp >= (1ULL << 32) || ord >= (1ULL << 32)) {
     g_ec_overflow++;
     return;
   }
-  if (g_ec_n == g_ec_cap) {
-    g_ec_cap = g_ec_cap ? g_ec_cap * 2 : 1u << 16;
-    g_ec = (ec_ev_t *)realloc(g_ec, g_ec_cap * sizeof *g_ec);
-    if (!g_ec) { fprintf(stderr, "[pim-runtime] ERROR: emit coverage alloc\n"); exit(1); }
-  }
-  g_ec[g_ec_n++] = (ec_ev_t){(uint64_t)cls << 61 | (uint64_t)cb << 51 | (uint64_t)tid << 47 |
-                                 lrow << 32 | (uint64_t)col << 27 | low,
-                             disp << 32 | ord};
+  g_ec = grow(g_ec, &g_ec_cap, g_ec_n + 1, sizeof *g_ec, "emit coverage");
+  g_ec[g_ec_n++] = (ec_ev_t){a, disp << 32 | ord};
 }
 
 /* The class mirrors the role and GRF election only, never the emitter's bookkeeping. */
@@ -1829,132 +1832,160 @@ static int ec_ev_cmp(const void *x, const void *y) {
   return (p->b > q->b) - (p->b < q->b);
 }
 
-/* Collapsed classes (compute, accumulator reads) are compared per channel, since the line
- * names whichever lane issued first, and the rest per bank. A fold adds compute at the last
- * MAC's column, so compute is a floor per column and exact in total. */
-static void emit_check(void) {
+/* What one emit check counts. bad starts at the events that did not fit an ec_ev_t. */
+typedef struct {
+  uint64_t lines, unknown, misaligned, bad;
+  int64_t fold, emi[EO_N], exp[EO_N];
+} ec_tally_t;
+
+/* The commands the access events imply, per slot of g_em. Collapsed classes (compute,
+ * accumulator reads) are keyed per channel, since the line names whichever lane issued
+ * first, and the rest per bank. */
+static void ec_expect(ec_tally_t *c) {
   int nb = banks_per_channel();
-  int map = __pim_layout_count > 0 && __pim_acc_cells_per_lane == 0;
-  int64_t fold = 0;
+  int map = __pim_acc_cells_per_lane == 0;
   if (g_ec_n) qsort(g_ec, g_ec_n, sizeof *g_ec, ec_ev_cmp);
   for (size_t i = 0; i < g_ec_n;) {
     size_t j = i + 1;
     int64_t distinct = 1;
     for (; j < g_ec_n && g_ec[j].a == g_ec[i].a; j++) distinct += g_ec[j].b != g_ec[j - 1].b;
-    uint64_t a = g_ec[i].a, lrow = (a >> 32) & 32767;
-    int cls = (int)(a >> 61), cb = (int)((a >> 51) & 1023), tid = (int)((a >> 47) & 15);
-    int col = (int)((a >> 27) & 31);
-    switch (cls) {
+    ec_key_t k = ec_unpack(g_ec[i].a);
+    switch (k.cls) {
     case EC_BR:
-      ec_slot(EO_C, cb, lrow, col)->exp += distinct;
-      if (g_dcc_activation[tid])
-        for (int b = 0; b < group_lanes(); b++) ec_slot(EO_ST, cb * nb + b, lrow, col)->exp++;
+      ec_slot(EO_C, k.cb, k.lrow, k.col)->exp += distinct;
+      if (g_dcc_activation[k.tid])
+        for (int b = 0; b < group_lanes(); b++)
+          ec_slot(EO_ST, k.cb * nb + b, k.lrow, k.col)->exp++;
       break;
     case EC_R:
-      ec_slot(EO_LD, cb, lrow, col)->exp += distinct;
+      ec_slot(EO_LD, k.cb, k.lrow, k.col)->exp += distinct;
       break;
     case EC_BW:
-      ec_slot(EO_ST, cb, lrow, col)->exp += distinct;
-      if (!map && !tensors[tid].dcc_map) {
-        ec_slot(EO_RESET, cb, lrow, col)->exp += distinct;
-        ec_slot(EO_WB, cb, lrow, col)->exp += distinct;
+      ec_slot(EO_ST, k.cb, k.lrow, k.col)->exp += distinct;
+      if (!map && !tensors[k.tid].dcc_map) {
+        ec_slot(EO_RESET, k.cb, k.lrow, k.col)->exp += distinct;
+        ec_slot(EO_WB, k.cb, k.lrow, k.col)->exp += distinct;
       }
       break;
     case EC_GRF:
     case EC_W:
-      ec_slot(EO_LDOP, cb, lrow, col)->exp += (int64_t)(j - i);
-      ec_slot(EO_LD, cb / nb, lrow, col)->exp++;
-      ec_slot(EO_ST, cb, lrow, col)->exp++;
+      ec_slot(EO_LDOP, k.cb, k.lrow, k.col)->exp += (int64_t)(j - i);
+      ec_slot(EO_LD, k.cb / nb, k.lrow, k.col)->exp++;
+      ec_slot(EO_ST, k.cb, k.lrow, k.col)->exp++;
       break;
     case EC_FOLD:
-      fold += distinct;
+      c->fold += distinct;
       break;
     case EC_RR:
-      ec_slot(EO_C, cb, lrow, col)->exp += distinct;
+      ec_slot(EO_C, k.cb, k.lrow, k.col)->exp += distinct;
       break;
     }
     i = j;
   }
-  uint64_t lines = 0, unknown = 0, misaligned = 0, bad = g_ec_overflow, shown = 0;
-  int64_t emi[EO_N] = {0}, exp[EO_N] = {0};
-  /* The gate's negative control: the check must refuse a trace that lost one command. */
+}
+
+/* The closed trace's commands, per slot of g_em and per opcode. Under PIM_DCC_EC_NEGCTL,
+ * the gate's negative control, the first compute line is dropped, a trace that lost one
+ * command, which the check must refuse. */
+static void ec_read_trace(ec_tally_t *c) {
+  int nb = banks_per_channel();
   int lose = getenv("PIM_DCC_EC_NEGCTL") != NULL;
   FILE *f = fopen(g_trace_path, "r");
   if (!f) {
     fprintf(stderr, "[pim-runtime] emit coverage: cannot reopen %s\n", g_trace_path);
-    bad++;
-  } else {
-    char op[48];
-    unsigned long long addr;
-    uint64_t g_ba = bank_bytes(), g_row = (uint64_t)DCC_COLS_PER_ROW * DCC_COL_BYTES;
-    while (fscanf(f, "%47s %llx", op, &addr) == 2) {
-      lines++;
-      int o = !strcmp(op, "ST") ? EO_ST
-              : !strcmp(op, "LD") ? EO_LD
-              : !strcmp(op, "PIM_LD_OP1") ? EO_LDOP
-              : (!strcmp(op, "PIM_MAC_OP1") || !strcmp(op, "PIM_RELU")) ? EO_C
-              : !strcmp(op, "PIM_ACC_RESET") ? EO_RESET
-              : !strcmp(op, "PIM_WB_ACC") ? EO_WB
-              : !strcmp(op, "PIM_BARRIER") ? 0 : -1;
-      if (!o) continue;
-      if (o < 0) { unknown++; continue; }
-      if (o == EO_C && lose) { lose = 0; continue; }
-      misaligned += addr % DCC_COL_BYTES != 0;
-      uint64_t gb = addr / g_ba, off = addr % g_ba;
-      int cb = (o == EO_LD || o == EO_C) ? (int)(gb / (uint64_t)nb) : (int)gb;
-      ec_slot(o, cb, off / g_row, (int)((off % g_row) / DCC_COL_BYTES))->emi++;
-      emi[o]++;
-    }
-    fclose(f);
+    c->bad++;
+    return;
   }
+  char op[48];
+  unsigned long long addr;
+  uint64_t g_ba = bank_bytes(), g_row = (uint64_t)DCC_COLS_PER_ROW * DCC_COL_BYTES;
+  while (fscanf(f, "%47s %llx", op, &addr) == 2) {
+    c->lines++;
+    int o = !strcmp(op, "ST") ? EO_ST
+            : !strcmp(op, "LD") ? EO_LD
+            : !strcmp(op, "PIM_LD_OP1") ? EO_LDOP
+            : (!strcmp(op, "PIM_MAC_OP1") || !strcmp(op, "PIM_RELU")) ? EO_C
+            : !strcmp(op, "PIM_ACC_RESET") ? EO_RESET
+            : !strcmp(op, "PIM_WB_ACC") ? EO_WB
+            : !strcmp(op, "PIM_BARRIER") ? 0 : -1;
+    if (!o) continue;
+    if (o < 0) { c->unknown++; continue; }
+    if (o == EO_C && lose) { lose = 0; continue; }
+    c->misaligned += addr % DCC_COL_BYTES != 0;
+    uint64_t gb = addr / g_ba, off = addr % g_ba;
+    int cb = (o == EO_LD || o == EO_C) ? (int)(gb / (uint64_t)nb) : (int)gb;
+    ec_slot(o, cb, off / g_row, (int)((off % g_row) / DCC_COL_BYTES))->emi++;
+    c->emi[o]++;
+  }
+  fclose(f);
+}
+
+/* Each slot must carry what its accesses imply. A fold adds compute at the last MAC's
+ * column, so compute is a floor per slot and exact in total with the folds. Any mismatch
+ * fails coverage. */
+static void ec_verdict(ec_tally_t *c) {
+  uint64_t shown = 0;
   for (size_t i = 0; i < g_em_cap; i++) {
     const ec_ent_t *e = &g_em[i];
     if (!e->key) continue;
     int o = (int)(e->key >> 40);
-    exp[o] += e->exp;
+    c->exp[o] += e->exp;
     int ok = o == EO_C ? e->emi >= e->exp : e->emi == e->exp;
-    if (!ok && ++bad && shown++ < 8)
+    if (!ok && ++c->bad && shown++ < 8)
       fprintf(stderr, "[pim-runtime] emit coverage: %s at bank/channel %d row %d col %d, %lld "
                       "implied by the accesses, %lld in the trace\n", EO_NAME[o],
               (int)((e->key >> 20) & 1023), (int)((e->key >> 5) & 16383), (int)(e->key & 31),
               (long long)e->exp, (long long)e->emi);
   }
-  if (emi[EO_C] != exp[EO_C] + fold) {
-    bad++;
+  if (c->emi[EO_C] != c->exp[EO_C] + c->fold) {
+    c->bad++;
     fprintf(stderr, "[pim-runtime] emit coverage: %lld compute lines, the accesses imply %lld "
-                    "and the folds %lld\n", (long long)emi[EO_C], (long long)exp[EO_C],
-            (long long)fold);
+                    "and the folds %lld\n", (long long)c->emi[EO_C], (long long)c->exp[EO_C],
+            (long long)c->fold);
   }
-  if (emi[EO_RESET] != exp[EO_RESET]) {
-    bad++;
+  if (c->emi[EO_RESET] != c->exp[EO_RESET]) {
+    c->bad++;
     fprintf(stderr, "[pim-runtime] emit coverage: %lld resets, the accesses imply %lld\n",
-            (long long)emi[EO_RESET], (long long)exp[EO_RESET]);
+            (long long)c->emi[EO_RESET], (long long)c->exp[EO_RESET]);
   }
-  bad += unknown + misaligned;
+  c->bad += c->unknown + c->misaligned;
   fprintf(stderr, "[pim-runtime] emit coverage: %llu trace lines against %zu accesses, %llu "
-                  "mismatches%s\n", (unsigned long long)lines, g_ec_n, (unsigned long long)bad,
-          bad ? "  NOT COVERED" : "");
-  if (bad) g_cov_failures += 1;
+                  "mismatches%s\n", (unsigned long long)c->lines, g_ec_n,
+          (unsigned long long)c->bad, c->bad ? "  NOT COVERED" : "");
+  if (c->bad) g_cov_failures += 1;
+}
+
+/* <trace>.emitcheck.json, which dcc_convention.attest reads. Every field stays, since the
+ * gate shows them when the check fails. */
+static void ec_write_sidecar(const ec_tally_t *c) {
   char side[sizeof g_trace_path + 32];
   snprintf(side, sizeof side, "%s.emitcheck.json", g_trace_path);
   FILE *js = fopen(side, "w");
-  if (js) {
-    fprintf(js, "{\"lines\": %llu, \"accesses\": %zu, \"mismatches\": %llu, \"unknown_ops\": %llu, "
-                "\"misaligned\": %llu, \"overflow\": %llu, \"folds\": %lld, \"implied\": {",
-            (unsigned long long)lines, g_ec_n, (unsigned long long)bad,
-            (unsigned long long)unknown, (unsigned long long)misaligned,
-            (unsigned long long)g_ec_overflow, (long long)fold);
-    for (int o = 1; o < EO_N; o++)
-      fprintf(js, "%s\"%s\": %lld", o > 1 ? ", " : "", EO_NAME[o], (long long)exp[o]);
-    fprintf(js, "}, \"emitted\": {");
-    for (int o = 1; o < EO_N; o++)
-      fprintf(js, "%s\"%s\": %lld", o > 1 ? ", " : "", EO_NAME[o], (long long)emi[o]);
-    fprintf(js, "}}\n");
-    fclose(js);
-  } else {
+  if (!js) {
     fprintf(stderr, "[pim-runtime] emit coverage: cannot write %s\n", side);
     g_cov_failures += 1;
+    return;
   }
+  fprintf(js, "{\"lines\": %llu, \"accesses\": %zu, \"mismatches\": %llu, \"unknown_ops\": %llu, "
+              "\"misaligned\": %llu, \"overflow\": %llu, \"folds\": %lld, \"implied\": {",
+          (unsigned long long)c->lines, g_ec_n, (unsigned long long)c->bad,
+          (unsigned long long)c->unknown, (unsigned long long)c->misaligned,
+          (unsigned long long)g_ec_overflow, (long long)c->fold);
+  for (int o = 1; o < EO_N; o++)
+    fprintf(js, "%s\"%s\": %lld", o > 1 ? ", " : "", EO_NAME[o], (long long)c->exp[o]);
+  fprintf(js, "}, \"emitted\": {");
+  for (int o = 1; o < EO_N; o++)
+    fprintf(js, "%s\"%s\": %lld", o > 1 ? ", " : "", EO_NAME[o], (long long)c->emi[o]);
+  fprintf(js, "}}\n");
+  fclose(js);
+}
+
+static void emit_check(void) {
+  ec_tally_t c = {.bad = g_ec_overflow};
+  ec_expect(&c);
+  ec_read_trace(&c);
+  ec_verdict(&c);
+  ec_write_sidecar(&c);
   free(g_em);
   g_em = NULL;
   g_em_cap = g_em_n = 0;
@@ -1986,15 +2017,99 @@ static void layout_sidecar(void) {
  *  Public API
  * ================================================================ */
 
+/* Clears every per-run global, the one place that does, so each replay starts clean.
+ * The host inputs at the top of the file are not cleared. pim_finalize only releases what
+ * it has written and keeps the counters the harness reads after it. */
+static void reset_run_state(void) {
+  destroy_dedup_state();
+  cov_reset();
+  ec_reset();
+  free_records();
+  for (int i = 0; i < MAX_TENSORS; i++) { free(g_dcc_written[i]); g_dcc_written[i] = NULL; }
+  num_tensors = 0;
+  cur_phase = PIM_PHASE_IDLE;
+  finalized = 0;
+  g_interleaved_next_linear = 0;
+  g_pack_col_top = -1;
+  g_pack_overflow = 0;
+  g_emit_drops = 0;
+  g_dcc_native = 0;
+  g_dcc_grf_decided = 0;
+  memset(g_dcc_grf_operand, 0, sizeof g_dcc_grf_operand);
+  g_grf_b_overflow = 0;
+  g_maddr = -1;
+  memset(g_ms_disp, 0, sizeof g_ms_disp);
+  g_last_mac = 0;
+  g_last_mac_tid = -1;
+  g_fold_tid = -1;
+  g_cur_op = 0;
+  g_ord_lane = -1; g_ord_disp = UINT64_MAX; g_access_ord = 0;
+  g_rnd_lane = -1; g_rnd_disp = UINT64_MAX; g_rnd = 0; g_rnd_closed = 0;
+  g_open_lane = -1; g_open_valid = 0; g_open_closed = 0;
+  stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored = 0;
+  stat_lane_placed = stat_load_coalesced = stat_coalesce_overflow = stat_lockstep_skips = 0;
+  stat_grf_a_loads = stat_grf_a_refetch = 0;
+  stat_dcc_staged = stat_dcc_free_acc_ops = stat_fold_cmds = 0;
+  stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_tile_issued = 0;
+  stat_addr_order_mismatch = stat_addr_unmapped = stat_addr_mapped = 0;
+  stat_ret_refused = stat_acc_unstated = 0;
+}
+
+/* PIM_DCC_NATIVE, 0 when unset. FAN, ACC and WAVE come together, ADDR needs TILE, SWAP
+ * needs ADDR, and MADDR takes neither. */
+static int parse_native_mask(void) {
+  const char *nat = getenv("PIM_DCC_NATIVE");
+  int mask = nat && *nat ? atoi(nat) : 0;
+  int base = NAT_FAN | NAT_ACC | NAT_WAVE;
+  if ((mask & ~NAT_ALL) || (mask && (mask & base) != base) ||
+      ((mask & NAT_ADDR) && !(mask & NAT_TILE)) || ((mask & NAT_SWAP) && !(mask & NAT_ADDR)) ||
+      ((mask & NAT_MADDR) && (mask & (NAT_ADDR | NAT_TILE)))) {
+    fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
+                    "trace format\n", nat);
+    exit(1);
+  }
+  if (mask && !__pim_dcc_decided) {
+    fprintf(stderr, "[pim-runtime] ERROR: the ACC bit needs the compiler's accumulator "
+                    "convention (im_dcc_acc_grf)\n");
+    exit(1);
+  }
+  if (mask)
+    fprintf(stderr, "[pim-runtime] dcc native mask=%d, %d accumulator conventions from the "
+                    "compiler\n", mask, (int)__pim_dcc_acc_count);
+  return mask;
+}
+
+/* The kernel's half of the runtime contract, refused before any placement when it does not
+ * fit this machine. The compiler emits the placement stamp, the bus width and the lane count
+ * only with a layout table, so a kernel past the first test states all three. The bus width
+ * is baked into every vector width the compiler picked, so it must equal ours. Lane b runs
+ * in bank b of its group, so the lanes may not outnumber a group's banks. */
+static void check_contract(void) {
+  if (__pim_placement_align != 3) {
+    fprintf(stderr, "[pim-runtime] ERROR: the kernel states placement align=%d, and this "
+                    "runtime places row-pack (3) only\n", (int)__pim_placement_align);
+    exit(1);
+  }
+  if (__pim_dq_bits != cfg_dq_bits) {
+    fprintf(stderr, "[pim-runtime] ERROR: bus-width disagreement. The compiler chose vector "
+                    "widths for a %d-bit bus, and this run models a %d-bit one.\n",
+            (int)__pim_dq_bits, cfg_dq_bits);
+    exit(1);
+  }
+  if ((int)__pim_lanes > banks_per_channel()) {
+    fprintf(stderr, "[pim-runtime] ERROR: kernel compiled for %d lanes, a group has %d "
+                    "banks\n", (int)__pim_lanes, banks_per_channel());
+    exit(1);
+  }
+}
+
 void pim_init(const char *trace_file) {
   /* If already initialized, close the existing trace and reinitialize. */
   if (trace_fp) {
     fclose(trace_fp);
     trace_fp = NULL;
   }
-  destroy_dedup_state();
-  cov_reset();
-  ec_reset();
+  reset_run_state();
 
   if (!trace_file)
     trace_file = "pim_trace.txt";
@@ -2006,89 +2121,18 @@ void pim_init(const char *trace_file) {
     exit(1);
   }
 
-  check_compiler_dq_bits();
-
-  /* Row-pack is this runtime's only placement, so a kernel stamped for another, or for
-   * none, is refused rather than priced on it. */
-  if (__pim_placement_align != 3) {
-    fprintf(stderr, "[pim-runtime] ERROR: the kernel states placement align=%d, and this "
-                    "runtime places row-pack (3) only\n", (int)__pim_placement_align);
-    exit(1);
-  }
-  g_interleaved_next_linear = 0;
-  g_pack_col_top = -1;
-  g_pack_overflow = 0;
-  g_emit_drops = 0;
-  stat_lane_placed = 0;
-
-  num_tensors = 0;
-  g_dcc_grf_decided = 0;
-  memset(g_dcc_grf_operand, 0, sizeof(g_dcc_grf_operand));
-  g_grf_b_overflow = 0;
-  stat_grf_a_loads = stat_grf_a_refetch = 0;
-  if (g_dcc_grf_staged) { addr_dedup_destroy(g_dcc_grf_staged); g_dcc_grf_staged = NULL; }
-  cur_phase = PIM_PHASE_IDLE;
-  stat_bank_reads = stat_bank_writes = stat_reads = stat_writes = stat_ignored =
-      0;
-  advance_program_epoch_if_needed();
+  check_contract();
+  refresh_dispatch_id();
 
   fprintf(stderr, "[pim-runtime] DCC-PARITY tracer: group-level commands span the "
                   "CHANNEL.\n");
   fprintf(stderr, "[pim-runtime] emitting DCC's opcodes at DCC's addresses; run this "
                   "trace through THEIR Ramulator, not ours.\n");
-  g_dcc_native = 0;
-  stat_native_off_bank0 = g_dcc_waves = stat_tile_absorbed = stat_addr_order_mismatch = 0;
-  stat_tile_issued = 0;
-  stat_addr_unmapped = stat_addr_mapped = stat_ret_refused = 0;
-  stat_acc_unstated = 0;
-  g_maddr = -1;
-  g_last_mac_tid = -1;
-  memset(g_ms_disp, 0, sizeof g_ms_disp);
-  {
-    const char *nat = getenv("PIM_DCC_NATIVE");
-    if (nat && *nat) {
-      g_dcc_native = atoi(nat);
-      int base = NAT_FAN | NAT_ACC | NAT_WAVE;
-      if ((g_dcc_native & ~NAT_ALL) || (g_dcc_native && (g_dcc_native & base) != base) ||
-          ((g_dcc_native & NAT_ADDR) && !(g_dcc_native & NAT_TILE)) ||
-          ((g_dcc_native & NAT_SWAP) && !(g_dcc_native & NAT_ADDR)) ||
-          ((g_dcc_native & NAT_MADDR) && (g_dcc_native & (NAT_ADDR | NAT_TILE)))) {
-        fprintf(stderr, "[pim-runtime] ERROR: PIM_DCC_NATIVE=%s is not a valid mask for this "
-                        "trace format\n", nat);
-        exit(1);
-      }
-    }
-    if (g_dcc_native && !__pim_dcc_decided) {
-      fprintf(stderr, "[pim-runtime] ERROR: the ACC bit needs the compiler's accumulator "
-                      "convention (im_dcc_acc_grf)\n");
-      exit(1);
-    }
-    if (g_dcc_native)
-      fprintf(stderr, "[pim-runtime] dcc native mask=%d, %d accumulator conventions from the "
-                      "compiler\n", g_dcc_native, (int)__pim_dcc_acc_count);
-  }
-
-  if (__pim_lanes > 0 && (int)__pim_lanes > banks_per_channel()) {
-    fprintf(stderr, "[pim-runtime] ERROR: kernel compiled for %d lanes, a group has %d "
-                    "banks\n", (int)__pim_lanes, banks_per_channel());
-    exit(1);
-  }
-  stat_lockstep_skips = 0;
-  stat_fold_cmds = 0;
-  g_last_mac = 0;
-  g_cur_op = 0;
-  if (g_dcc_staged) { addr_dedup_destroy(g_dcc_staged); g_dcc_staged = NULL; }
-  if (g_rrelu_seen) { addr_dedup_destroy(g_rrelu_seen); g_rrelu_seen = NULL; }
-  stat_dcc_staged = stat_dcc_free_acc_ops = 0;
-  for (int i = 0; i < MAX_TENSORS; i++) { free(g_dcc_written[i]); g_dcc_written[i] = NULL; }
-  stat_coalesce_overflow = 0;
+  g_dcc_native = parse_native_mask();
 
   /* 136 entries per bank is only the starting size. The table grows on demand, so it
    * bounds nothing. */
-  g_lockstep_collapse =
-      addr_dedup_create(active_banks() * 136);
-
-  finalized = 0;
+  g_lockstep_collapse = addr_dedup_create(active_banks() * 136);
 
   fprintf(stderr, "[pim-runtime] Initialized. Trace: %s\n", trace_file);
   fprintf(stderr,
@@ -2101,23 +2145,12 @@ void pim_init(const char *trace_file) {
 /* ================================================================
  *  Compiler-emitted residency descriptor
  * ================================================================
- * emitPimLayoutTable (TritonIMToLLVM.cpp) puts these globals in the KERNEL object, and
+ * emitPimLayoutTable (IMArtifact.cpp) puts these globals in the KERNEL object, and
  * kernel and runtime link into one dylib. The record layout is in pim_layout_table.h.
  * operand_arg == tensor id, because pointer args are registered first and in signature
  * order. Only bank_replicated and is_store are read, the footprint words are skipped. */
 
 static int stat_layout_from_compiler = 0;
-
-/* The compiler bakes a bus width into every vector width it picks. Ours must match,
- * or the artifact was tuned for a machine this run is not modelling. */
-static void check_compiler_dq_bits(void) {
-  if (__pim_dq_bits && __pim_dq_bits != cfg_dq_bits)
-    fprintf(stderr,
-            "[pim-runtime] WARN: bus-width disagreement. The compiler chose vector widths for "
-            "a %d-bit bus; this run models %d-bit. Vector accesses are priced against "
-            "a width the artifact never assumed.\n",
-            (int)__pim_dq_bits, cfg_dq_bits);
-}
 
 /* Refuse a descriptor whose record width is not the one we stride by. The compiler's
  * kRecWords and this runtime's PIM_LAYOUT_REC_WORDS are in separate submodules, so a
@@ -2184,21 +2217,15 @@ static void apply_dcc_return_from(int tensor_id) {
     if (__pim_dcc_return_from[2 * i] == tensor_id) t->ret_src = __pim_dcc_return_from[2 * i + 1];
 }
 
+/* Places one tensor and takes its role as the compiler's record says. check_contract has
+ * refused every kernel without a layout table, so a tensor without a record is the only
+ * gap left. */
 static void apply_compiler_layout(int tensor_id) {
   apply_dcc_tile_mac(tensor_id);
   apply_dcc_acc(tensor_id);
   apply_dcc_return_from(tensor_id);
   check_layout_rec_words();
   int n = (int)__pim_layout_count;
-  if (n <= 0) {
-    /* The tensor stays on the interleaved map, but a placement made by default rather
-     * than by the compiler must still be audible. */
-    static int warned = 0;
-    if (!warned++)
-      fprintf(stderr, "[pim-runtime] WARN kernel carries no layout table; every tensor "
-                      "stays on the interleaved map and the host roles stand.\n");
-    return;
-  }
   const int32_t *table = __pim_layout_table;
   for (int i = 0; i < n; i++) {
     const int32_t *rec = table + (size_t)i * PIM_LAYOUT_REC_WORDS;
@@ -2210,29 +2237,15 @@ static void apply_compiler_layout(int tensor_id) {
           "[pim-runtime] compiler-emitted layout table found in the kernel "
           "artifact (%d entries)\n",
           n);
-    /* COMPILER-DERIVED ROLE. Whether a tensor is replicated across banks
-     * is a property of the LAYOUT, so the pass reads it off the encoding and we
-     * honor it over the role the host asserted at registration. The host string
-     * was written for one particular layout, so any layout change silently
-     * inverted the charge: a transposed matmul accumulator measured 31x too fast
-     * because both operands ended up in the free role (2026-09-06). The
-     * accumulator is exempt -- a store's role is decided by what it is, not by
-     * how it is spread. */
     tensor_info_t *_t = &tensors[tensor_id];
-    /* Index through PIM_LW_*, never a literal: these shifted when the record lost
-     * its reduction_col_axis word on 2026-09-10 and a raw rec[3] silently read
-     * num_axes instead, turning every operand into a streamed tensor and dropping
-     * the entire W charge (matmul 64x64x32 went 32,786 -> 246 cycles). */
     _t->bank_replicated = (int)rec[PIM_LW_BANK_REPLICATED];
     if (_t->bank_replicated >= 0) {
       /* Reserve a per-lane share of the packed column space, the same columns in every
        * bank. Partitioned: the share is the most elements any lane touched in the sizing
        * replay, or the even share until that replay has run. Replicated: every lane holds
-       * the whole tensor, so the share IS the tensor. The copy in bank b used to keep the
-       * source word's (sa,row,col) and drop its bank bits, which aliased 4-8 distinct words
-       * onto one address (matmul A: 8,192 writes, 2,048 addresses). Packing needs the
-       * extent up front, so a lane that touches more than its share is refused at
-       * placement. */
+       * the whole tensor, so the share IS the tensor. Packing needs the extent up front, so
+       * a lane that touches more than its share is counted at placement and fails
+       * coverage. */
       int all_banks = active_banks();
       int vpr = _t->values_per_row;
       int vpc = _t->values_per_col;
@@ -2267,8 +2280,6 @@ static void apply_compiler_layout(int tensor_id) {
           if (extra > 0) g_pack_col_top -= extra;
         }
       }
-      _t->lane_row_base = (int)(g_pack_col_top / cpr);
-      _t->lane_row_count = (int)((g_pack_col_top + cols + cpr - 1) / cpr) - _t->lane_row_base;
       _t->lane_slot = slot_map_create((size_t)share / 2 + 1);
       if (!_t->lane_slot) {
         fprintf(stderr, "[pim-runtime] ERROR tensor %d: slot map allocation failed\n",
@@ -2276,18 +2287,17 @@ static void apply_compiler_layout(int tensor_id) {
         exit(1);
       }
     }
-    /* THE ROLE IS THE COMPILER'S. is_store marks the output (sticky in the emitter, so a
-     * tensor both loaded and stored is the output), bank_replicated says whether every
-     * bank sees the same elements. The host string used to be the role and a layout
-     * change silently inverted the charge (31x on a transposed accumulator); now it is
-     * an input to check, and a disagreement prints a WARN instead of costing a day. */
+    /* The compiler's role overrides the host's. is_store makes the output (sticky in the
+     * emitter, so a tensor both loaded and stored is the output), bank_replicated > 0 an
+     * operand and 0 a streamed input. The host role then goes unused, so a disagreement is
+     * no WARN. */
     if (rec[PIM_LW_IS_STORE] == 1 || rec[PIM_LW_BANK_REPLICATED] >= 0) {
       int derived = rec[PIM_LW_IS_STORE] == 1 ? PIM_ROLE_ACCUMULATOR
                     : rec[PIM_LW_BANK_REPLICATED] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
       if (derived != _t->role) {
         static const char *names[] = {"STREAMED", "OPERAND", "ACCUMULATOR"};
-        fprintf(stderr, "[pim-runtime] WARN tensor %d: host role %s, compiler layout says "
-                        "%s; taking the compiler's.\n", tensor_id,
+        fprintf(stderr, "[pim-runtime] tensor %d: host role %s, the compiler's record makes "
+                        "it %s\n", tensor_id,
                 (_t->role >= 0 && _t->role < 3) ? names[_t->role] : "?",
                 names[derived]);
         _t->role = derived;
@@ -2304,13 +2314,6 @@ static void apply_compiler_layout(int tensor_id) {
   if (tensors[tensor_id].role != PIM_ROLE_OPERAND)
     fprintf(stderr, "[pim-runtime] WARN tensor %d: no layout record; placement stays "
                     "on the interleaved map.\n", tensor_id);
-}
-
-/* Assign the id, then apply the compiler's descriptor to it. */
-static int pim_finish_register(void) {
-  int tid = num_tensors++;
-  apply_compiler_layout(tid);
-  return tid;
 }
 
 int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
@@ -2338,8 +2341,6 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
   t->elem_size = elem_size;
   t->role = role;
   t->bank_replicated = -1;
-  t->lane_row_base = -1;
-  t->lane_row_count = 0;
   t->pack_base_col = -1;
   t->pack_cols = 0;
   memset(t->lane_ord, 0, sizeof(t->lane_ord));
@@ -2402,7 +2403,9 @@ int pim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size,
           (unsigned long long)t->layout_linear_base,
           (unsigned long long)((total + elems_per_global_row - 1) /
                                elems_per_global_row));
-  return pim_finish_register();
+  int tid = num_tensors++;
+  apply_compiler_layout(tid);
+  return tid;
 }
 
 void pim_set_phase(pim_phase_t phase) {
@@ -2430,23 +2433,14 @@ void pim_finalize(void) {
     }
     g_sizing = 0;
     g_sized = 1;
-    cov_reset();
-    ec_reset();
-    free(stage_buf); stage_buf = NULL; stage_len = stage_cap = 0;
-    free(g_recs); g_recs = NULL; g_rec_n = g_rec_cap = 0;
     if (trace_fp) { fclose(trace_fp); trace_fp = NULL; }
     destroy_dedup_state();
     return;
   }
 
-  /* The check is lazy, on the first compute-phase load of a non-accumulator tensor. A
-   * kernel with no such load would otherwise never be judged, so a run can never end
-   * with the bound unexamined. */
-  if (!g_dcc_grf_decided) {
-    g_dcc_grf_decided = 1;
-    dcc_pick_grf_operand();
-    grf_b_check();
-  }
+  /* A kernel with no load of an input never reached the election, and the bound is
+   * judged here so that no run ends with it unexamined. */
+  dcc_decide_grf_once();
   cov_report();
   dp_flush();
 
@@ -2485,17 +2479,17 @@ void pim_finalize(void) {
   fprintf(stderr, "[pim-runtime]   Lane-placed accesses            : %" PRIu64 "\n",
           stat_lane_placed);
   /* Slab occupancy per lane: how many values each lane placed in its own bank. Uneven
-   * rows are masked or straddling lanes, not a bug; a zero row for an active lane is. */
+   * counts are masked or straddling lanes, not a bug. A zero count for an active lane is. */
   for (int i = 0; i < num_tensors; i++) {
     tensor_info_t *t = &tensors[i];
-    if (t->bank_replicated < 0 || t->lane_row_base < 0)
+    if (!has_slab(t))
       continue;
     int all_banks = g_groups * banks_per_channel();
     fprintf(stderr, "[pim-runtime]   tensor %d slab slots per lane:", i);
     for (int l = 0; l < all_banks; l++)
       fprintf(stderr, " %d", t->lane_ord[l]);
-    fprintf(stderr, "  (rows %d..%d)\n", t->lane_row_base,
-            t->lane_row_base + t->lane_row_count - 1);
+    fprintf(stderr, "  (columns %ld..%ld)\n", t->pack_base_col,
+            t->pack_base_col + t->pack_cols - 1);
   }
   {
     uint64_t sat = addr_dedup_saturations(g_lockstep_collapse);
@@ -2520,102 +2514,93 @@ void pim_finalize(void) {
  *  LLVM pass hooks
  * ================================================================ */
 
-/*
- * Translate a single memory access into PIM trace operations.
- *
- * COMPUTE phase (PIM PE active):
- *   STREAMED load   -> BR (bank-read: data streams through PE)
- *   OPERAND load    -> W  (write: data to PE register via bus)
- *   ACCUMULATOR load  -> R  (read: partial sum from PE)
- *   ACCUMULATOR store -> BW (bank-write: result to bank)
- *
- * IDLE phase: no trace emission.
- */
-/* Process a single logical element access against an already-resolved tensor. */
-static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
-                                 int is_write) {
-  pim_phys_loc_t loc;
-  if (!resolve_access_location(t, addr, &loc)) {
-    return;
-  }
+/* GRF-SIDE OPERAND. A per-bank event decided by that bank's GRF_A, so it stays out of the
+ * group-level collapse, which would fold a later re-read of the same column into the first
+ * as if it were a lane replica. It issues no MAC either, since DCC's x read is the
+ * PIM_LD_OP1. */
+static void dcc_trace_grf_operand(const tensor_info_t *t, const pim_phys_loc_t *loc) {
+  ec_note(t, loc, 0);
+  uint64_t lrow = (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row;
+  /* Keyed WITHOUT the dispatch: has this value ever been put in this bank. */
+  if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
+  int first_stage = addr_dedup_check_and_mark(
+      g_dcc_grf_staged, perbank_ns(t, loc->ch, loc->pch, loc->bg, loc->bank, 0), lrow,
+      (uint64_t)loc->col);
+  if (first_stage)
+    stat_grf_a_loads++;
+  else
+    stat_grf_a_refetch++;
+  uint64_t at = dcc_loc_addr(loc), ld = at;
+  if (g_dcc_native & NAT_SWAP) dcc_swap_vec(t, loc, &at, &ld);
+  grf_record(at, ld, first_stage);
+  /* Counted as W: an operand delivered into a bank's register file, the same ST +
+   * PIM_LD_OP1 pair dcc_emit_operand_load emits. */
+  stat_writes++;
+}
 
-  /* Lockstep dedup: collapse bank-replicated events at the same
-   * (tensor_id, sa, row, col, access ordinal) within a program-id, one SIMD dispatch per
-   * logical instruction. STREAMED bank-local reads collapse.
-   * Every operand load bypasses the collapse and pays one write per receiving bank, as
-   * DCC issues one PIM_LD_OP1 per bank. Real HBM-PIM also has an all-bank GRF broadcast
-   * (Lee et al. ISCA'21 III-A/III-B), which DCC does not use. */
+/* One resolved element access: the GRF operand's own path, or the lockstep collapse and
+ * then emit_access. */
+static void pim_trace_access_one(tensor_info_t *t, const pim_phys_loc_t *loc, int is_write) {
   int is_operand_load = (!is_write && t->role == PIM_ROLE_OPERAND);
   int is_acc_store = (is_write && t->role == PIM_ROLE_ACCUMULATOR);
-  /* GRF-SIDE OPERAND. A per-bank event decided by that bank's GRF_A, so
-   * it must not enter the group-level collapse below: the collapse folds a later re-read
-   * of the same column into the first as if it were a lane replica, which granted
-   * residency upstream of any bound (K=256 loaded each column once where a bounded
-   * GRF_A reloads per block). It also emitted a group-level MAC_OP1 for the read, which
-   * DCC does not: their x read IS the LD_OP1. */
   if (!is_write && t->role != PIM_ROLE_ACCUMULATOR) {
-    if (!g_dcc_grf_decided) {
-      g_dcc_grf_decided = 1;
-      dcc_pick_grf_operand();
-      grf_b_check();
-    }
-    int tid = (int)(t - tensors);
-    if (g_dcc_grf_operand[tid]) {
-      ec_note(t, &loc, is_write);
-      uint64_t lrow = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
-      /* Keyed WITHOUT the dispatch: has this value ever been put in this bank. */
-      if (!g_dcc_grf_staged) g_dcc_grf_staged = addr_dedup_create(4096);
-      int first_stage = addr_dedup_check_and_mark(
-          g_dcc_grf_staged, perbank_ns(t, loc.ch, loc.pch, loc.bg, loc.bank, 0),
-          lrow, (uint64_t)loc.col);
-      if (first_stage)
-        stat_grf_a_loads++;
-      else
-        stat_grf_a_refetch++;
-      uint64_t at = dcc_addr(loc.ch, loc.pch, loc.bg, loc.bank, loc.sa, loc.row, loc.col);
-      uint64_t ld = at;
-      if (g_dcc_native & NAT_SWAP) dcc_swap_vec(t, &loc, &at, &ld);
-      grf_record(at, ld, first_stage);
-      /* Counted as W: an operand delivered into a bank's register file, the same ST +
-       * PIM_LD_OP1 pair the W branch emits. */
-      stat_writes++;
+    dcc_decide_grf_once();
+    if (g_dcc_grf_operand[(int)(t - tensors)]) {
+      dcc_trace_grf_operand(t, loc);
       return;
     }
   }
-  ec_note(t, &loc, is_write);
+  ec_note(t, loc, is_write);
   /* Before the collapse, which folds a store's bank replicas, so every written element is
    * recorded. */
-  if (is_acc_store) dcc_mark_written(t, loc.elem_idx);
+  if (is_acc_store) dcc_mark_written(t, loc->elem_idx);
+  /* Lockstep collapse: the bank replicas of one access, alike in namespace, dispatch,
+   * access ordinal, row and col, fold into one SIMD command. Every operand load bypasses
+   * it and pays one write per receiving bank, as DCC issues one PIM_LD_OP1 per bank. Real
+   * HBM-PIM also has an all-bank GRF broadcast (Lee et al. ISCA'21 III-A/III-B), which DCC
+   * does not use. */
   if (g_lockstep_collapse && !is_operand_load) {
     /* Compute and streamed reads are group-level and span the CHANNEL (DCC's group).
-     * The accumulator is bank-level in DCC's model, so it keeps the bank in its key --
+     * The accumulator is bank-level in DCC's model, so it keeps the bank in its key,
      * still packed by column, just not folded across banks. */
     uint64_t tensor_key =
-        is_acc_store ? perbank_ns(t, loc.ch, loc.pch, loc.bg, loc.bank, is_write)
-                     : channel_ns(t, loc.ch, is_write);
+        is_acc_store ? perbank_ns(t, loc->ch, loc->pch, loc->bg, loc->bank, is_write)
+                     : channel_ns(t, loc->ch, is_write);
     /* Keyed on the lane's access ordinal too, so only the bank replicas of one
      * instruction fold and a lane re-reading its own column pays. The fields exceed
      * the packed key, so it is a 64-bit hash split back into k1/k2/k3. */
-    uint64_t key_row = (uint64_t)loc.sa * (uint64_t)cfg_num_rows + (uint64_t)loc.row;
+    uint64_t key_row = (uint64_t)loc->sa * (uint64_t)cfg_num_rows + (uint64_t)loc->row;
     uint64_t h = lockstep_key(tensor_key, cur_dispatch, g_access_ord, key_row,
-                              (uint64_t)loc.col);
+                              (uint64_t)loc->col);
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, h, h >> 16, h >> 48)) {
       stat_lockstep_skips++;
       return;
     }
   }
-
-  emit_access_by_role_phase(t, &loc, is_write);
+  emit_access(t, loc, is_write);
 }
 
 /* Cap on distinct DRAM columns one instrumented access can coalesce over. */
 #define PIM_COALESCE_MAX 64
 
-/* Process a vector or scalar access spanning [base_addr, base_addr+size).
- * MemTracePass calls this once per IR-level load/store; we expand to one
- * pim_trace_access_one per logical element so multi-bank/multi-row vector
- * loads are correctly accounted for, and the dedup primitive then collapses
- * intra-tile spatial redundancy. */
+/* 1 when this call already issued the DRAM column loc lands on, counted as coalesced. */
+static int word_seen(const pim_phys_loc_t *loc, uint64_t *seen, int *n_seen) {
+  uint64_t key = word_key(loc);
+  for (int j = 0; j < *n_seen; j++)
+    if (seen[j] == key) {
+      stat_load_coalesced++;
+      return 1;
+    }
+  if (*n_seen < PIM_COALESCE_MAX)
+    seen[(*n_seen)++] = key;
+  else
+    stat_coalesce_overflow++;
+  return 0;
+}
+
+/* One vector or scalar access spanning [base_addr, base_addr+size), as MemTracePass calls
+ * it once per IR-level load or store. Each element is resolved once and traced, so a
+ * vector that crosses banks or rows is charged for each. */
 static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
                                    int is_write, uint64_t compiler_lanes) {
   if (cur_phase == PIM_PHASE_IDLE) {
@@ -2630,17 +2615,16 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   }
   tensor_info_t *t = &tensors[tidx];
   if (g_sizing) {
-    int es = t->elem_size > 0 ? t->elem_size : 1;
-    for (uint64_t i = 0; i < (size ? size / (uint64_t)es : 1); i++) {
-      uint64_t ea = base_addr + i * (uint64_t)es;
-      int k = find_tensor(ea);
+    /* Placement alone, which counts each lane's slots for the next run's shares. */
+    uint64_t es = (uint64_t)(t->elem_size > 0 ? t->elem_size : 1);
+    for (uint64_t i = 0; i < (size ? size / es : 1); i++) {
       pim_phys_loc_t loc;
-      if (k >= 0) resolve_access_location(&tensors[k], ea, &loc);
+      resolve_elem(&t, base_addr + i * es, &loc);
     }
     return;
   }
 
-  advance_program_epoch_if_needed();
+  refresh_dispatch_id();
   access_ord_next();
 
   int elem_size = t->elem_size > 0 ? t->elem_size : 1;
@@ -2670,86 +2654,26 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
   cov_mark(tidx, t, base_addr, n_elements, is_write);
 
   /* WITHIN-CALL DQ-WORD COALESCING for loads. One __mem_trace_load call is ONE
-   * machine instruction. A vector load of 8 fp16 values is one 128-bit bus
-   * transaction, not eight, so it must cost one command per distinct DRAM column it
-   * touches.
+   * machine instruction, and a vector load is one bus transaction per DRAM column it
+   * touches, so it costs one command per distinct column.
    *
    * LOADS ONLY. The lanes of one store call share an access ordinal, so the collapse
    * already folds every same-column store lane. An OPERAND load bypasses the collapse,
    * which is what leaves this copy load-bearing.
    *
-   * STRICTLY within the call, and that is the whole point. Two SEPARATE scalar loads
-   * of the same word, issued far apart, still pay twice, because by then the word is
-   * gone. That is the k-outer penalty and it is real physics: the k-outer matmul
-   * measures 0 memo fires against the k-packed kernel's 7/8, an 8x difference that
-   * the compiler earns by consuming word-mates together. Grouping across calls would
-   * hand k-outer a discount it never earned.
-   *
-   * Inert for scalar loads: n_elements == 1 takes the fast path below untouched, so
-   * this changes nothing until a kernel actually emits vector loads. */
-  if (!is_write && n_elements > 1) {
-    uint64_t seen[PIM_COALESCE_MAX];
-    int n_seen = 0;
-    for (uint64_t i = 0; i < n_elements; i++) {
-      uint64_t elem_addr = base_addr + i * (uint64_t)elem_size;
-      if (elem_addr >= (uint64_t)t->base_addr + t->total_bytes) {
-        int ntidx = find_tensor(elem_addr);
-        if (ntidx < 0) {
-          note_ignored();
-          continue;
-        }
-        t = &tensors[ntidx];
-      }
-      int elem_idx =
-          (int)((elem_addr - (uint64_t)t->base_addr) / t->elem_size);
-      if (elem_idx < 0 || elem_idx >= t->num_elements) {
-        note_ignored();
-        continue;
-      }
-      /* Key on the PLACED tuple. Keying on the interleaved home dropped every
-       * word-mate before it reached place_in_lane_slab, so a partitioned tensor's
-       * slab held one slot per word instead of one per element and came out 2-8x
-       * too few columns (matmul B read 16 BR where its 16 words per lane owe 32). */
-      pim_phys_loc_t pl;
-      pl.elem_idx = elem_idx;
-      map_element(t, elem_idx, &pl.ch, &pl.pch, &pl.bg, &pl.bank, &pl.sa, &pl.row,
-                  &pl.col);
-      if (t->bank_replicated >= 0 && t->lane_slot && t->lane_row_base >= 0)
-        place_in_lane_slab(t, &pl);
-      int gb = compute_global_bank(pl.ch, pl.pch, pl.bg, pl.bank);
-      uint64_t key = ((uint64_t)gb & 0xFFFFULL) |
-                     (((uint64_t)pl.sa & 0xFFULL) << 16) |
-                     (((uint64_t)pl.row & 0xFFFFFFULL) << 24) |
-                     (((uint64_t)pl.col & 0xFFFFULL) << 48);
-      int dup = 0;
-      for (int j = 0; j < n_seen; j++)
-        if (seen[j] == key) { dup = 1; break; }
-      if (dup) {
-        stat_load_coalesced++;
-        continue;
-      }
-      if (n_seen < PIM_COALESCE_MAX)
-        seen[n_seen++] = key;
-      else
-        stat_coalesce_overflow++;
-      pim_trace_access_one(t, elem_addr, is_write);
-    }
-    return;
-  }
-
+   * STRICTLY within the call. Two separate loads of the same word pay twice, since the
+   * word is gone by the second, and folding across calls would hand a kernel that does
+   * not consume word-mates together a discount it never earned. The key is the placed
+   * column, and every element is placed before the test, so each keeps its own slot. */
+  uint64_t seen[PIM_COALESCE_MAX];
+  int n_seen = 0, coalesce = !is_write && n_elements > 1;
   for (uint64_t i = 0; i < n_elements; i++) {
-    uint64_t elem_addr = base_addr + i * (uint64_t)elem_size;
-    /* Re-resolve tensor if the vector spans tensor boundaries. Common case
-     * (single-tensor vector) keeps the cached pointer. */
-    if (elem_addr >= (uint64_t)t->base_addr + t->total_bytes) {
-      int ntidx = find_tensor(elem_addr);
-      if (ntidx < 0) {
-        note_ignored();
-        continue;
-      }
-      t = &tensors[ntidx];
-    }
-    pim_trace_access_one(t, elem_addr, is_write);
+    pim_phys_loc_t loc;
+    if (!resolve_elem(&t, base_addr + i * (uint64_t)elem_size, &loc))
+      continue;
+    if (coalesce && word_seen(&loc, seen, &n_seen))
+      continue;
+    pim_trace_access_one(t, &loc, is_write);
   }
 }
 
@@ -2759,7 +2683,7 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
 void __pim_trace_fold(int64_t steps, int64_t outputs) {
   if (!trace_fp || g_sizing || cur_phase != PIM_PHASE_COMPUTE || steps <= 0 || outputs <= 0)
     return;
-  advance_program_epoch_if_needed();
+  refresh_dispatch_id();
   access_ord_next();
   int fch, fpch, fbg, fbank;
   decompose_global_bank(phys_lane(), &fch, &fpch, &fbg, &fbank);
@@ -2776,7 +2700,7 @@ void __pim_trace_fold(int64_t steps, int64_t outputs) {
       uint64_t at = g_last_mac;
       if (maddr_on() && g_last_mac_tid >= 0)
         at = maddr_at(&g_last_mac_loc, g_last_mac_tid, 2 * k);
-      dp_record(DP_MAC, "PIM_MAC_OP1", at);
+      dp_record(DP_MAC, "PIM_MAC_OP1", g_fold_tid, at);
       stat_fold_cmds++;
     }
 }

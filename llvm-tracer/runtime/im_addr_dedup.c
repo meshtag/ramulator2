@@ -24,8 +24,8 @@ static inline uint64_t pack_keys(uint64_t k1, uint64_t k2, uint64_t k3) {
          ((k3 & 0xFFFFULL) << 48);
 }
 
-/* SplitMix64 finalizer — strong avalanche for 64→64 bit hashing. */
-static inline uint64_t mix64(uint64_t x) {
+/* MurmurHash3's fmix64 finalizer, a 64-bit to 64-bit mix with full avalanche. */
+static inline uint64_t fmix64(uint64_t x) {
   x ^= x >> 33;
   x *= 0xFF51AFD7ED558CCDULL;
   x ^= x >> 33;
@@ -59,14 +59,8 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
 }
 
 /* Double the table, rehashing the claimed entries. Returns 0 if the allocation fails,
- * leaving the table untouched.
- *
- * WHY THIS EXISTS: the capacity used to be fixed at create() from a caller hint, and
- * a full table falls back to "treat as new". The lockstep hint was sized to the PE
- * register file, which has nothing to do with how many distinct addresses one
- * program-id touches, so on large tiles the table filled partway through and the
- * collapse silently stopped collapsing. On matmul 128x3072x768 that inflated bank
- * reads 1,769,472 -> 2,668,032 and cycles 14,545,807 -> 21,150,357 (2026-09-10). */
+ * leaving the table untouched. A full table falls back to treat-as-new, so without
+ * growth a large tile would stop the collapse partway through. */
 static int addr_dedup_grow(addr_dedup_state_t *s) {
   int newcap = s->capacity * 2;
   if (newcap <= s->capacity)
@@ -79,7 +73,7 @@ static int addr_dedup_grow(addr_dedup_state_t *s) {
     if (s->slots[i].epoch != s->cur_epoch)
       continue;
     uint64_t k = s->slots[i].key;
-    int idx = (int)(mix64(k) & (uint64_t)newmask);
+    int idx = (int)(fmix64(k) & (uint64_t)newmask);
     while (ns[idx].epoch == s->cur_epoch)
       idx = (idx + 1) & newmask;
     ns[idx].key = k;
@@ -98,7 +92,7 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
     return 1; /* no dedup state — always emit */
 
   uint64_t key = pack_keys(k1, k2, k3);
-  uint64_t h = mix64(key);
+  uint64_t h = fmix64(key);
   int idx = (int)(h & (uint64_t)s->mask);
 
   for (int probe = 0; probe < s->capacity; probe++) {
@@ -158,11 +152,6 @@ struct slot_map {
   size_t cap, n;
 };
 
-static inline uint64_t slot_hash(uint64_t k) {
-  k ^= k >> 33; k *= 0xFF51AFD7ED558CCDULL; k ^= k >> 33;
-  k *= 0xC4CEB9FE1A85EC53ULL; k ^= k >> 33; return k;
-}
-
 slot_map_t *slot_map_create(size_t hint) {
   slot_map_t *m = (slot_map_t *)calloc(1, sizeof(*m));
   if (!m) return NULL;
@@ -187,7 +176,7 @@ static int slot_map_grow(slot_map_t *m) {
   if (!nk || !nv) { free(nk); free(nv); return 0; }
   for (size_t i = 0; i < m->cap; i++) {
     if (!m->keys[i]) continue;
-    size_t j = slot_hash(m->keys[i]) & (ncap - 1);
+    size_t j = fmix64(m->keys[i]) & (ncap - 1);
     while (nk[j]) j = (j + 1) & (ncap - 1);
     nk[j] = m->keys[i]; nv[j] = m->vals[i];
   }
@@ -201,7 +190,7 @@ int32_t slot_map_get_or_put(slot_map_t *m, int lane, int elem, int32_t fresh,
   *inserted = 0;
   if (m->n * 2 >= m->cap && !slot_map_grow(m)) return -1;
   uint64_t key = (((uint64_t)(uint32_t)lane << 32) | (uint32_t)elem) + 1;
-  size_t i = slot_hash(key) & (m->cap - 1);
+  size_t i = fmix64(key) & (m->cap - 1);
   for (;;) {
     if (m->keys[i] == key) return m->vals[i] & 0x00FFFFFF; /* no flag bits in this tree */
     if (m->keys[i] == 0) { m->keys[i] = key; m->vals[i] = fresh; m->n++; *inserted = 1; return fresh; }

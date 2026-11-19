@@ -4,7 +4,7 @@
  * Provides the bank-ID and program-ID primitives that Triton's IM backend
  * emits as extern calls (__pim_get_bank_id / __pim_get_program_id).
  *
- * The trace harness (benchmarks/pass_ablation.py) iterates over banks, calling the
+ * The trace harness (benchmarks/pipeline.py) iterates over banks, calling the
  * kernel once per bank to collect per-bank memory traces.
  *
  * The "set" functions are called by the host driver; the "get" functions
@@ -33,9 +33,9 @@ void __pim_set_group_id(int32_t id);
 /* --- Program ID (which tile / block of the input this invocation covers) ---
  * Axis 0 (X) is the primary dimension; Y and Z are optional for 2D/3D grids.
  */
-/* Bumped by each __pim_set_program_id* call. A trace runtime watches this rather
- * than comparing program ids, so the per-instance reset does not depend on the
- * order the host walks the grid. */
+/* Bumped by each __pim_set_program_id* call. A trace runtime puts it in its lockstep
+ * key rather than comparing program ids, so the key does not depend on the order the
+ * host walks the grid. */
 extern uint64_t __pim_program_epoch;
 
 /* Signalled by a persistent kernel at each tile boundary; resets when the host picks
