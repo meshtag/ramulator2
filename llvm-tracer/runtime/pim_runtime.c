@@ -47,19 +47,13 @@ static void check_compiler_dq_bits(void);
  * Column packing is dq_bits / data_width. */
 static const int cfg_data_width_bits = 16;
 
-/* Where each tensor starts. DQ aligns to the data-bus word only. ROW_PACK applies to
- * lane slabs: each tensor reserves exactly its per-lane share in one shared column space,
- * so small tensors sit side by side in the same rows. */
-typedef enum { PIM_ALIGN_DQ = 1, PIM_ALIGN_ROW_PACK = 3 } pim_place_align_t;
-static pim_place_align_t cfg_place_align = PIM_ALIGN_DQ;
-
 /* Next free position in the global linear-element space. Tensors are appended and
  * aligned to a values_per_col boundary only, so they share rows on different banks. */
 static uint64_t g_interleaved_next_linear = 0;
-/* Lane slabs take rows from the TOP of the per-bank row space; interleaved placement
- * grows from the bottom, and the two must never meet. */
-static int g_lane_row_top = -1;
-static long g_pack_col_top = -1;   /* row-pack: next free column, counted down */
+/* Lane slabs are row-packed: each tensor reserves exactly its per-lane share in one
+ * shared column space, so small tensors sit side by side in the same rows. The space is
+ * claimed from the TOP of each bank, and interleaved placement grows from the bottom. */
+static long g_pack_col_top = -1;   /* next free column, counted down */
 static uint64_t g_pack_overflow = 0; /* accesses beyond a lane's share, reported as uncovered */
 static uint64_t g_emit_drops = 0;    /* compute accesses that reached no record */
 static uint64_t stat_lane_placed = 0;
@@ -129,27 +123,17 @@ typedef struct {
 
   /* Offset into the global bit-interleaved element space, see map_element. */
   uint64_t layout_linear_base;
-  /* Compiler's partition bit: 1 replicated, 0 bank-partitioned, -1 not stated. Only 0
-   * changes anything: that tensor's accesses go to the executing lane's own bank at a
-   * per-lane slab address instead of the element's interleaved home, see
-   * place_in_lane_slab. The lockstep key drops bank, so counts do not move; addresses do. */
+  /* The record's receive count (pim_layout_table.h), -1 when the compiler stated nothing.
+   * Any stated value puts the tensor's accesses in the executing lane's slab, see
+   * place_in_lane_slab, instead of the element's interleaved home. */
   int bank_replicated;
   int lane_row_base;        /* first row of this tensor's per-lane slab, or -1 */
   int lane_row_count;
   int lane_ord[MAX_BANKS];  /* next free value slot per lane */
-  slot_map_t *lane_slot;    /* (lane, elem) -> slot, partitioned tensors only */
+  slot_map_t *lane_slot;    /* (lane, elem) -> slot, every tensor with a slab */
   long pack_base_col;       /* row-pack: first column of this tensor's share, or -1 */
   int pack_cols;
 
-  /* Per-tensor diagnostic counters for the end-of-run table: role-level commands
-   * produced (before buffering), accesses the collapse or the coalescer absorbed, and
-   * __mem_trace_load/store calls into the tensor. */
-  uint64_t emitted_br;
-  uint64_t emitted_bw;
-  uint64_t emitted_r;
-  uint64_t emitted_w;
-  uint64_t dedup_skips;
-  uint64_t range_calls;
   /* DCC tile MAC: column reads one command covers (0 = one per column), and the count of
    * surviving reads in the current dispatch. */
   int tile_mac_reads;
@@ -813,8 +797,8 @@ static int rec_cmp(const void *a, const void *b) {
  * from the geometry the compiler stated, their pos_mat stride included (a convention of
  * their trace). RET emits a tensor's return stage as wide as the input the compiler named,
  * as their RED sizes it from the input, walking away from the input in allocation order,
- * which mirrors their addresses, under row-pack placement only. SWAP, on top of ADDR, puts
- * the GEMV vector and result where their swapped call does from ADDR's MAC base (dcc_swap_*).
+ * which mirrors their addresses. SWAP, on top of ADDR, puts the GEMV vector and result where
+ * their swapped call does from ADDR's MAC base (dcc_swap_*).
  * MADDR issues a map's or a reduction's every command at the address their VA, RELU and RED
  * generators give it (maddr_*).
  * Every mask carries FAN, ACC and WAVE, as dcc_convention.native_mask builds it.
@@ -873,7 +857,7 @@ static uint64_t dcc_mac_addr(tensor_info_t *t, int e, int ch, int pch, int bg, i
   t->addr_disp = ep;
   t->addr_last = key;
   stat_addr_mapped++;
-  /* The matrix base is the slab's first column under row-pack, else where the tensor's
+  /* The matrix base is the slab's first column, or, for a tensor with no slab, where its
    * first element lands in this bank's row map. */
   long cpr = vpr / vpc, base = t->pack_base_col;
   if (base < 0) {
@@ -978,8 +962,8 @@ static int dcc_swap_res(const tensor_info_t *t, const pim_phys_loc_t *loc, uint6
  * stage and return it a column at a time (VA :111-117, :136-140), and address every PIM
  * command two bytes a column from the iteration's first value (VA :99-108), a convention of
  * their trace as ADDR's is. RED's four in-register steps sit at the slab's first bytes and its
- * partial at the iteration's first value of the result (RED :86-97). Row-pack placement only,
- * on a kernel with no GEMV tile. */
+ * partial at the iteration's first value of the result (RED :86-97). MADDR applies only to a
+ * kernel with no GEMV tile. */
 static int g_maddr = -1;  /* -1 undecided this kernel, 0 off, 1 on */
 static long g_maddr_base[MAX_TENSORS];
 static uint64_t g_ms_disp[MAX_TENSORS][MAX_BANKS];
@@ -991,7 +975,7 @@ static pim_phys_loc_t g_last_mac_loc;
 static int maddr_on(void) {
   if (g_maddr >= 0) return g_maddr;
   g_maddr = 0;
-  if (!(g_dcc_native & NAT_MADDR) || cfg_place_align != PIM_ALIGN_ROW_PACK) return 0;
+  if (!(g_dcc_native & NAT_MADDR)) return 0;
   long base = 0;
   for (int i = 0; i < num_tensors; i++) {
     if (tensors[i].addr_head > 0 || tensors[i].pack_base_col < 0) return 0;
@@ -1629,33 +1613,17 @@ static void place_in_lane_slab(tensor_info_t *t, pim_phys_loc_t *loc) {
     t->lane_ord[key_lane]++;
   int vpc = t->values_per_col;
   int vpr = t->values_per_row;
-  if (t->pack_base_col >= 0) {
-    long c = slot / vpc, cpr = vpr / vpc;
-    if (c >= t->pack_cols) {
-      g_pack_overflow++;
-      c = t->pack_cols - 1;
-    }
-    long lc = t->pack_base_col + c;
-    int linear_row = (int)(lc / cpr);
-    decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
-    loc->sa = linear_row / cfg_num_rows;
-    loc->row = linear_row % cfg_num_rows;
-    loc->col = (int)(lc % cpr);
-    stat_lane_placed++;
-    return;
+  long c = slot / vpc, cpr = vpr / vpc;
+  if (c >= t->pack_cols) {
+    g_pack_overflow++;
+    c = t->pack_cols - 1;
   }
-  int r = slot / vpr;
-  if (r >= t->lane_row_count) {
-    if (!warned++)
-      fprintf(stderr, "[pim-runtime] WARN tensor lane %d overflowed its %d-row slab; "
-                      "rows now alias.\n", lane, t->lane_row_count);
-    r = t->lane_row_count - 1;
-  }
-  int linear_row = t->lane_row_base + r;
+  long lc = t->pack_base_col + c;
+  int linear_row = (int)(lc / cpr);
   decompose_global_bank(lane, &loc->ch, &loc->pch, &loc->bg, &loc->bank);
   loc->sa = linear_row / cfg_num_rows;
   loc->row = linear_row % cfg_num_rows;
-  loc->col = (slot % vpr) / vpc;
+  loc->col = (int)(lc % cpr);
   stat_lane_placed++;
 }
 
@@ -1698,7 +1666,6 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                  loc->row, loc->col);
       stat_bank_reads++;
-      t->emitted_br++;
       break;
     case PIM_ROLE_OPERAND: {
       /* An operand load is a bus-mediated write into the RECEIVING PE's register
@@ -1709,7 +1676,6 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       decompose_global_bank(phys_lane(), &dch, &dpch, &dbg, &dbank);
       emit_trace("W", dch, dpch, dbg, dbank, loc->sa, loc->row, loc->col);
       stat_writes++;
-      t->emitted_w++;
       /* The W already expands to ST + PIM_LD_OP1 in emit_trace, so no second command.
        * Our W count equals DCC's PIM_LD_OP1 count exactly. */
       break;
@@ -1727,13 +1693,11 @@ static void emit_access_by_role_phase(tensor_info_t *t,
         emit_trace("BR", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                    loc->row, loc->col);
         stat_bank_reads++;
-        t->emitted_br++;
         break;
       }
       emit_trace("R", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                  loc->row, loc->col);
       stat_reads++;
-      t->emitted_r++;
       break;
     }
     }
@@ -1748,7 +1712,6 @@ static void emit_access_by_role_phase(tensor_info_t *t,
       emit_trace("BW", loc->ch, loc->pch, loc->bg, loc->bank, loc->sa,
                  loc->row, loc->col);
       stat_bank_writes++;
-      t->emitted_bw++;
     }
     /* Stores to STREAMED/OPERAND in COMPUTE phase are ignored (read-only) */
     else
@@ -1868,8 +1831,7 @@ static int ec_ev_cmp(const void *x, const void *y) {
 
 /* Collapsed classes (compute, accumulator reads) are compared per channel, since the line
  * names whichever lane issued first, and the rest per bank. A fold adds compute at the last
- * MAC's column, so compute is a floor per column and exact in total, and a folded reset is
- * exact in total with the runtime's drop count. */
+ * MAC's column, so compute is a floor per column and exact in total. */
 static void emit_check(void) {
   int nb = banks_per_channel();
   int map = __pim_layout_count > 0 && __pim_acc_cells_per_lane == 0;
@@ -1930,8 +1892,7 @@ static void emit_check(void) {
       int o = !strcmp(op, "ST") ? EO_ST
               : !strcmp(op, "LD") ? EO_LD
               : !strcmp(op, "PIM_LD_OP1") ? EO_LDOP
-              : (!strcmp(op, "PIM_MAC_OP1") || !strcmp(op, "PIM_MUL_OP1") ||
-                 !strcmp(op, "PIM_RELU")) ? EO_C
+              : (!strcmp(op, "PIM_MAC_OP1") || !strcmp(op, "PIM_RELU")) ? EO_C
               : !strcmp(op, "PIM_ACC_RESET") ? EO_RESET
               : !strcmp(op, "PIM_WB_ACC") ? EO_WB
               : !strcmp(op, "PIM_BARRIER") ? 0 : -1;
@@ -1951,7 +1912,7 @@ static void emit_check(void) {
     if (!e->key) continue;
     int o = (int)(e->key >> 40);
     exp[o] += e->exp;
-    int ok = o == EO_C ? e->emi >= e->exp : o == EO_RESET ? e->emi <= e->exp : e->emi == e->exp;
+    int ok = o == EO_C ? e->emi >= e->exp : e->emi == e->exp;
     if (!ok && ++bad && shown++ < 8)
       fprintf(stderr, "[pim-runtime] emit coverage: %s at bank/channel %d row %d col %d, %lld "
                       "implied by the accesses, %lld in the trace\n", EO_NAME[o],
@@ -2047,13 +2008,14 @@ void pim_init(const char *trace_file) {
 
   check_compiler_dq_bits();
 
-  cfg_place_align = __pim_placement_align == 3 ? PIM_ALIGN_ROW_PACK : PIM_ALIGN_DQ;
-  fprintf(stderr, "[pim-runtime] placement: interleaved, align=%s (compiler said %d, "
-                  "0 = nothing)\n",
-          cfg_place_align == PIM_ALIGN_ROW_PACK ? "row-pack" : "dq",
-          (int)__pim_placement_align);
+  /* Row-pack is this runtime's only placement, so a kernel stamped for another, or for
+   * none, is refused rather than priced on it. */
+  if (__pim_placement_align != 3) {
+    fprintf(stderr, "[pim-runtime] ERROR: the kernel states placement align=%d, and this "
+                    "runtime places row-pack (3) only\n", (int)__pim_placement_align);
+    exit(1);
+  }
   g_interleaved_next_linear = 0;
-  g_lane_row_top = -1;
   g_pack_col_top = -1;
   g_pack_overflow = 0;
   g_emit_drops = 0;
@@ -2220,10 +2182,6 @@ static void apply_dcc_return_from(int tensor_id) {
   int n = (int)__pim_dcc_return_from_count;
   for (int i = 0; i < n && i < PIM_MAX_TILE_MAC; i++)
     if (__pim_dcc_return_from[2 * i] == tensor_id) t->ret_src = __pim_dcc_return_from[2 * i + 1];
-  if ((g_dcc_native & NAT_RET) && t->ret_src >= 0 && cfg_place_align != PIM_ALIGN_ROW_PACK) {
-    stat_ret_refused++;  /* their layout packs the input beside the output, row-pack only */
-    t->ret_src = -1;
-  }
 }
 
 static void apply_compiler_layout(int tensor_id) {
@@ -2267,90 +2225,62 @@ static void apply_compiler_layout(int tensor_id) {
      * the entire W charge (matmul 64x64x32 went 32,786 -> 246 cycles). */
     _t->bank_replicated = (int)rec[PIM_LW_BANK_REPLICATED];
     if (_t->bank_replicated >= 0) {
-      /* Reserve a per-lane slab, the same rows in every bank. Partitioned: a lane can
-       * touch far more than its even share when lanes overlap (a conv halo lane touched
-       * 576 of a 4,096-element input), so a small tensor gets room for every element
-       * per lane and only a large one falls back to twice the share. Replicated: every
-       * lane holds the whole tensor, so the slab IS the tensor; the copy in bank b
-       * used to keep the source word's (sa,row,col) and drop its bank bits, which
-       * aliased 4-8 distinct words onto one address (matmul A: 8,192 writes, 2,048
-       * addresses). When the rows do not fit, keep the interleaved home and say so. */
+      /* Reserve a per-lane share of the packed column space, the same columns in every
+       * bank. Partitioned: the share is the most elements any lane touched in the sizing
+       * replay, or the even share until that replay has run. Replicated: every lane holds
+       * the whole tensor, so the share IS the tensor. The copy in bank b used to keep the
+       * source word's (sa,row,col) and drop its bank bits, which aliased 4-8 distinct words
+       * onto one address (matmul A: 8,192 writes, 2,048 addresses). Packing needs the
+       * extent up front, so a lane that touches more than its share is refused at
+       * placement. */
       int all_banks = active_banks();
       int vpr = _t->values_per_row;
-      int share2 = 2 * ((_t->num_elements + all_banks - 1) / all_banks);
-      if (cfg_place_align == PIM_ALIGN_ROW_PACK) {
-        /* The exact share, not the halo allowance below: packing needs the extent up
-         * front, so a lane that touches more than its share is refused at placement. */
-        int vpc = _t->values_per_col;
-        long cpr = vpr / vpc;
-        int share = _t->bank_replicated >= 1 ? _t->num_elements
-                    : g_sized ? g_sized_share[tensor_id]
-                    : (_t->num_elements + all_banks - 1) / all_banks;
-        if (share < 1) share = 1;
-        int cols = (share + vpc - 1) / vpc;
-        if (g_pack_col_top < 0)
-          g_pack_col_top = (long)cfg_num_sa * cfg_num_rows * cpr;
-        if (g_pack_col_top - cols < 0) {
-          fprintf(stderr, "[pim-runtime] ERROR tensor %d: row-pack share of %d columns does "
-                          "not fit the %ld columns left per bank\n",
-                  tensor_id, cols, g_pack_col_top);
-          exit(1);
-        }
-        g_pack_col_top -= cols;
-        _t->pack_base_col = g_pack_col_top;
-        _t->pack_cols = cols;
-        if ((g_dcc_native & NAT_RET) && _t->ret_src >= 0) {
-          /* Their Ret_addr = Vec_addr + Vec_size: the input sits right beside the output,
-           * and the return stage takes the input's width. Anything else emits no return
-           * stage and is counted, and the padded reading refuses it. */
-          tensor_info_t *src = _t->ret_src < num_tensors ? &tensors[_t->ret_src] : NULL;
-          int extra = src ? src->pack_cols - _t->pack_cols : 0;
-          if (!src || src->pack_base_col != _t->pack_base_col + _t->pack_cols ||
-              g_pack_col_top - (extra > 0 ? extra : 0) < 0) {
-            stat_ret_refused++;
-          } else {
-            _t->ret_cols = src->pack_cols;
-            if (extra > 0) g_pack_col_top -= extra;
-          }
-        }
-        _t->lane_row_base = (int)(g_pack_col_top / cpr);
-        _t->lane_row_count = (int)((g_pack_col_top + cols + cpr - 1) / cpr) - _t->lane_row_base;
-        _t->lane_slot = slot_map_create((size_t)share / 2 + 1);
-        if (!_t->lane_slot) {
-          fprintf(stderr, "[pim-runtime] ERROR tensor %d: slot map allocation failed\n",
-                  tensor_id);
-          exit(1);
-        }
-      } else {
-        int per_lane = _t->bank_replicated >= 1 ? _t->num_elements
-                       : share2 > 65536 ? share2
-                       : (_t->num_elements < 65536 ? _t->num_elements : 65536);
-        int rows = (per_lane + vpr - 1) / vpr;
-        if (rows < 1) rows = 1;
-        if (g_lane_row_top < 0)
-          g_lane_row_top = cfg_num_sa * cfg_num_rows;
-        if (rows > g_lane_row_top) {
-          fprintf(stderr, "[pim-runtime] WARN tensor %d: lane slab of %d rows does not fit "
-                          "the %d rows left; placement stays on the interleaved map.\n",
-                  tensor_id, rows, g_lane_row_top);
+      int vpc = _t->values_per_col;
+      long cpr = vpr / vpc;
+      int share = _t->bank_replicated >= 1 ? _t->num_elements
+                  : g_sized ? g_sized_share[tensor_id]
+                  : (_t->num_elements + all_banks - 1) / all_banks;
+      if (share < 1) share = 1;
+      int cols = (share + vpc - 1) / vpc;
+      if (g_pack_col_top < 0)
+        g_pack_col_top = (long)cfg_num_sa * cfg_num_rows * cpr;
+      if (g_pack_col_top - cols < 0) {
+        fprintf(stderr, "[pim-runtime] ERROR tensor %d: row-pack share of %d columns does "
+                        "not fit the %ld columns left per bank\n",
+                tensor_id, cols, g_pack_col_top);
+        exit(1);
+      }
+      g_pack_col_top -= cols;
+      _t->pack_base_col = g_pack_col_top;
+      _t->pack_cols = cols;
+      if ((g_dcc_native & NAT_RET) && _t->ret_src >= 0) {
+        /* Their Ret_addr = Vec_addr + Vec_size: the input sits right beside the output,
+         * and the return stage takes the input's width. Anything else emits no return
+         * stage and is counted, and the padded reading refuses it. */
+        tensor_info_t *src = _t->ret_src < num_tensors ? &tensors[_t->ret_src] : NULL;
+        int extra = src ? src->pack_cols - _t->pack_cols : 0;
+        if (!src || src->pack_base_col != _t->pack_base_col + _t->pack_cols ||
+            g_pack_col_top - (extra > 0 ? extra : 0) < 0) {
+          stat_ret_refused++;
         } else {
-          g_lane_row_top -= rows;
-          _t->lane_row_base = g_lane_row_top;
-          _t->lane_row_count = rows;
-          _t->lane_slot = slot_map_create((size_t)per_lane / 2 + 1);
-          if (!_t->lane_slot) {
-            _t->lane_row_base = -1;
-            fprintf(stderr, "[pim-runtime] WARN tensor %d: slot map allocation failed; "
-                            "placement stays on the interleaved map.\n", tensor_id);
-          }
+          _t->ret_cols = src->pack_cols;
+          if (extra > 0) g_pack_col_top -= extra;
         }
+      }
+      _t->lane_row_base = (int)(g_pack_col_top / cpr);
+      _t->lane_row_count = (int)((g_pack_col_top + cols + cpr - 1) / cpr) - _t->lane_row_base;
+      _t->lane_slot = slot_map_create((size_t)share / 2 + 1);
+      if (!_t->lane_slot) {
+        fprintf(stderr, "[pim-runtime] ERROR tensor %d: slot map allocation failed\n",
+                tensor_id);
+        exit(1);
       }
     }
     /* THE ROLE IS THE COMPILER'S. is_store marks the output (sticky in the emitter, so a
      * tensor both loaded and stored is the output), bank_replicated says whether every
      * bank sees the same elements. The host string used to be the role and a layout
      * change silently inverted the charge (31x on a transposed accumulator); now it is
-     * an input to check, and a disagreement fails invariant 6 instead of costing a day. */
+     * an input to check, and a disagreement prints a WARN instead of costing a day. */
     if (rec[PIM_LW_IS_STORE] == 1 || rec[PIM_LW_BANK_REPLICATED] >= 0) {
       int derived = rec[PIM_LW_IS_STORE] == 1 ? PIM_ROLE_ACCUMULATOR
                     : rec[PIM_LW_BANK_REPLICATED] ? PIM_ROLE_OPERAND : PIM_ROLE_STREAMED;
@@ -2583,24 +2513,6 @@ void pim_finalize(void) {
             " (raise PIM_COALESCE_MAX)\n",
             stat_coalesce_overflow);
 
-  /* Per-tensor breakdown — Stage-0 diagnostics. Useful for figuring out
-   * which tensor's accesses dominate the trace and where dedup is biting. */
-  fprintf(stderr,
-          "\n[pim-runtime] === Per-tensor breakdown ===\n"
-          "[pim-runtime]   tid  role         range_calls   BR        BW        "
-          "R         W         dedup_skips\n");
-  for (int i = 0; i < num_tensors; i++) {
-    tensor_info_t *t = &tensors[i];
-    const char *role_str = (t->role == PIM_ROLE_STREAMED)  ? "STREAMED"
-                           : (t->role == PIM_ROLE_OPERAND) ? "OPERAND "
-                                                           : "ACCUMUL.";
-    fprintf(stderr,
-            "[pim-runtime]   %3d  %-9s    %10" PRIu64 "  %8" PRIu64
-            "  %8" PRIu64 "  %8" PRIu64 "  %8" PRIu64 "  %12" PRIu64 "\n",
-            i, role_str, t->range_calls, t->emitted_br, t->emitted_bw,
-            t->emitted_r, t->emitted_w, t->dedup_skips);
-  }
-
   destroy_dedup_state();
 }
 
@@ -2667,7 +2579,6 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
       /* Counted as W: an operand delivered into a bank's register file, the same ST +
        * PIM_LD_OP1 pair the W branch emits. */
       stat_writes++;
-      t->emitted_w++;
       return;
     }
   }
@@ -2690,7 +2601,6 @@ static void pim_trace_access_one(tensor_info_t *t, uint64_t addr,
                               (uint64_t)loc.col);
     if (!addr_dedup_check_and_mark(g_lockstep_collapse, h, h >> 16, h >> 48)) {
       stat_lockstep_skips++;
-      t->dedup_skips++;
       return;
     }
   }
@@ -2729,7 +2639,6 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
     }
     return;
   }
-  t->range_calls++;
 
   advance_program_epoch_if_needed();
   access_ord_next();
@@ -2797,11 +2706,6 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
         note_ignored();
         continue;
       }
-      /* Keyed by the element's physical tuple, not by the receiving bank where an
-       * OPERAND load's bus write actually lands. Re-keying was tried 2026-09-10 and
-       * reverted as inert, but the premise has since changed: the conv weight load
-       * used to arrive one element per call and skip this path entirely, and it now
-       * vectorizes. Re-keying is untested under that shape. */
       /* Key on the PLACED tuple. Keying on the interleaved home dropped every
        * word-mate before it reached place_in_lane_slab, so a partitioned tensor's
        * slab held one slot per word instead of one per element and came out 2-8x
@@ -2822,7 +2726,6 @@ static void pim_trace_access_range(uint64_t base_addr, uint64_t size,
         if (seen[j] == key) { dup = 1; break; }
       if (dup) {
         stat_load_coalesced++;
-        t->dedup_skips++;
         continue;
       }
       if (n_seen < PIM_COALESCE_MAX)
