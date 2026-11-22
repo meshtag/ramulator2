@@ -175,14 +175,14 @@ class Implementation {
         // Print all my stats
         emitter << m_stats;
         // Print all my children
-        for (auto child_impl : m_children) {
-          if (child_impl->has_stats()) {
-            // TODO: Is this a bug in yaml-cpp that I have to emit NewLine twice?
-            emitter << YAML::Newline;
-            emitter << YAML::Newline;
-          }
-          child_impl->print_stats(emitter);
-        }
+//        for (auto child_impl : m_children) {
+//          if (child_impl->has_stats()) {
+//            // TODO: Is this a bug in yaml-cpp that I have to emit NewLine twice?
+//            emitter << YAML::Newline;
+//            emitter << YAML::Newline;
+//          }
+//          child_impl->print_stats(emitter);
+//        }
       emitter << YAML::EndMap;
       emitter << YAML::Newline;
     };

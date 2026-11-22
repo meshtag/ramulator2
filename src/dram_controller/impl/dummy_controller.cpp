@@ -28,6 +28,10 @@ class DummyController final : public IDRAMController, public Implementation {
       return;
     }
 
+    bool is_pending() override {
+      return true;
+    }
+
 };
 
 }   // namespace Ramulator

@@ -8,7 +8,6 @@
 #include "base/config.h"
 #include "frontend/frontend.h"
 #include "memory_system/memory_system.h"
-#include "example/example_ifce.h"
 
 int main(int argc, char* argv[]) {
   // Parse command line arguments
@@ -102,13 +101,14 @@ int main(int argc, char* argv[]) {
       frontend->tick();
     }
 
-    if (frontend->is_finished()) {
-      break;
-    }
-
     if ((i % tick_mult) % frontend_tick == 0) {
       memory_system->tick();
     }
+
+    if (frontend->is_finished() & !memory_system->is_pending()) {
+      break;
+    }
+
   }
 
   // Finalize the simulation. Recursively print all statistics from all components

@@ -47,6 +47,11 @@ class IDRAMController : public Clocked<IDRAMController> {
      */
     virtual void tick() = 0;
    
+    virtual bool is_pending() = 0;
+
+    // For debugging
+    Clk_t get_clk() {return m_clk;}
+
 };
 
 }       // namespace Ramulator

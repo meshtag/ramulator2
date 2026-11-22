@@ -123,4 +123,5 @@ class MOP4CLXOR final : public LinearMapperBase, public Implementation {
     }
 };
 
+
 }   // namespace Ramulator

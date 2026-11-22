@@ -1,5 +1,4 @@
 add_subdirectory(base)
-add_subdirectory(test)
 add_subdirectory(frontend)
 add_subdirectory(translation)
 add_subdirectory(memory_system)

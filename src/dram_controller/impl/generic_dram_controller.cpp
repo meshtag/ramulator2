@@ -135,6 +135,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
 
 
+    bool is_pending() override {
+      bool is_pending = m_active_buffer.size() ||  m_priority_buffer.size() || m_read_buffer.size() || m_write_buffer.size() || pending.size();
+      return is_pending;
+    };
+
   private:
     /**
      * @brief    Helper function to serve the completed read requests

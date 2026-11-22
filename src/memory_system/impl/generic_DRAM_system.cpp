@@ -82,11 +82,19 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
     float get_tCK() override {
       return m_dram->m_timing_vals("tCK_ps") / 1000.0f;
-    }
+    };
 
     // const SpecDef& get_supported_requests() override {
     //   return m_dram->m_requests;
     // };
+
+    bool is_pending() override {
+      bool is_pending = false;
+      for (auto controller : m_controllers) {
+        is_pending |= controller->is_pending();
+      }
+      return is_pending;
+    };
 };
   
 }   // namespace 
