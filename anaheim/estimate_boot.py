@@ -9,12 +9,17 @@ overlap, and each GPU/PIM switch costs SWITCH_US.
 Three Cheddar kernels fuse element-wise work with GPU-only work:
   NTTPhase2ForModDown: the NTT stays at a plain NTTPhase2's measured time per limb, and the
       epilogue becomes ModDownEp.
-  BSFusedKernel: R KeyMults become PAccum<D>, and the automorphism stays at Permute's
-      measured time per polynomial limb.
+  BSFusedKernel: R KeyMults become PAccum<D>, each followed by the Add of P * bx on the Q
+      limbs (Fig. 1's b' = b + P * b), and the automorphism stays at Permute's measured time
+      per polynomial limb.
   GSFusedKernel: gs giant steps become PAccum<bs>. Anaheim has no instruction that reuses
       baby steps across giant steps, as this kernel does.
 The fused kernels' bs, gs, D and R are read exactly from the pointer arrays Cheddar copies
-to the GPU before each launch.
+to the GPU before each launch. GSFusedKernel skips the diagonals a giant step lacks, which
+the profile does not show, so every giant step is taken as bs diagonals.
+
+CPAccumAdd with plaintext factors (const_accum 0) is res + sum_k p_k * ct_k. PAccum<K> has
+no initial value (Table II), so it becomes PAccum<K> and an Add per polynomial.
 
 Not modeled: Anaheim's GPU kernels changed for PIM (L2 write-backs, which the paper puts at
 1.03-1.11x on (I)NTT and automorphism) and its op reordering.
@@ -36,6 +41,7 @@ from gen_trace import generate
 HERE = Path(__file__).resolve().parent
 N = 1 << 16
 SWITCH_US = 2.0
+AUX_PRIMES = 14  # P primes of every key, alpha in anaheim_boot.json
 GPU_ONLY = {"NTTPhase1", "NTTPhase2", "INTTPhase1", "INTTPhase2", "ModSwitchMatrixMult",
             "Permute", "PermuteAccum", "PermuteAccumAdd", "ModUpToMax1", "ModUpToMax2"}
 
@@ -46,7 +52,9 @@ def pim_ops(base, nums, lists, limbs, extra):
         npoly, const = nums[0], nums[1]
         return [(f"{'CAccum' if const else 'PAccum'}{lists}x{npoly}", limbs)]
     if base == "CPAccumAdd":
-        return [(f"CAccum{lists + 1}x{nums[0]}", limbs)]
+        if nums[1]:
+            return [(f"CAccum{lists + 1}x{nums[0]}", limbs)]
+        return [(f"PAccum{lists}x{nums[0]}", limbs)] + [("Add", limbs)] * nums[0]
     if base == "Sum":
         return [(f"CAccum{lists}x{nums[0]}", limbs)]
     if base == "Tensor":
@@ -64,7 +72,7 @@ def pim_ops(base, nums, lists, limbs, extra):
         return [(f"PAccum{bs}", limbs)] * gs
     if base == "BSFusedKernel":
         d, r = extra
-        return [(f"PAccum{d}", limbs)] * r
+        return [(f"PAccum{d}", limbs), ("Add", limbs - AUX_PRIMES)] * r
     if base == "NTTPhase2ForModDown":
         return [("ModDownEp", limbs)]
     raise KeyError(f"no Anaheim mapping for Cheddar kernel {base}")
