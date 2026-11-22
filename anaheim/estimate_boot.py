@@ -95,7 +95,92 @@ def load(path):
     return acts
 
 
-def main():
+def rates(acts):
+    """Measured GPU rates for the parts of fused kernels that stay on the GPU: NTTPhase2 in
+    us per limb and Permute in us per polynomial limb."""
+    ntt2 = [((e - s) / 1e3) / g[1] for s, e, k, b, n, l, g, h in acts if b == "NTTPhase2"]
+    perm = [((e - s) / 1e3) / (n[0] * g[0] * g[3] / N) for s, e, k, b, n, l, g, h in acts
+            if b == "Permute"]
+    return statistics.median(ntt2), statistics.median(perm)
+
+
+def launches(acts):
+    """Every kernel and copy in time order as (base, us, side, kept, ops, limbs, extra): its
+    Cheddar time, "gpu", "pim" or None for a copy, the GPU time it keeps as {label: us}, the
+    Anaheim instructions doing its element-wise work, and its limbs and (bs, gs) or (D, R)."""
+    ntt2_us_per_limb, perm_us_per_poly_limb = rates(acts)
+    htod = []
+    for s, e, kind, base, nums, lists, grid, copy in acts:
+        us = (e - s) / 1e3
+        if kind != "kernel":
+            if copy and copy[0] == 1:
+                htod.append(copy[1])
+            yield base, us, None, {"copies": us}, [], None, None
+            continue
+        if base in GPU_ONLY:
+            yield base, us, "gpu", {base: us}, [], None, None
+        else:
+            kept, extra = {}, None
+            if base == "NTTPhase2ForModDown":
+                limbs = grid[1]
+                kept["NTT (ModDown)"] = min(us, ntt2_us_per_limb * limbs)
+            else:
+                limbs = grid[0] * grid[3] / N
+                if base == "GSFusedKernel":
+                    bx, ax, mx, dbx, dax = htod[-5:]
+                    extra = (bx // 8, dax // 8)
+                elif base == "BSFusedKernel":
+                    modup, ka, kb, db, da, kx, gal = htod[-7:]
+                    extra = (modup // 8, gal // 4)
+                    kept["automorphism (KeyMult)"] = (extra[1] * 2 * limbs
+                                                      * perm_us_per_poly_limb)
+            yield (base, us, "pim", kept, pim_ops(base, nums, lists, limbs, extra), limbs,
+                   extra)
+        htod = []
+
+
+def estimate(a, acts, work, replace=None):
+    """The estimate's parts: Cheddar's total, the GPU time kept and the PIM time by kind (us),
+    the switch count and Cheddar's time per kernel. replace(base, extra, limbs per group,
+    Anaheim's time), where it returns a time, stands in for a launch's Anaheim instructions."""
+    config = Path(a.config).read_text()
+    if a.preset:
+        config = re.sub(r"(timing:\s*\n\s*preset:) \S+", rf"\1 {a.preset}", config)
+    cfg = work / "base.yaml"
+    cfg.write_text(config)
+    cache = {}
+
+    def pim_us(name, limbs):
+        per_group = math.ceil(limbs / a.groups)
+        key = (name, per_group)
+        if key not in cache:
+            lines = list(generate(name, a.buffer, a.chunks, per_group, a.row_chunks, a.cg_max))
+            cache[key] = simulate(cfg, lines, work) * a.tck_ns / 1e3
+        return cache[key]
+
+    total = 0.0
+    kept, pim, cheddar = defaultdict(float), defaultdict(float), defaultdict(float)
+    switches, last = 0, "gpu"
+    for base, us, side, gpu, ops, limbs, extra in launches(acts):
+        total += us
+        for label, t in gpu.items():
+            kept[label] += t
+        if side is None:
+            continue
+        cheddar[base] += us
+        times = [(name.rstrip("0123456789x") or name, pim_us(name, lb)) for name, lb in ops]
+        mine = None
+        if replace and ops:
+            mine = replace(base, extra, math.ceil(limbs / a.groups), sum(t for _, t in times))
+        for kind, t in times if mine is None else [(base, mine)]:
+            pim[kind] += t
+        if side != last:
+            switches += 1
+            last = side
+    return total, kept, pim, switches, cheddar
+
+
+def parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("profile")
@@ -107,76 +192,15 @@ def main():
     ap.add_argument("--cg-max", type=int, default=16)
     ap.add_argument("--buffer", type=int, default=32, help="B")
     ap.add_argument("--tck-ns", type=float, default=0.5)
-    a = ap.parse_args()
+    return ap
 
+
+def main():
+    a = parser().parse_args()
     acts = load(a.profile)
-    # Measured GPU rates for the parts of fused kernels that stay on the GPU.
-    ntt2 = [((e - s) / 1e3) / g[1] for s, e, k, b, n, l, g, h in acts if b == "NTTPhase2"]
-    ntt2_us_per_limb = statistics.median(ntt2)
-    perm = [((e - s) / 1e3) / (n[0] * g[0] * g[3] / N) for s, e, k, b, n, l, g, h in acts
-            if b == "Permute"]
-    perm_us_per_poly_limb = statistics.median(perm)
-
-    config = Path(a.config).read_text()
-    if a.preset:
-        config = re.sub(r"(timing:\s*\n\s*preset:) \S+", rf"\1 {a.preset}", config)
-    cache = {}
+    ntt2_us_per_limb, perm_us_per_poly_limb = rates(acts)
     with tempfile.TemporaryDirectory() as d:
-        work = Path(d)
-        cfg = work / "base.yaml"
-        cfg.write_text(config)
-
-        def pim_us(name, limbs):
-            per_group = math.ceil(limbs / a.groups)
-            key = (name, per_group)
-            if key not in cache:
-                lines = list(generate(name, a.buffer, a.chunks, per_group, a.row_chunks, a.cg_max))
-                cache[key] = simulate(cfg, lines, work) * a.tck_ns / 1e3
-            return cache[key]
-
-        total_gpu = 0.0
-        kept = defaultdict(float)
-        pim = defaultdict(float)
-        cheddar = defaultdict(float)
-        switches, last, htod = 0, "gpu", []
-        for s, e, kind, base, nums, lists, grid, copy in acts:
-            us = (e - s) / 1e3
-            total_gpu += us
-            if kind != "kernel":
-                kept["copies"] += us
-                if copy and copy[0] == 1:
-                    htod.append(copy[1])
-                continue
-            cheddar[base] += us
-            if base in GPU_ONLY:
-                kept[base] += us
-                side = "gpu"
-            else:
-                if base == "NTTPhase2ForModDown":
-                    limbs = grid[1]
-                    gpu_part = min(us, ntt2_us_per_limb * limbs)
-                    kept["NTT (ModDown)"] += gpu_part
-                    extra = None
-                else:
-                    limbs = grid[0] * grid[3] / N
-                    gpu_part = 0.0
-                    extra = None
-                    if base == "GSFusedKernel":
-                        bx, ax, mx, dbx, dax = htod[-5:]
-                        extra = (bx // 8, dax // 8)
-                    elif base == "BSFusedKernel":
-                        modup, ka, kb, db, da, kx, gal = htod[-7:]
-                        extra = (modup // 8, gal // 4)
-                        gpu_part = extra[1] * 2 * limbs * perm_us_per_poly_limb
-                        kept["automorphism (KeyMult)"] += gpu_part
-                for name, lb in pim_ops(base, nums, lists, limbs, extra):
-                    pim[name.rstrip("0123456789x") or name] += pim_us(name, lb)
-                side = "pim"
-            if side != last:
-                switches += 1
-                last = side
-            htod = [] if kind == "kernel" else htod
-
+        total_gpu, kept, pim, switches, cheddar = estimate(a, acts, Path(d))
     gpu_kept = sum(kept.values())
     pim_total = sum(pim.values())
     switch_total = switches * SWITCH_US
