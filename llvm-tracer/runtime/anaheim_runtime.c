@@ -13,9 +13,10 @@
  *
  * Placement is the compiler's: im_polygroups, emitted as __anaheim_polygroups with placement
  * scheme 3. It is Anaheim's column partitioning (Sec. VI-B), the formula of
- * ramulator2_anaheim/anaheim/gen_trace.py. A tensor is u32[limbs][banks][C][8]. PolyGroup g
- * owns the rows from g << 12. Its n tensors split each row into column groups of
- * w = min(cg_max, row_chunks / next_pow2(n)) chunks, and limb l of its k-th tensor wraps
+ * ramulator2_anaheim/anaheim/gen_trace.py. A polynomial is u32[limbs][banks][C][8], and a
+ * tensor registered with two or more dims stacks dims[0] of them. PolyGroup g owns the rows
+ * from g << 12. Its n polynomials split each row into column groups of
+ * w = min(cg_max, row_chunks / next_pow2(n)) chunks, and limb l of its k-th polynomial wraps
  * over ceil(C / w) rows of column group k. PolyGroup -1 is a constant the PIM decoder
  * broadcasts, so its accesses issue nothing.
  *
@@ -24,11 +25,12 @@
  * it. MMACs ride the run of reads just before them, one MMAC per read chunk, taking that
  * chunk as their bank operand as the unit's datapath does. A run is the consecutive reads of
  * one tensor, since the compiler splits a lane's block into one load per chunk. Any other
- * MMAC costs one PIM_CMP cycle. Any other operation is refused, since the unit has none.
+ * MMAC costs one PIM_CMP cycle. Any other operation is refused, since the unit has none, and
+ * so is a program with more multiplies than reductions, since the MMAC reduces every product.
  *
- * The buffer holds every read chunk no MMAC took on arrival, plus the results the program
- * writes back. A program that needs more than B entries is refused, since Anaheim has no
- * spill.
+ * The buffer holds every read chunk no MMAC took on arrival, for the rest of the program, and
+ * each batch of results until it is written back. A program that needs more than B entries is
+ * refused, since Anaheim has no spill.
  */
 #define PIM_LAYOUT_TABLE_DEFINE
 #include "im_runtime.h"
@@ -46,7 +48,9 @@ typedef struct {
   size_t total_bytes;
   int elem_size;
   int polygroup; /* -1: broadcast by the decoder, in no bank */
-  int cg_index;  /* its column group within the PolyGroup */
+  int n_polys;   /* polynomials stacked along dims[0] */
+  size_t poly_elems;
+  int cg_index;  /* the column group of its first polynomial within the PolyGroup */
   int cg_width;  /* chunks per column group */
   int rows_per_limb;
 } anaheim_tensor_t;
@@ -85,7 +89,8 @@ static int pending_chunks = 0; /* chunks of the current read run no MMAC has tak
 static int pending_tensor = -1; /* the run's tensor, -1 once an MMAC or a write ends it */
 static int bypass_chunks = 0;   /* read chunks no MMAC took on arrival, held in the buffer */
 static int rem_elems = 0;       /* urem elements not yet a whole chunk */
-static int acc_chunks = 0;      /* results written back, held in the buffer until then */
+static int batch_chunks = 0;    /* the current run of writes, held in the buffer until then */
+static long long mul_count = 0, rem_count = 0; /* elements, for the reduction check */
 
 static long long s_rd, s_wr, s_cmp, s_mmac, s_paired, s_programs;
 static int s_max_buffer;
@@ -112,6 +117,19 @@ static int next_pow2(int n) {
   return p;
 }
 
+/* The buffer holds the reads no MMAC took and the current batch of results. */
+static void check_buffer(void) {
+  int used = bypass_chunks + pending_chunks + batch_chunks;
+  if (used > s_max_buffer)
+    s_max_buffer = used;
+  if (used > cfg_buffer) {
+    fprintf(stderr, "[anaheim] ERROR: a program holds %d chunks (%d read ahead, %d results) "
+                    "in a buffer of %d entries, and Anaheim's unit cannot spill. Shrink the "
+                    "tile.\n", used, bypass_chunks + pending_chunks, batch_chunks, cfg_buffer);
+    exit(1);
+  }
+}
+
 /* Close out the leader's program: unconsumed reads stay in the buffer, which must fit. */
 static void finish_program(void) {
   if (cur_epoch == (uint64_t)-1)
@@ -122,13 +140,12 @@ static void finish_program(void) {
     exit(1);
   }
   bypass_chunks += pending_chunks;
-  int used = bypass_chunks + acc_chunks;
-  if (used > s_max_buffer)
-    s_max_buffer = used;
-  if (used > cfg_buffer) {
-    fprintf(stderr, "[anaheim] ERROR: a program holds %d chunks (%d read ahead, %d MMAC "
-                    "results) in a buffer of %d entries, and Anaheim's unit cannot spill. "
-                    "Shrink the tile.\n", used, bypass_chunks, acc_chunks, cfg_buffer);
+  pending_chunks = 0;
+  check_buffer();
+  if (mul_count > rem_count) {
+    fprintf(stderr, "[anaheim] ERROR: a program multiplies %lld elements but reduces %lld. "
+                    "Anaheim's MMAC reduces every product, so write `%% q` after each "
+                    "multiply.\n", mul_count, rem_count);
     exit(1);
   }
   s_programs++;
@@ -142,8 +159,9 @@ static int sync_program(void) {
     cur_epoch = __pim_program_epoch;
     prog_len = 0;
     cur_lane = -1;
-    pending_chunks = bypass_chunks = rem_elems = acc_chunks = 0;
+    pending_chunks = bypass_chunks = rem_elems = batch_chunks = 0;
     pending_tensor = -1;
+    mul_count = rem_count = 0;
   }
   if (lane != cur_lane) {
     if (cur_lane > 0 && lane_pos != prog_len) {
@@ -158,14 +176,39 @@ static int sync_program(void) {
   return lane;
 }
 
-static void place(const anaheim_tensor_t *t, size_t chunk_idx, int *limb, int *bank,
-                  int *row, int *col) {
+static void place(const anaheim_tensor_t *t, uint64_t elem, int *limb, int *bank, int *row,
+                  int *col) {
+  int poly = (int)(elem / t->poly_elems);
+  size_t chunk_idx = (elem % t->poly_elems) / CHUNK_WORDS;
   size_t per_bank = (size_t)cfg_chunks_per_limb;
   *limb = (int)(chunk_idx / (per_bank * cfg_num_banks));
   *bank = (int)((chunk_idx / per_bank) % cfg_num_banks);
   int chunk = (int)(chunk_idx % per_bank);
   *row = (t->polygroup << 12) + *limb * t->rows_per_limb + chunk / t->cg_width;
-  *col = t->cg_index * t->cg_width + chunk % t->cg_width;
+  *col = (t->cg_index + poly) * t->cg_width + chunk % t->cg_width;
+}
+
+/* Lay out every PolyGroup once all its tensors are registered. */
+static void layout_polygroups(void) {
+  for (int i = 0; i < num_tensors; i++) {
+    anaheim_tensor_t *t = &tensors[i];
+    if (t->polygroup < 0)
+      continue;
+    int n = 0, k = 0;
+    for (int j = 0; j < num_tensors; j++) {
+      if (tensors[j].polygroup != t->polygroup)
+        continue;
+      if (j < i)
+        k += tensors[j].n_polys;
+      n += tensors[j].n_polys;
+    }
+    int w = cfg_row_chunks / next_pow2(n);
+    t->cg_width = w < cfg_cg_max ? w : cfg_cg_max;
+    if (t->cg_width < 1)
+      die("a PolyGroup with more polynomials than chunks in a row");
+    t->cg_index = k;
+    t->rows_per_limb = (cfg_chunks_per_limb + t->cg_width - 1) / t->cg_width;
+  }
 }
 
 static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint64_t lanes) {
@@ -187,7 +230,7 @@ static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint6
   int nchunks = (int)(n / CHUNK_WORDS);
   for (int j = 0; j < nchunks; j++) {
     int limb, bank, row, col;
-    place(t, first / CHUNK_WORDS + (uint64_t)j, &limb, &bank, &row, &col);
+    place(t, first + (uint64_t)j * CHUNK_WORDS, &limb, &bank, &row, &col);
     if (bank != lane) {
       fprintf(stderr, "[anaheim] ERROR: lane %d touched bank %d of tensor %d. Put the banks "
                       "on the lane axis (im_bank_axis).\n", lane, bank, tid);
@@ -217,13 +260,17 @@ static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint6
       bypass_chunks += pending_chunks;
       pending_chunks = 0;
       pending_tensor = -1;
-      acc_chunks += nchunks;
-    } else if (tid == pending_tensor) {
-      pending_chunks += nchunks;
+      batch_chunks += nchunks;
+      check_buffer();
     } else {
-      bypass_chunks += pending_chunks;
-      pending_chunks = nchunks;
-      pending_tensor = tid;
+      batch_chunks = 0; /* the batch went back to the banks */
+      if (tid == pending_tensor) {
+        pending_chunks += nchunks;
+      } else {
+        bypass_chunks += pending_chunks;
+        pending_chunks = nchunks;
+        pending_tensor = tid;
+      }
     }
   }
 }
@@ -236,8 +283,11 @@ void __compute_trace(int32_t op, int32_t lanes, void *dest_addr) {
   switch (op) {
   case SIMDRAM_OP_ADD:
   case SIMDRAM_OP_SUB:
-  case SIMDRAM_OP_MUL:
     return; /* part of the MMAC that reduces it */
+  case SIMDRAM_OP_MUL:
+    if (lane == 0)
+      mul_count += lanes;
+    return;
   case SIMDRAM_OP_REM:
     break;
   default:
@@ -247,6 +297,8 @@ void __compute_trace(int32_t op, int32_t lanes, void *dest_addr) {
   }
   if (lane != 0)
     return;
+  rem_count += lanes;
+  batch_chunks = 0;
   rem_elems += lanes;
   int chunks = rem_elems / CHUNK_WORDS;
   rem_elems %= CHUNK_WORDS;
@@ -297,26 +349,18 @@ int anaheim_register_tensor(void *ptr, const int *dims, int ndims, int elem_size
   t->elem_size = elem_size;
   t->total_bytes = total * (size_t)elem_size;
   t->polygroup = (int)__anaheim_polygroups[id];
-  if (t->polygroup >= 0) {
-    if (elem_size != 4)
-      die("a banked tensor that is not u32. Anaheim stores 32-bit words");
-    int n = 0, k = 0;
-    for (int i = 0; i < (int)__anaheim_polygroup_count; i++) {
-      if (__anaheim_polygroups[i] != t->polygroup)
-        continue;
-      if (i < id)
-        k++;
-      n++;
-    }
-    int w = cfg_row_chunks / next_pow2(n);
-    t->cg_width = w < cfg_cg_max ? w : cfg_cg_max;
-    t->cg_index = k;
-    t->rows_per_limb = (cfg_chunks_per_limb + t->cg_width - 1) / t->cg_width;
-  }
+  t->n_polys = ndims >= 2 ? dims[0] : 1;
+  t->poly_elems = total / (size_t)t->n_polys;
+  if (t->polygroup >= 0 && elem_size != 4)
+    die("a banked tensor that is not u32. Anaheim stores 32-bit words");
   return id;
 }
 
-void anaheim_set_phase(int p) { phase = p; }
+void anaheim_set_phase(int p) {
+  if (p && !phase)
+    layout_polygroups();
+  phase = p;
+}
 
 void anaheim_finalize(void) {
   finish_program();
