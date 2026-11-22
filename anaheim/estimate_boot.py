@@ -147,10 +147,11 @@ def launches(acts):
         htod = []
 
 
-def estimate(a, acts, work, replace=None):
+def estimate(a, acts, work, replace=None, record=None):
     """The estimate's parts: Cheddar's total, the GPU time kept and the PIM time by kind (us),
     the switch count and Cheddar's time per kernel. replace(base, extra, limbs per group,
-    Anaheim's time), where it returns a time, stands in for a launch's Anaheim instructions."""
+    Anaheim's time), where it returns a time, stands in for a launch's Anaheim instructions.
+    record(i, Cheddar us, GPU us kept, PIM us, switched) sees the i-th of launches(acts)."""
     config = Path(a.config).read_text()
     if a.preset:
         config = re.sub(r"(timing:\s*\n\s*preset:) \S+", rf"\1 {a.preset}", config)
@@ -169,22 +170,29 @@ def estimate(a, acts, work, replace=None):
     total = 0.0
     kept, pim, cheddar = defaultdict(float), defaultdict(float), defaultdict(float)
     switches, last = 0, "gpu"
-    for base, us, side, gpu, ops, limbs, extra in launches(acts):
+    for i, (base, us, side, gpu, ops, limbs, extra) in enumerate(launches(acts)):
         total += us
         for label, t in gpu.items():
             kept[label] += t
         if side is None:
+            if record:
+                record(i, us, sum(gpu.values()), 0.0, False)
             continue
         cheddar[base] += us
         times = [(name.rstrip("0123456789x") or name, pim_us(name, lb)) for name, lb in ops]
         mine = None
         if replace and ops:
             mine = replace(base, extra, math.ceil(limbs / a.groups), sum(t for _, t in times))
+        here = 0.0
         for kind, t in times if mine is None else [(base, mine)]:
             pim[kind] += t
-        if side != last:
+            here += t
+        switched = side != last
+        if switched:
             switches += 1
             last = side
+        if record:
+            record(i, us, sum(gpu.values()), here, switched)
     return total, kept, pim, switches, cheddar
 
 
