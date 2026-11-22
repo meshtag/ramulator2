@@ -11,6 +11,7 @@ target_sources(
   impl/generic_dram_controller.cpp
   impl/hbm3_controller.cpp
   impl/hbm3_pim_controller.cpp
+  impl/anaheim_pim_controller.cpp
   
   impl/scheduler/generic_scheduler.cpp
   impl/scheduler/pim_scheduler.cpp
@@ -18,6 +19,7 @@ target_sources(
   impl/refresh/all_bank_refresh.cpp
   impl/refresh/all_bank_refresh_hbm3.cpp
   impl/refresh/no_refresh.cpp
+  impl/refresh/anaheim_refresh.cpp
 
   impl/plugin/hbm3_trace_recorder.cpp
   impl/plugin/trace_recorder.cpp

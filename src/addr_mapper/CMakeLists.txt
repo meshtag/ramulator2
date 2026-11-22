@@ -7,6 +7,7 @@ target_sources(
   impl/linear_mappers.cpp
   impl/hbm3_linear_mappers.cpp
   impl/hbm3_pim_linear_mappers.cpp
+  impl/anaheim_mapper.cpp
   impl/rit.cpp
   impl/rit.h
 )

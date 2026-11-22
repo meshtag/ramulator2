@@ -6,6 +6,7 @@ target_sources(
 
   impl/memory_trace/loadstore_trace.cpp
   impl/memory_trace/pim_loadstore_trace.cpp
+  impl/memory_trace/anaheim_pim_trace.cpp
 )
 
 target_link_libraries(

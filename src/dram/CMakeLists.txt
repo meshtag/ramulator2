@@ -8,6 +8,7 @@ target_sources(
 
   impl/HBM3.cpp
   impl/HBM3-PIM.cpp
+  impl/Anaheim-PIM.cpp
 )
 
 target_link_libraries(

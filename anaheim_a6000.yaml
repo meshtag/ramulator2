@@ -1,0 +1,28 @@
+# Anaheim ported to the RTX A6000 (GDDR6 at 16 Gbps, CK 2 GHz). One x8 channel of one chip.
+# Timing preset GDDR6_16Gbps_PIM_CK2 runs the units at CK/2 like their RTX 4090 setup,
+# GDDR6_16Gbps_PIM_CK4 at tCCDL = 4 clocks.
+#   ./build/ramulator2 -f anaheim_a6000.yaml -p Frontend.path=<trace>
+Frontend:
+  impl: AnaheimPIMTrace
+  path: ./anaheim.trace
+  clock_ratio: 1
+  Translation:
+    impl: NoTranslation
+    max_addr: 2147483648
+
+MemorySystem:
+  impl: PIMDRAM
+  clock_ratio: 1
+  DRAM:
+    impl: GDDR6-Anaheim
+    org:
+      preset: GDDR6_16Gb_x8
+      channel: 1
+    timing:
+      preset: GDDR6_16Gbps_PIM_CK2
+  Controller:
+    impl: Anaheim-PIM
+    RefreshManager:
+      impl: AnaheimAllBank
+  AddrMapper:
+    impl: AnaheimLinear

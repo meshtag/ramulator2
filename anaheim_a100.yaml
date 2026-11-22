@@ -1,0 +1,27 @@
+# Anaheim on the A100 80GB (HBM2E at 3.024 Gbps, 1512 MHz). One channel of one die: every
+# channel runs the same all-bank command stream, so one stands for all.
+#   ./build/ramulator2 -f anaheim_a100.yaml -p Frontend.path=<trace>
+Frontend:
+  impl: AnaheimPIMTrace
+  path: ./anaheim.trace
+  clock_ratio: 1
+  Translation:
+    impl: NoTranslation
+    max_addr: 2147483648
+
+MemorySystem:
+  impl: PIMDRAM
+  clock_ratio: 1
+  DRAM:
+    impl: HBM2E-Anaheim
+    org:
+      preset: HBM2E_16Gb
+      channel: 1
+    timing:
+      preset: HBM2E_3.024Gbps
+  Controller:
+    impl: Anaheim-PIM
+    RefreshManager:
+      impl: AnaheimAllBank
+  AddrMapper:
+    impl: AnaheimLinear
