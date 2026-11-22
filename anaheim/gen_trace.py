@@ -56,31 +56,34 @@ INSTRUCTIONS = {
 }
 
 
-def paccum(k):
-    """Alg. 1: p_0..p_{K-1} loaded from PolyGroup0, (a_k, b_k) streamed from PolyGroup1,
-    x and y written to PolyGroup2. G = floor(B / (K + 2))."""
+def paccum(k, npoly=2):
+    """Alg. 1: p_0..p_{K-1} loaded from PolyGroup0, the K ciphertexts' polys streamed from
+    PolyGroup1, the npoly outputs written to PolyGroup2. G = floor(B / (K + npoly)).
+    npoly = 2 is Table II's PAccum<K>."""
     p = [f"p{i}" for i in range(k)]
-    ab = [n for i in range(k) for n in (f"a{i}", f"b{i}")]
-    return {"slots": k + 2, "pgs": [p, ab, ["x", "y"]],
-            "phases": [[("load", n) for n in p],
-                       [op for i in range(k) for op in (("mac", f"a{i}"), ("mac", f"b{i}"))],
-                       [("write", "x"), ("write", "y")]]}
+    outs = [f"x{j}" for j in range(npoly)]
+    ins = [f"a{i}_{j}" for i in range(k) for j in range(npoly)]
+    return {"slots": k + npoly, "pgs": [p, ins, outs],
+            "phases": [[("load", n) for n in p], [("mac", n) for n in ins],
+                       [("write", n) for n in outs]]}
 
 
-def caccum(k):
-    """x = C0 + sum C_i a_i, y likewise: a_i and b_i are each used once, so they stream
-    from one PolyGroup into two accumulators, then x and y are written."""
-    ab = [n for i in range(k) for n in (f"a{i}", f"b{i}")]
-    return {"slots": 2, "pgs": [ab, ["x", "y"]],
-            "phases": [[op for i in range(k) for op in (("mac", f"a{i}"), ("mac", f"b{i}"))],
-                       [("write", "x"), ("write", "y")]]}
+def caccum(k, npoly=2):
+    """x_j = C0 + sum_i C_i a_i_j: every input is used once, so they all stream from one
+    PolyGroup into npoly accumulators, which are then written. npoly = 2 is Table II's
+    CAccum<K>. With unit constants this is also a K-way sum."""
+    outs = [f"x{j}" for j in range(npoly)]
+    ins = [f"a{i}_{j}" for i in range(k) for j in range(npoly)]
+    return {"slots": npoly, "pgs": [ins, outs],
+            "phases": [[("mac", n) for n in ins], [("write", n) for n in outs]]}
 
 
 def lookup(name):
-    if name.startswith("PAccum"):
-        return paccum(int(name[6:]))
-    if name.startswith("CAccum"):
-        return caccum(int(name[6:]))
+    """Table II names, plus PAccum<K>x<n> and CAccum<K>x<n> for n polys per operand."""
+    for prefix, build in (("PAccum", paccum), ("CAccum", caccum)):
+        if name.startswith(prefix):
+            k, _, n = name[len(prefix):].partition("x")
+            return build(int(k), int(n) if n else 2)
     return INSTRUCTIONS[name]
 
 
