@@ -11,11 +11,11 @@ typedef struct {
 
 struct addr_dedup_state {
   dedup_slot_t *slots;
-  int capacity;       /* power of two */
-  int mask;           /* capacity - 1 */
+  size_t capacity;    /* power of two */
+  size_t mask;        /* capacity - 1 */
   uint32_t cur_epoch; /* 0 reserved as "empty"/uninitialized */
   uint64_t hits;
-  int live;           /* slots claimed at cur_epoch */
+  size_t live;        /* slots claimed at cur_epoch */
   uint64_t grows;     /* doublings; a nonzero value means the create() hint was low */
   uint64_t saturations; /* claims made with no room left: the caller over-emits */
 };
@@ -43,8 +43,8 @@ static inline uint64_t mix64(uint64_t x) {
 addr_dedup_state_t *addr_dedup_create(int max_entries) {
   if (max_entries < 16)
     max_entries = 16;
-  int capacity = 1;
-  while (capacity < max_entries * 2)
+  size_t capacity = 1;
+  while (capacity < (size_t)max_entries * 2)
     capacity <<= 1; /* 50% target load */
 
   addr_dedup_state_t *s =
@@ -74,20 +74,23 @@ addr_dedup_state_t *addr_dedup_create(int max_entries) {
  * register file, which has nothing to do with how many distinct addresses one
  * program-id touches, so on large tiles the table filled partway through and the
  * collapse silently stopped collapsing. On matmul 128x3072x768 that inflated bank
- * reads 1,769,472 -> 2,668,032 and cycles 14,545,807 -> 21,150,357 (2026-09-10). */
+ * reads 1,769,472 -> 2,668,032 and cycles 14,545,807 -> 21,150,357 (2026-09-10).
+ * The sizes are size_t because as int they stopped at 2^30 slots: a run marking more
+ * than 2^29 keys (VGG16 conv1 on one bank) filled the table, every probe walked most of
+ * it, and once full it over-emitted (2026-11-23). */
 static int addr_dedup_grow(addr_dedup_state_t *s) {
-  int newcap = s->capacity * 2;
+  size_t newcap = s->capacity * 2;
   if (newcap <= s->capacity)
-    return 0; /* int overflow */
-  dedup_slot_t *ns = (dedup_slot_t *)calloc((size_t)newcap, sizeof(dedup_slot_t));
+    return 0; /* overflow */
+  dedup_slot_t *ns = (dedup_slot_t *)calloc(newcap, sizeof(dedup_slot_t));
   if (!ns)
     return 0;
-  int newmask = newcap - 1;
-  for (int i = 0; i < s->capacity; i++) {
+  size_t newmask = newcap - 1;
+  for (size_t i = 0; i < s->capacity; i++) {
     if (s->slots[i].epoch != s->cur_epoch)
       continue;
     uint64_t k = s->slots[i].key;
-    int idx = (int)(mix64(k) & (uint64_t)newmask);
+    size_t idx = (size_t)(mix64(k) & (uint64_t)newmask);
     while (ns[idx].epoch == s->cur_epoch)
       idx = (idx + 1) & newmask;
     ns[idx].key = k;
@@ -108,9 +111,9 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
 
   uint64_t key = pack_keys(k1, k2, k3);
   uint64_t h = mix64(key);
-  int idx = (int)(h & (uint64_t)s->mask);
+  size_t idx = (size_t)(h & (uint64_t)s->mask);
 
-  for (int probe = 0; probe < s->capacity; probe++) {
+  for (size_t probe = 0; probe < s->capacity; probe++) {
     dedup_slot_t *slot = &s->slots[idx];
     if (slot->epoch == s->cur_epoch) {
       if (slot->key == key) {
@@ -121,7 +124,7 @@ int addr_dedup_check_and_mark(addr_dedup_state_t *s, uint64_t k1, uint64_t k2,
     } else {
       /* empty or stale slot — claim it, growing first if we are at the load target */
       if (s->live + 1 > s->capacity / 2 && addr_dedup_grow(s)) {
-        idx = (int)(h & (uint64_t)s->mask);
+        idx = (size_t)(h & (uint64_t)s->mask);
         for (;;) {
           dedup_slot_t *g = &s->slots[idx];
           if (g->epoch == s->cur_epoch) {
@@ -173,7 +176,7 @@ uint64_t addr_dedup_saturations(const addr_dedup_state_t *s) {
   return s ? s->saturations : 0;
 }
 
-int addr_dedup_capacity(const addr_dedup_state_t *s) {
+size_t addr_dedup_capacity(const addr_dedup_state_t *s) {
   return s ? s->capacity : 0;
 }
 

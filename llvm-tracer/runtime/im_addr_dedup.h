@@ -54,7 +54,7 @@ uint64_t addr_dedup_hits(const addr_dedup_state_t *s);
 uint64_t addr_dedup_saturations(const addr_dedup_state_t *s);
 
 /* Current slot count, after any growth. */
-int addr_dedup_capacity(const addr_dedup_state_t *s);
+size_t addr_dedup_capacity(const addr_dedup_state_t *s);
 
 void addr_dedup_destroy(addr_dedup_state_t *s);
 
