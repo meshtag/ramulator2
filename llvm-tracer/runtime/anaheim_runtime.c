@@ -33,8 +33,9 @@
  * The buffer holds every read chunk no MMAC took on arrival, for the rest of the program, and
  * each batch of results until it is written back. It keeps one copy of an address, so a chunk
  * read again while the buffer holds it lands in the held copy's entry, as a program that reads
- * a value twice needs it stored once. A program that needs more than B entries is refused,
- * since Anaheim has no spill.
+ * a value twice needs it stored once, and a result for an address it holds takes that entry,
+ * as an accumulator's sum does. A program that needs more than B entries is refused, since
+ * Anaheim has no spill.
  */
 #define PIM_LAYOUT_TABLE_DEFINE
 #include "im_runtime.h"
@@ -314,7 +315,7 @@ static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint6
   if (first % CHUNK_WORDS || n % CHUNK_WORDS)
     die("an access that is not whole 256-bit chunks. Size each lane's block in multiples "
         "of 8 u32 and compile with im_dq_bits 256");
-  int nchunks = (int)(n / CHUNK_WORDS);
+  int nchunks = (int)(n / CHUNK_WORDS), results = 0;
   if (lane == 0 && !is_write) {
     batch_chunks = 0; /* the batch went back to the banks */
     if (tid == pending_tensor) {
@@ -345,6 +346,8 @@ static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint6
       is_write ? s_wr++ : s_rd++;
       if (!is_write)
         hold_read(chunk_addr);
+      else if (*held_slot(chunk_addr) == 0)
+        results++;
     } else {
       const access_t *a = lane_pos < prog_len ? &prog[lane_pos] : NULL;
       if (!a || a->is_write != is_write || a->row != row || a->col != col) {
@@ -359,7 +362,7 @@ static void trace_access_range(uint64_t addr, uint64_t size, int is_write, uint6
     pending_chunks = 0; /* the run's chunks no MMAC took stay held */
     pending_tensor = -1;
     run_next = n_reads;
-    batch_chunks += nchunks;
+    batch_chunks += results;
     check_buffer();
   }
 }
